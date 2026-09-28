@@ -169,7 +169,7 @@ qcom_tsens_poll(void *arg)
 	    where, hottest / 10, hottest % 10, crit);
 	shutdown_nice(RB_POWEROFF);
 out:
-	callout_schedule(&sc->poll, hz);
+	callout_schedule_sbt(&sc->poll, SBT_1S, SBT_1S / 2, 0);
 }
 
 /*
@@ -224,7 +224,9 @@ qcom_tsens_attach_common(device_t dev, const char *const *names)
 		device_printf(dev, "%d sensors\n", bitcount32(sc->sensors));
 
 	callout_init(&sc->poll, 1);
-	callout_reset(&sc->poll, hz, qcom_tsens_poll, sc);
+	/* Loose timing lets the controllers' polls share wakeups. */
+	callout_reset_sbt(&sc->poll, SBT_1S, SBT_1S / 2, qcom_tsens_poll, sc,
+	    0);
 	return (0);
 fail:
 	if (sc->tm != NULL)
