@@ -33,6 +33,10 @@
 #include <sys/condvar.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
+#include <sys/rman.h>
+
+#include <machine/bus.h>
+#include <machine/resource.h>
 
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -131,6 +135,52 @@ generic_xhci_acpi_probe(device_t dev)
 	return (BUS_PROBE_GENERIC);
 }
 
+/* Synopsys DWC_usb3x global registers, after the xHCI registers. */
+#define	DWC3_GSNPSID		0xc120
+#define	 DWC3_GSNPSID_USB3	0x5533
+#define	 DWC3_GSNPSID_USB31	0x3331
+#define	 DWC3_GSNPSID_USB32	0x3332
+#define	DWC3_GRXTHRCFG		0xc10c
+#define	 DWC3_GRXTHRCFG_PKTCNTSEL	(1u << 29)
+#define	 DWC31_GRXTHRCFG_PKTCNTSEL	(1u << 26)
+#define	DWC3_MIN_SIZE		0xc200
+
+/*
+ * Firmware may leave a DWC3 core's receive threshold enabled, which on
+ * the SC8280XP's USB-C controllers cuts SuperSpeed reads to a third.
+ * Disable it, as the core's reset default does.
+ */
+static void
+generic_xhci_acpi_dwc3_fixup(device_t dev)
+{
+	struct resource *mem;
+	uint32_t id, reg, sel;
+	int rid;
+
+	rid = 0;
+	mem = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
+	if (mem == NULL)
+		return;
+	if (rman_get_size(mem) < DWC3_MIN_SIZE)
+		goto out;
+	id = bus_read_4(mem, DWC3_GSNPSID) >> 16;
+	if (id == DWC3_GSNPSID_USB3)
+		sel = DWC3_GRXTHRCFG_PKTCNTSEL;
+	else if (id == DWC3_GSNPSID_USB31 || id == DWC3_GSNPSID_USB32)
+		sel = DWC31_GRXTHRCFG_PKTCNTSEL;
+	else
+		goto out;
+	reg = bus_read_4(mem, DWC3_GRXTHRCFG);
+	if ((reg & sel) != 0) {
+		if (bootverbose)
+			device_printf(dev, "disabling DWC3 RX threshold "
+			    "(GRXTHRCFG 0x%08x)\n", reg);
+		bus_write_4(mem, DWC3_GRXTHRCFG, reg & ~sel);
+	}
+out:
+	bus_release_resource(dev, SYS_RES_MEMORY, rid, mem);
+}
+
 static int
 generic_xhci_acpi_attach(device_t dev)
 {
@@ -145,6 +195,7 @@ generic_xhci_acpi_attach(device_t dev)
 			return (ENXIO);
 		bus_set_resource(dev, SYS_RES_IRQ, 0, gsiv, 1);
 	}
+	generic_xhci_acpi_dwc3_fixup(dev);
 	return (generic_xhci_attach(dev));
 }
 
