@@ -64,6 +64,7 @@
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_var.h>
+#include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/iflib.h>
 
@@ -1243,15 +1244,40 @@ tcx_dma_addr(bus_addr_t pa)
 	return ((uint64_t)pa + TC956X_DMA_OFFSET);
 }
 
+static u_int
+tcx_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	uint32_t *hash, crc, rev;
+	int i;
+
+	hash = arg;
+	crc = ~ether_crc32_le(LLADDR(sdl), ETHER_ADDR_LEN);
+	for (rev = 0, i = 0; i < 32; i++, crc >>= 1)
+		rev = (rev << 1) | (crc & 1);
+	rev >>= 32 - XGMAC_HASH_BITS_LOG2;
+	hash[rev >> 5] |= 1u << (rev & 0x1f);
+	return (1);
+}
+
 static void
 tcx_set_filter(struct tcx_softc *sc, int flags)
 {
-	uint32_t v;
+	uint32_t hash[2], v;
 
-	/* No hash filter yet: take all multicast. */
-	v = XGMAC_FILTER_PM;
+	hash[0] = hash[1] = 0;
+	v = XGMAC_FILTER_HPF;
 	if ((flags & IFF_PROMISC) != 0)
 		v |= XGMAC_FILTER_PR;
+	if ((flags & IFF_ALLMULTI) != 0) {
+		v |= XGMAC_FILTER_PM;
+		hash[0] = hash[1] = 0xffffffff;
+	} else {
+		v |= XGMAC_FILTER_HMC;
+		if_foreach_llmaddr(iflib_get_ifp(sc->ctx), tcx_hash_maddr,
+		    hash);
+	}
+	MAC_WRITE(sc, XGMAC_HASH_TABLE(0), hash[0]);
+	MAC_WRITE(sc, XGMAC_HASH_TABLE(1), hash[1]);
 	MAC_WRITE(sc, XGMAC_PACKET_FILTER, v);
 }
 

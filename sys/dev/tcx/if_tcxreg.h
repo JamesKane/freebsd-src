@@ -216,7 +216,16 @@
 #define	 XGMAC_RX_CONFIG_GPSL_SHIFT	16
 #define	 XGMAC_RX_CONFIG_GPSL_MAX	16368
 #define	 XGMAC_FILTER_PR		(1u << 0)
-#define	 XGMAC_FILTER_PM		(1u << 4)
+#define	 XGMAC_FILTER_HMC		(1u << 2)	/* hash multicast */
+#define	 XGMAC_FILTER_PM		(1u << 4)	/* all multicast */
+#define	 XGMAC_FILTER_HPF		(1u << 10)	/* hash or perfect */
+/*
+ * Multicast hash filter: 64 bins in two registers, as HW_FEATURE1 on
+ * the TC956x reports.  A frame's bin is the top six bits of the bit-reversed
+ * complement of the Ethernet CRC of its destination address.
+ */
+#define	XGMAC_HASH_TABLE(n)		(0x0010 + (n) * 4)
+#define	XGMAC_HASH_BITS_LOG2		6
 #define	XGMAC_Q_TX_FLOW_CTRL(q)		(0x0070 + (q) * 4)
 #define	 XGMAC_TX_FLOW_TFE		(1u << 1)
 #define	 XGMAC_TX_FLOW_PT_SHIFT		16	/* pause time, 512 bit times */
