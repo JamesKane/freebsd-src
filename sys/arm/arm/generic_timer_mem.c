@@ -245,6 +245,13 @@ gt_mem_acpi_attach(device_t dev)
 		device_printf(dev, "cannot set up interrupt\n");
 		goto fail;
 	}
+	/*
+	 * Take the interrupt on CPU 0: a core powered down in a deep idle
+	 * state may not be woken by it, so CPU 0 stays out of such states
+	 * while this timer is in use.
+	 */
+	if (bus_bind_intr(dev, sc->irq, 0) != 0)
+		device_printf(dev, "cannot bind interrupt to CPU 0\n");
 
 	/*
 	 * A global timer: interrupts go to one CPU, which wakes the others

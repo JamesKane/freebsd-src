@@ -1441,9 +1441,14 @@ acpi_cpu_idle_lpi(sbintime_t sbt)
     us = sc->cpu_prev_sleep;
     if (sbt >= 0 && us > (sbt >> 12))
 	us = (sbt >> 12);
+    /*
+     * CPU 0 takes the global event timer's interrupt (see gt_mem), which
+     * need not wake a powered-down core, so it never powers down; it
+     * wakes the other cores with IPIs.
+     */
     if (cpu_disable_c2_sleep)
 	i = min(sc->cpu_cx_lowest, sc->cpu_non_c2);
-    else if (cpu_disable_c3_sleep)
+    else if (cpu_disable_c3_sleep || PCPU_GET(cpuid) == 0)
 	i = min(sc->cpu_cx_lowest, sc->cpu_non_c3);
     else
 	i = sc->cpu_cx_lowest;
