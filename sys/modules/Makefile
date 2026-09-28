@@ -405,6 +405,7 @@ SUBDIR=	\
 	sysvipc \
 	tarfs \
 	tcp \
+	${_tcx} \
 	${_tglhgpio} \
 	${_thunderbolt} \
 	${_ti} \
@@ -742,6 +743,7 @@ _armv8_rng=	armv8_rng
 _dpaa2=		dpaa2
 _sff=		sff
 _em=		em
+_tcx=		tcx
 _hyperv=  hyperv
 _vf_i2c=	vf_i2c
 

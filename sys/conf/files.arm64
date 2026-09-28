@@ -512,6 +512,7 @@ dev/sram/mmio_sram_if.m				optional fdt mmio_sram
 
 dev/spibus/controller/allwinner/aw_spi.c	optional fdt aw_spi
 dev/spibus/controller/rockchip/rk_spi.c		optional fdt rk_spi
+dev/tcx/if_tcx.c				optional tcx iflib pci
 
 dev/uart/uart_cpu_arm64.c			optional uart
 dev/uart/uart_dev_mu.c				optional uart uart_mu fdt
