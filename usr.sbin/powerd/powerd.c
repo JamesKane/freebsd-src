@@ -401,6 +401,92 @@ get_freq_id(int freq, int *freqs, int numfreqs)
 	return (i - 1);
 }
 
+/* Bring a domain's frequency within the user-defined range. */
+static void
+clamp_freq(struct freq_domain *d)
+{
+	int freq;
+	bool above;
+
+	above = d->curfreq > d->freqs[0];
+	if (above)
+		freq = d->freqs[0];
+	else if (d->curfreq < d->freqs[d->numfreqs - 1])
+		freq = d->freqs[d->numfreqs - 1];
+	else
+		return;
+	if (vflag) {
+		print_prefix(d);
+		printf("CPU frequency is %s user-defined %s; changing "
+		    "frequency to %d MHz\n", above ? "above" : "below",
+		    above ? "maximum" : "minimum", freq);
+	}
+	if (set_freq(d, freq) != 0)
+		warn("error setting CPU freq %d", freq);
+}
+
+/*
+ * Adjust a domain's frequency to its load in an adaptive mode.  Returns
+ * whether the frequency was changed.
+ */
+static bool
+adapt_freq(struct freq_domain *d, int mode)
+{
+	int *freqs, load, n, want;
+
+	freqs = d->freqs;
+	n = d->numfreqs;
+	load = d->load;
+	if (mode == MODE_ADAPTIVE) {
+		if (load > cpu_running_mark) {
+			if (load > 95 || load > cpu_running_mark * 2)
+				d->freq *= 2;
+			else
+				d->freq = d->freq * load / cpu_running_mark;
+			if (d->freq > freqs[0])
+				d->freq = freqs[0];
+		} else if (load < cpu_idle_mark &&
+		    d->curfreq * load < freqs[get_freq_id(d->freq * 7 / 8,
+		    freqs, n)] * cpu_running_mark) {
+			d->freq = d->freq * 7 / 8;
+			if (d->freq < freqs[n - 1])
+				d->freq = freqs[n - 1];
+		}
+	} else { /* MODE_HIADAPTIVE */
+		if (load > cpu_running_mark / 2) {
+			if (load > 95 || load > cpu_running_mark)
+				d->freq *= 4;
+			else
+				d->freq = d->freq * load * 2 /
+				    cpu_running_mark;
+			if (d->freq > freqs[0] * 2)
+				d->freq = freqs[0] * 2;
+		} else if (load < cpu_idle_mark / 2 &&
+		    d->curfreq * load < freqs[get_freq_id(d->freq * 31 / 32,
+		    freqs, n)] * cpu_running_mark / 2) {
+			d->freq = d->freq * 31 / 32;
+			if (d->freq < freqs[n - 1])
+				d->freq = freqs[n - 1];
+		}
+	}
+	if (vflag) {
+		print_prefix(d);
+		printf("load %3d%%, current freq %4d MHz (%2d), wanted freq "
+		    "%4d MHz\n", load, d->curfreq, d->i, d->freq);
+	}
+	want = get_freq_id(d->freq, freqs, n);
+	if (d->i == want)
+		return (false);
+	if (vflag) {
+		print_prefix(d);
+		printf("changing clock speed from %d MHz to %d MHz\n",
+		    freqs[d->i], freqs[want]);
+	}
+	if (set_freq(d, freqs[want]))
+		warn("error setting CPU frequency %d", freqs[want]);
+	return (true);
+}
+
 /*
  * Try to use ACPI to find the AC line status.  If this fails, fall back
  * to APM.  If nothing succeeds, we'll just run in default mode.
@@ -679,7 +765,6 @@ main(int argc, char * argv[])
 	struct pidfh *pfh = NULL;
 	const char *pidfile = NULL;
 	struct freq_domain *d;
-	int j, k, load, numfreqs, *freqs;
 	int minfreq = -1, maxfreq = -1;
 	int ch, mode, mode_ac, mode_battery, mode_none, idle, to;
 	uint64_t mjoules_used;
@@ -833,42 +918,8 @@ main(int argc, char * argv[])
 	    (mode_battery == MODE_ADAPTIVE || mode_battery == MODE_HIADAPTIVE)) ||
 	    (acline_status == SRC_UNKNOWN &&
 	    (mode_none == MODE_ADAPTIVE || mode_none == MODE_HIADAPTIVE))) {
-		for (d = domains; d < domains + ndomains; d++) {
-			freqs = d->freqs;
-			numfreqs = d->numfreqs;
-			/* Read the current frequency. */
-			len = sizeof(d->curfreq);
-			if (sysctl(d->freq_mib, 4, &d->curfreq, &len, NULL,
-			    0) != 0) {
-				if (vflag)
-					warn("error reading current CPU "
-					    "frequency");
-			}
-			if (d->curfreq < freqs[numfreqs - 1]) {
-				if (vflag) {
-					print_prefix(d);
-					printf("CPU frequency is below "
-					    "user-defined minimum; changing "
-					    "frequency to %d MHz\n",
-					    freqs[numfreqs - 1]);
-				}
-				if (set_freq(d, freqs[numfreqs - 1]) != 0) {
-					warn("error setting CPU freq %d",
-					    freqs[numfreqs - 1]);
-				}
-			} else if (d->curfreq > freqs[0]) {
-				if (vflag) {
-					print_prefix(d);
-					printf("CPU frequency is above "
-					    "user-defined maximum; changing "
-					    "frequency to %d MHz\n", freqs[0]);
-				}
-				if (set_freq(d, freqs[0]) != 0) {
-					warn("error setting CPU freq %d",
-					    freqs[0]);
-				}
-			}
-		}
+		for (d = domains; d < domains + ndomains; d++)
+			clamp_freq(d);
 	}
 
 	idle = 0;
@@ -970,76 +1021,18 @@ main(int argc, char * argv[])
 			continue;
 		}
 
-		for (d = domains; d < domains + ndomains; d++) {
-			freqs = d->freqs;
-			numfreqs = d->numfreqs;
-			load = d->load;
-			if (mode == MODE_ADAPTIVE) {
-				if (load > cpu_running_mark) {
-					if (load > 95 ||
-					    load > cpu_running_mark * 2)
-						d->freq *= 2;
-					else
-						d->freq = d->freq * load /
-						    cpu_running_mark;
-					if (d->freq > freqs[0])
-						d->freq = freqs[0];
-				} else if (load < cpu_idle_mark &&
-				    d->curfreq * load < freqs[get_freq_id(
-				    d->freq * 7 / 8, freqs, numfreqs)] *
-				    cpu_running_mark) {
-					d->freq = d->freq * 7 / 8;
-					if (d->freq < freqs[numfreqs - 1])
-						d->freq = freqs[numfreqs - 1];
-				}
-			} else { /* MODE_HIADAPTIVE */
-				if (load > cpu_running_mark / 2) {
-					if (load > 95 ||
-					    load > cpu_running_mark)
-						d->freq *= 4;
-					else
-						d->freq = d->freq * load * 2 /
-						    cpu_running_mark;
-					if (d->freq > freqs[0] * 2)
-						d->freq = freqs[0] * 2;
-				} else if (load < cpu_idle_mark / 2 &&
-				    d->curfreq * load < freqs[get_freq_id(
-				    d->freq * 31 / 32, freqs, numfreqs)] *
-				    cpu_running_mark / 2) {
-					d->freq = d->freq * 31 / 32;
-					if (d->freq < freqs[numfreqs - 1])
-						d->freq = freqs[numfreqs - 1];
-				}
-			}
-			if (vflag) {
-				print_prefix(d);
-				printf("load %3d%%, current freq %4d MHz "
-				    "(%2d), wanted freq %4d MHz\n",
-				    load, d->curfreq, d->i, d->freq);
-			}
-			j = get_freq_id(d->freq, freqs, numfreqs);
-			if (d->i != j) {
-				if (vflag) {
-					print_prefix(d);
-					printf("changing clock"
-					    " speed from %d MHz to %d MHz\n",
-					    freqs[d->i], freqs[j]);
-				}
+		for (d = domains; d < domains + ndomains; d++)
+			if (adapt_freq(d, mode))
 				idle = 0;
-				if (set_freq(d, freqs[j]))
-					warn("error setting CPU frequency %d",
-					    freqs[j]);
-			}
-		}
 	}
 	for (d = domains; d < domains + ndomains; d++) {
 		if (set_freq(d, d->initfreq))
 			warn("error setting CPU frequency %d", d->initfreq);
 	}
-	for (k = 0; k < ndomains; k++) {
-		free(domains[k].freqs);
-		free(domains[k].mwatts);
-		free(domains[k].levels);
+	for (d = domains; d < domains + ndomains; d++) {
+		free(d->freqs);
+		free(d->mwatts);
+		free(d->levels);
 	}
 	free(domains);
 	free(cpu_domain);
