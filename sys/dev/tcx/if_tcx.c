@@ -139,6 +139,17 @@
 #define	TCX_PMA_TIMEOUT		1000000	/* microseconds */
 #define	TCX_XPCS_RESET_TIMEOUT	600000	/* microseconds */
 
+/*
+ * The QCA8081's SerDes answers at the next MDIO address.  Its FIFO toward
+ * the MAC must be taken out of reset on each link up and put back on link
+ * down, as Linux does; while it is held no frames pass, although the
+ * SerDes link and SGMII autonegotiation work.  Firmware only releases it
+ * on ports that had a link when it ran.
+ */
+#define	QCA8081_SERDES_ADDR		(TC956X_PHY_ADDR + 1)
+#define	QCA8081_SERDES_FIFO_CTRL	0x9072		/* MMD 1 */
+#define	 QCA8081_SERDES_FIFO_RSTN	(1u << 11)
+
 /* QCA8081 registers reached through the clause 22 MMD window */
 #define	MII_MMDCTRL		0x0d
 #define	 MMDCTRL_DATA_NOINC	0x4000
@@ -462,6 +473,44 @@ tcx_mdio_read_c22(struct tcx_softc *sc, int phy, int reg)
 	if (tcx_mdio_wait(sc) != 0)
 		return (-1);
 	return (MAC_READ(sc, XGMAC_MDIO_DATA) & XGMAC_MDIO_DATA_MASK);
+}
+
+/* Clause 45 access; the port must not be marked clause 22 in C22P. */
+static int
+tcx_mdio_c45(struct tcx_softc *sc, int phy, int mmd, int reg, uint32_t cmd,
+    uint16_t val)
+{
+	if (tcx_mdio_wait(sc) != 0)
+		return (-1);
+
+	MAC_WRITE(sc, XGMAC_MDIO_C22P,
+	    MAC_READ(sc, XGMAC_MDIO_C22P) & ~(1u << phy));
+	MAC_WRITE(sc, XGMAC_MDIO_ADDR, (phy << XGMAC_MDIO_ADDR_PA_SHIFT) |
+	    (mmd << XGMAC_MDIO_ADDR_DA_SHIFT) | (reg & 0xffff));
+	MAC_WRITE(sc, XGMAC_MDIO_DATA,
+	    (TCX_MDIO_CR << XGMAC_MDIO_CR_SHIFT) | cmd | XGMAC_MDIO_BUSY | val);
+
+	if (tcx_mdio_wait(sc) != 0)
+		return (-1);
+	return (MAC_READ(sc, XGMAC_MDIO_DATA) & XGMAC_MDIO_DATA_MASK);
+}
+
+/* Hold the PHY's SerDes FIFO in reset while the link is down. */
+static void
+tcx_phy_serdes_fifo(struct tcx_softc *sc, bool up)
+{
+	int v;
+
+	v = tcx_mdio_c45(sc, QCA8081_SERDES_ADDR, 1, QCA8081_SERDES_FIFO_CTRL,
+	    XGMAC_MDIO_CMD_READ, 0);
+	if (v < 0)
+		return;
+	if (up)
+		v |= QCA8081_SERDES_FIFO_RSTN;
+	else
+		v &= ~QCA8081_SERDES_FIFO_RSTN;
+	tcx_mdio_c45(sc, QCA8081_SERDES_ADDR, 1, QCA8081_SERDES_FIFO_CTRL,
+	    XGMAC_MDIO_CMD_WRITE, v);
 }
 
 /* Clause 22 write.  Returns 0 or ETIMEDOUT. */
@@ -1874,6 +1923,8 @@ tcx_update_admin_status(if_ctx_t ctx)
 	    sc->link_rxpause == sc->rxpause_reported)))
 		return;
 
+	if (state != sc->link_reported)
+		tcx_phy_serdes_fifo(sc, state == LINK_STATE_UP);
 	sc->link_reported = state;
 	sc->speed_reported = sc->link_speed;
 	sc->txpause_reported = sc->link_txpause;
