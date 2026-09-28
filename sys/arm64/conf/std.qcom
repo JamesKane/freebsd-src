@@ -3,6 +3,7 @@
 #
 
 # Qualcomm Snapdragon drivers
+device		qcom_epss		# EPSS CPU frequency control
 device		qcom_gcc		# Global Clock Controller
 device		qcom_mdio		# MDIO support
 device		qcom_tsens		# TSENS temperature sensors

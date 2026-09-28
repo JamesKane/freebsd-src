@@ -342,6 +342,7 @@ SUBDIR=	\
 	${_qatfw} \
 	${_qat_c2xxx} \
 	${_qat_c2xxxfw} \
+	${_qcom_epss} \
 	${_qcom_tsens} \
 	${_qlxge} \
 	${_qlxgb} \
@@ -744,6 +745,7 @@ _armv8_rng=	armv8_rng
 _dpaa2=		dpaa2
 _sff=		sff
 _em=		em
+_qcom_epss=	qcom_epss
 _qcom_tsens=	qcom_tsens
 _tcx=		tcx
 _hyperv=  hyperv

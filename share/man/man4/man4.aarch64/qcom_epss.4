@@ -1,0 +1,136 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd September 28, 2026
+.Dt QCOM_EPSS 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_epss
+.Nd "Qualcomm EPSS CPU frequency control driver"
+.Sh SYNOPSIS
+To compile this driver into the kernel,
+place the following line in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device qcom_epss"
+.Ed
+.Pp
+Alternatively, to load the driver as a
+module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+qcom_epss_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver controls the CPU frequency of Qualcomm Snapdragon systems-on-chip
+whose cores are scaled by EPSS hardware,
+through the
+.Xr cpufreq 4
+framework.
+.Pp
+The cores are grouped into frequency domains,
+typically one per cluster,
+and all cores of a domain run at the same frequency.
+One
+.Nm
+instance attaches per domain, under the domain's first core,
+so each domain has its own
+.Va dev.cpu.\& Ns Ar N Ns Va .freq
+and
+.Va dev.cpu.\& Ns Ar N Ns Va .freq_levels
+variables, where
+.Ar N
+is the domain's first core.
+.Pp
+The available frequencies are those firmware placed in the hardware's
+table of performance levels.
+The hardware sets the matching voltage itself.
+Setting a frequency requests it for every core of the domain;
+reading one returns the frequency the domain actually runs at,
+which is lower than requested when the hardware limits power or
+temperature, or while the domain is idle.
+.Pp
+The driver changes nothing until a frequency is set.
+.Sh HARDWARE
+The
+.Nm
+driver supports EPSS frequency domains described in a devicetree by a
+.Qq qcom,cpufreq-epss
+node and the
+.Qq qcom,freq-domain
+properties of the cpu nodes.
+.Pp
+Windows-on-Arm ACPI tables describe neither.
+When booted with ACPI, the driver recognizes the following systems-on-chip
+by the ACPI hardware ID of their power management device,
+.Va \e_SB.PEP0 ,
+and uses a built-in description of their domains:
+.Pp
+.Bl -bullet -compact
+.It
+Qualcomm Snapdragon 8cx Gen 3 (SC8280XP):
+cores 0-3 from 300 to 2438 MHz and cores 4-7 from 825 to 2995 MHz
+.El
+.Pp
+A core whose ACPI description has a
+.Li _CPC
+object is left alone,
+as its firmware provides standard ACPI performance control.
+.Pp
+It has been tested on the Radxa Dragon Q8B.
+.Sh LOADER TUNABLES
+.Bl -tag -width indent
+.It Va debug.acpi.disabled
+Including
+.Dq qcom_epss
+in this list stops the driver from attaching under ACPI.
+.El
+.Sh EXAMPLES
+Run the second domain of an SC8280XP at 1516 MHz:
+.Bd -literal -offset indent
+# sysctl dev.cpu.4.freq=1516
+.Ed
+.Sh SEE ALSO
+.Xr cpufreq 4 ,
+.Xr qcom_tsens 4 ,
+.Xr powerd 8
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
+.Sh BUGS
+.Xr powerd 8
+only manages
+.Va dev.cpu.0.freq ,
+so it leaves the other domains at the frequency they were last set to.
