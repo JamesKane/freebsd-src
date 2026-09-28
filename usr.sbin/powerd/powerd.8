@@ -82,21 +82,19 @@ for battery power and
 .Cm hiadaptive
 for the rest.
 .Pp
-CPUs whose
-.Va dev.cpu.\& Ns Ar N Ns Va .freq_levels
-differ, such as the clusters of a big.LITTLE system, are taken to have
-separate clocks.
-.Nm
-manages each such frequency domain on its own, from the load of its
-CPUs, through the
+When the
+.Xr cpufreq 4
+drivers control clock domains, such as the clusters of a big.LITTLE
+system, only a domain's first CPU has a
 .Va dev.cpu.\& Ns Ar N Ns Va .freq
-of its first CPU;
-a CPU without
-.Va dev.cpu.\& Ns Ar N Ns Va .freq
-belongs to the domain of the CPU before it.
-When all CPUs offer the same levels,
+variable.
 .Nm
-manages them together through
+then manages each domain on its own, from the load of its CPUs,
+through that variable; a CPU without one belongs to the domain of the
+CPU before it.
+When every CPU has the variable, setting one sets them all, and
+.Nm
+manages all CPUs together through
 .Va dev.cpu.0.freq .
 The
 .Fl m

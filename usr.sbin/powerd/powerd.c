@@ -94,11 +94,11 @@ static const char *modes[] = {
 
 /*
  * A frequency domain: CPUs that share one clock.  Its first CPU's
- * dev.cpu.N.freq controls it.  CPUs whose frequency levels differ are
- * taken to be in different domains, as on big.LITTLE systems, and a CPU
- * without its own dev.cpu.N.freq belongs to the domain of the CPU before
- * it.  Systems whose CPUs all offer the same levels have one domain,
- * controlled through dev.cpu.0.freq.
+ * dev.cpu.N.freq controls it.  When every CPU has its own dev.cpu.N.freq,
+ * setting one sets them all, so there is one domain.  Otherwise the
+ * cpufreq drivers control clock domains, such as the clusters of a
+ * big.LITTLE system: each CPU with a dev.cpu.N.freq heads a domain, and a
+ * CPU without one belongs to the domain of the CPU before it.
  */
 struct freq_domain {
 	int	cpu;		/* first CPU */
@@ -304,6 +304,7 @@ init_domains(int minfreq, int maxfreq)
 	char name[64], *levels;
 	size_t len;
 	int cpu, i;
+	bool percpu;
 
 	len = 0;
 	if (sysctl(cp_times_mib, 2, NULL, &len, NULL, 0))
@@ -313,23 +314,34 @@ init_domains(int minfreq, int maxfreq)
 	    (domains = calloc(ncpus, sizeof(*domains))) == NULL)
 		err(1, "calloc");
 
+	/*
+	 * If every CPU has its own dev.cpu.N.freq, setting one sets them
+	 * all: use one domain.  Otherwise each CPU with one heads a domain
+	 * of the CPUs up to the next such CPU.
+	 */
+	percpu = true;
+	for (cpu = 0; cpu < ncpus && percpu; cpu++) {
+		/* Skip CPU IDs with no CPU. */
+		snprintf(name, sizeof(name), "dev.cpu.%d.%%parent", cpu);
+		len = 0;
+		if (sysctlbyname(name, NULL, &len, NULL, 0) != 0)
+			continue;
+		snprintf(name, sizeof(name), "dev.cpu.%d.freq", cpu);
+		len = 0;
+		percpu = sysctlbyname(name, NULL, &len, NULL, 0) == 0;
+	}
+
 	for (cpu = 0; cpu < ncpus; cpu++) {
 		snprintf(name, sizeof(name), "dev.cpu.%d.freq_levels", cpu);
-		if ((levels = sysctl_string(name)) == NULL) {
+		if ((cpu > 0 && percpu) ||
+		    (levels = sysctl_string(name)) == NULL) {
 			if (cpu == 0)
 				errx(EX_UNAVAILABLE,
 				    "no cpufreq(4) support -- aborting");
 			cpu_domain[cpu] = cpu_domain[cpu - 1];
 			continue;
 		}
-		for (i = 0; i < ndomains; i++)
-			if (strcmp(domains[i].levels, levels) == 0)
-				break;
-		cpu_domain[cpu] = i;
-		if (i < ndomains) {
-			free(levels);
-			continue;
-		}
+		cpu_domain[cpu] = ndomains;
 
 		d = &domains[ndomains++];
 		d->cpu = cpu;
