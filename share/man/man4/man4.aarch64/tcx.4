@@ -1,0 +1,201 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd September 28, 2026
+.Dt TCX 4 aarch64
+.Os
+.Sh NAME
+.Nm tcx
+.Nd "Toshiba TC956x PCIe 2.5 Gigabit Ethernet driver"
+.Sh SYNOPSIS
+To compile this driver into the kernel,
+place the following lines in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device pci"
+.Cd "device iflib"
+.Cd "device tcx"
+.Ed
+.Pp
+Alternatively, to load the driver as a
+module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+if_tcx_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver supports the Ethernet ports of the Toshiba TC956x,
+a PCI Express switch with an internal endpoint whose two PCI functions
+each contain a Synopsys XGMAC Ethernet controller,
+an XPCS and a SerDes.
+Each function appears as a separate
+.Nm
+interface.
+.Pp
+The driver restarts each controller from reset when it attaches,
+and follows the PHY as its link changes speed:
+the PHY carries 2.5 Gbit/s over 2500BASE-X
+and lower speeds over SGMII,
+and the driver switches the SerDes and XPCS to match.
+The PHY is polled for link state.
+.Pp
+Flow control is negotiated by the PHY.
+When the link partner agrees, the controller sends PAUSE frames as its
+receive FIFO fills and obeys PAUSE frames it receives;
+the negotiated result appears as
+.Cm rxpause
+and
+.Cm txpause
+in the media status reported by
+.Xr ifconfig 8 .
+.Pp
+The
+.Nm
+driver supports the following media types:
+.Bl -tag -width ".Cm 10baseT/UTP"
+.It Cm autoselect
+Enables auto-negotiation for speed and duplex.
+.It Cm 10baseT/UTP
+Sets 10 Mbit/s operation.
+.It Cm 100baseTX
+Sets 100 Mbit/s operation.
+.It Cm 1000baseT
+Sets 1000 Mbit/s operation.
+.It Cm 2500baseT
+Sets 2500 Mbit/s operation.
+.El
+.Pp
+Selecting a fixed media type limits what the PHY advertises to that
+speed; the link is still auto-negotiated.
+Only
+.Cm full-duplex
+operation is supported.
+.Sh HARDWARE
+The
+.Nm
+driver supports the Ethernet functions of the following controllers:
+.Pp
+.Bl -bullet -compact
+.It
+Toshiba TC9564 (also sold as the Qualcomm QPS615)
+.El
+.Pp
+It has been tested on the Radxa Dragon Q8B, whose two 2.5 Gbit/s ports
+are TC9564 functions, each wired to a Qualcomm QCA8081 PHY.
+.Sh LOADER TUNABLES
+Tunables can be set at the
+.Xr loader 8
+prompt before booting the kernel or stored in
+.Xr loader.conf 5 .
+.Bl -tag -width indent
+.It Va hw.tcx.cold_init
+When set to 1, the default, each controller, SerDes and XPCS is
+restarted from reset when the driver attaches.
+When set to 0, a controller that firmware left running is kept as it is,
+which avoids dropping the link, for example when the system was booted
+from the network.
+.El
+.Sh SYSCTL VARIABLES
+The following variables are available for each interface as
+.Va dev.tcx.\& Ns Ar N :
+.Bl -tag -width indent
+.It Va mmc_rx_frames
+Frames received by the MAC, good and bad.
+.It Va mmc_rx_crc_errors
+Frames received with a CRC error.
+.It Va mmc_rx_fifo_overflow
+Frames dropped because the receive FIFO was full.
+.It Va mmc_rx_discard
+Frames discarded by the MAC.
+.It Va mtl_rxq0_missed
+The raw missed and overflow packet counts of receive queue 0.
+.It Va rx_buf_unavail
+The number of times the receive DMA found no free descriptor.
+.It Va dma_bus_errors
+The number of fatal DMA bus errors.
+.It Va serdes
+The state of the SerDes and XPCS, for debugging.
+.It Va serdes_reset
+Writing 1 makes the driver set up the SerDes and XPCS again at the next
+link check.
+.El
+.Sh DIAGNOSTICS
+.Bl -diag
+.It "tcx%d: function 0 has not set up the chip"
+Function 1 attached before function 0,
+which must set up the parts of the chip that both functions share.
+.It "tcx%d: cannot allocate an MSI"
+The driver needs one MSI per function.
+.It "tcx%d: MAC %d did not start cleanly"
+Restarting the controller, SerDes or XPCS from reset timed out;
+the driver attaches anyway and tries again at the next link check
+that finds the PHY up.
+.It "tcx%d: PHY at %d does not answer"
+No PHY responded on the controller's MDIO bus.
+.It "tcx%d: SerDes did not come up at %u Mb/s"
+The SerDes did not finish initializing for the new link speed.
+.It "tcx%d: PCS reset timed out"
+The XPCS did not come out of reset.
+.It "tcx%d: DMA reset timed out"
+The controller's DMA did not finish its software reset;
+the interface stays down.
+.It "tcx%d: DMA bus error, status 0x%08x"
+The controller reported a fatal error while accessing host memory.
+.El
+.Sh SEE ALSO
+.Xr altq 4 ,
+.Xr iflib 4 ,
+.Xr netintro 4 ,
+.Xr ng_ether 4 ,
+.Xr vlan 4 ,
+.Xr ifconfig 8
+.Sh HISTORY
+The
+.Nm
+device driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
+.Sh CAVEATS
+There is no public documentation for the TC956x.
+.Pp
+The driver expects the PHY at MDIO address 28 and reads its link state
+from a Qualcomm QCA808x status register, as on the Radxa Dragon Q8B.
+.Pp
+The station address is kept in an I2C EEPROM that the driver cannot read.
+The driver keeps the address firmware programmed into the controller;
+if there is none, it generates one with
+.Xr ether_gen_addr 9 .
+.Sh BUGS
+Checksum offload, TCP segmentation offload, jumbo frames, multiple queues,
+multicast filtering, interrupt moderation and Wake on LAN are not
+supported.
+All multicast frames are received.

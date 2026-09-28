@@ -9,6 +9,7 @@ MAN=	\
 	rk_grf_gpio.4 \
 	rk_i2c.4 \
 	rk_pinctrl.4 \
+	tcx.4 \
 
 # Install manpages shared with arm only if not installing manpages
 # for all architectures, otherwise arm takes care of installing them.
