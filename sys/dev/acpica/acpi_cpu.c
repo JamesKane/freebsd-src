@@ -50,6 +50,8 @@
 #endif
 #ifdef __aarch64__
 #include <machine/cpu_suspend.h>
+
+#include <dev/psci/psci.h>
 #endif
 #include <sys/rman.h>
 
@@ -1323,6 +1325,7 @@ acpi_cpu_idle(sbintime_t sbt)
 #define	 LPI_FLAG_ENABLED	0x1
 #define	LPI_ARCH_FLAGS		3
 #define	 LPI_ARCH_CORE_LOST	0x1	/* Arm: core context is lost. */
+#define	 LPI_ARCH_GIC_LOST	0xc	/* Arm: GICR or GICD context is lost. */
 #define	LPI_ENABLED_PARENT	5
 #define	LPI_ENTRY_METHOD	6
 #define	LPI_STATE_FIELDS	10
@@ -1400,7 +1403,9 @@ acpi_cpu_lpi_compose(struct acpi_cpu_softc *sc, const struct acpi_cx *child,
 {
     struct acpi_cx *cx;
 
+    /* The GIC distributor and redistributors are not restored. */
     if (!p->valid || p->ffh || (p->flags & LPI_FLAG_ENABLED) == 0 ||
+	(p->arch_flags & LPI_ARCH_GIC_LOST) != 0 ||
 	sc->cpu_cx_count == MAX_CX_STATES)
 	return (NULL);
     cx = &sc->cpu_cx_states[sc->cpu_cx_count++];
@@ -1515,7 +1520,7 @@ acpi_cpu_idle_lpi(sbintime_t sbt)
     int i, us;
 
     sc = cpu_softc[PCPU_GET(cpuid)];
-    if (sc == NULL || is_idle_disabled(sc)) {
+    if (sc == NULL || is_idle_disabled(sc) || sc->cpu_cx_count == 0) {
 	__asm __volatile("dsb sy; wfi" ::: "memory");
 	return;
     }
@@ -1545,7 +1550,9 @@ acpi_cpu_idle_lpi(sbintime_t sbt)
     start_ticks = cpu_ticks();
     if (cx->type == ACPI_STATE_C1) {
 	__asm __volatile("dsb sy; wfi" ::: "memory");
-    } else if (cpu_suspend_psci(cx->psci_state) != 0) {
+    } else if (cx->type == ACPI_STATE_C2 ?
+	psci_cpu_suspend(cx->psci_state, 0, 0) != PSCI_RETVAL_SUCCESS :
+	cpu_suspend_psci(cx->psci_state) != 0) {
 	cx->lpi_failed = true;
 	device_printf(sc->cpu_dev,
 	    "PSCI refused idle state C%d (0x%x), not using it\n", i + 1,
@@ -1599,15 +1606,14 @@ acpi_cpu_quirks(void)
 {
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 
+#ifdef __aarch64__
     /*
-     * Hardware-reduced ACPI has no bus master control.  Its low-power
-     * idle states are entered through firmware, which keeps the caches
-     * coherent.
+     * Arm idle states are entered through PSCI firmware, which keeps the
+     * caches coherent; there is no bus master control.
      */
-    if (AcpiGbl_ReducedHardware) {
-	cpu_quirks |= CPU_QUIRK_NO_BM_CTRL;
-	return;
-    }
+    cpu_quirks |= CPU_QUIRK_NO_BM_CTRL;
+    return;
+#endif
 
     /*
      * Bus mastering arbitration control is needed to keep caches coherent
