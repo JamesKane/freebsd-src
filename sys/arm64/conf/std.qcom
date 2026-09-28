@@ -5,6 +5,7 @@
 # Qualcomm Snapdragon drivers
 device		qcom_gcc		# Global Clock Controller
 device		qcom_mdio		# MDIO support
+device		qcom_tsens		# TSENS temperature sensors
 
 # Serial (COM) ports
 device		uart_msm		# Qualcomm MSM UART driver

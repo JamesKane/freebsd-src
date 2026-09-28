@@ -804,6 +804,7 @@ dev/qcom_clk/qcom_clk_rcg2.c			optional qcom_gcc fdt
 dev/qcom_clk/qcom_clk_branch2.c			optional qcom_gcc fdt
 dev/qcom_clk/qcom_clk_ro_div.c			optional qcom_gcc fdt
 dev/qcom_mdio/qcom_mdio_ipq4018.c		optional qcom_mdio fdt mdio mii
+dev/qcom_tsens/qcom_tsens.c			optional qcom_tsens acpi | qcom_tsens fdt
 dev/qcom_tlmm/qcom_tlmm_debug.c			optional qcom_tlmm gpio
 dev/qcom_tlmm/qcom_tlmm_pin.c			optional qcom_tlmm gpio
 dev/qcom_tlmm/qcom_tlmm_pinmux.c		optional qcom_tlmm gpio

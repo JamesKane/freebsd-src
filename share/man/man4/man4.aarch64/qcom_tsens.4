@@ -1,0 +1,137 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd September 28, 2026
+.Dt QCOM_TSENS 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_tsens
+.Nd "Qualcomm TSENS temperature sensor driver"
+.Sh SYNOPSIS
+To compile this driver into the kernel,
+place the following line in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device qcom_tsens"
+.Ed
+.Pp
+Alternatively, to load the driver as a
+module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+qcom_tsens_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver reports the temperatures measured by the TSENS v2 thermal sensor
+controllers of Qualcomm Snapdragon systems-on-chip.
+Each controller serves up to 16 sensors spread over the die,
+next to the CPU cores, the GPU, memory and other blocks.
+.Pp
+The driver relies on firmware to have enabled the controller and its
+sensors, and reports only the sensors firmware enabled.
+It does not program the controller's thresholds or interrupts.
+.Pp
+Each sensor is available as a read-only
+.Xr sysctl 8
+variable
+.Va dev.qcom_tsens.\& Ns Ar N Ns .\& Ns Ar name ,
+in degrees Celsius.
+With a devicetree, a sensor is named after the thermal zone that refers
+to it, without the
+.Dq -thermal
+suffix;
+sensors that no thermal zone refers to are named
+.Va s Ns Ar M ,
+after their channel number
+.Ar M .
+.Pp
+The driver checks all sensors once a second.
+If any sensor reads
+.Va hw.qcom_tsens.crit_temp
+degrees or more on two checks in a row,
+the driver logs the sensor and its temperature and shuts the system down
+cleanly, powering it off.
+This is a last resort:
+the hardware slows the CPUs down on its own well before it gets that hot.
+.Sh HARDWARE
+The
+.Nm
+driver supports TSENS v2 controllers described in a devicetree as
+.Qq qcom,tsens-v2 .
+.Pp
+Windows-on-Arm ACPI tables do not describe the controllers.
+When booted with ACPI, the driver recognizes the following systems-on-chip
+by the ACPI hardware ID of their power management device,
+.Va \e_SB.PEP0 ,
+and adds their controllers from a built-in table:
+.Pp
+.Bl -bullet -compact
+.It
+Qualcomm Snapdragon 8cx Gen 3 (SC8280XP), four controllers and 46 sensors
+.El
+.Pp
+It has been tested on the Radxa Dragon Q8B.
+.Sh LOADER TUNABLES
+Tunables can be set at the
+.Xr loader 8
+prompt before booting the kernel or stored in
+.Xr loader.conf 5 .
+.Bl -tag -width indent
+.It Va hw.qcom_tsens.crit_temp
+The temperature, in degrees Celsius, at which the driver powers the system
+off.
+The default is 110, the critical trip point of the SC8280XP devicetree.
+Setting it to 0 disables the check.
+It can also be changed at run time with
+.Xr sysctl 8 .
+.It Va debug.acpi.disabled
+Including
+.Dq qcom_tsens
+in this list stops the driver from adding controllers under ACPI.
+.El
+.Sh EXAMPLES
+Show every sensor:
+.Bd -literal -offset indent
+$ sysctl dev.qcom_tsens | grep -v %
+dev.qcom_tsens.0.cpu0-0: 31.6C
+dev.qcom_tsens.0.cluster0: 33.1C
+\&...
+.Ed
+.Sh SEE ALSO
+.Xr shutdown 8 ,
+.Xr sysctl 8
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
