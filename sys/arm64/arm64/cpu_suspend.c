@@ -51,19 +51,31 @@
 #include <machine/armreg.h>
 #include <machine/cpu.h>
 #include <machine/cpu_suspend.h>
+#include <machine/debug_monitor.h>
 #include <machine/machdep.h>
 #include <machine/vfp.h>
 
 #include <dev/psci/psci.h>
 
-_Static_assert(offsetof(struct cpu_suspend_ctx, cpacr) == CS_ASM_SIZE,
-    "cpu_suspend_ctx layout");
+/* cpu_suspend_save() and the resume path move these in pairs. */
+#define	CS_PAIR(a, b)							\
+	_Static_assert(offsetof(struct cpu_suspend_ctx, b) ==		\
+	    offsetof(struct cpu_suspend_ctx, a) + 8, #a " and " #b)
+CS_PAIR(cs_ttbr0, cs_ttbr1);
+CS_PAIR(cs_tcr, cs_mair);
+CS_PAIR(cs_sctlr, cs_vbar);
+CS_PAIR(cs_tpidr_el1, cs_sp_el0);
+CS_PAIR(cs_contextidr, cs_tpidr_el0);
+CS_PAIR(cs_apia_lo, cs_apia_hi);
 
 DPCPU_DEFINE_STATIC(struct cpu_suspend_ctx, cpu_suspend_ctx);
 
-static vm_paddr_t cpu_suspend_entry_pa;
-
 extern int has_pan;
+
+/* Fixed once the boot CPU is identified; set by cpu_suspend_supported(). */
+static bool cpu_suspend_ok;
+static bool cpu_suspend_gicv3;
+static vm_paddr_t cpu_suspend_entry_pa;
 
 /*
  * Whether cpu_suspend_psci() can be used: PSCI is present and the kernel
@@ -75,36 +87,29 @@ cpu_suspend_supported(void)
 {
 	uint64_t pfr0;
 
-	if (!psci_present || in_vhe())
-		return (false);
-	get_kernel_reg(ID_AA64PFR0_EL1, &pfr0);
-	return (ID_AA64PFR0_SVE_VAL(pfr0) == ID_AA64PFR0_SVE_NONE);
-}
-
-static bool
-cpu_suspend_has_gicv3(void)
-{
-	uint64_t pfr0;
-
-	get_kernel_reg(ID_AA64PFR0_EL1, &pfr0);
-	return (ID_AA64PFR0_GIC_VAL(pfr0) != ID_AA64PFR0_GIC_CPUIF_NONE);
+	if (cpu_suspend_entry_pa == 0) {
+		get_kernel_reg(ID_AA64PFR0_EL1, &pfr0);
+		cpu_suspend_ok = psci_present && !in_vhe() &&
+		    ID_AA64PFR0_SVE_VAL(pfr0) == ID_AA64PFR0_SVE_NONE;
+		cpu_suspend_gicv3 =
+		    ID_AA64PFR0_GIC_VAL(pfr0) != ID_AA64PFR0_GIC_CPUIF_NONE;
+		cpu_suspend_entry_pa =
+		    pmap_kextract((vm_offset_t)cpu_suspend_resume_entry);
+	}
+	return (cpu_suspend_ok);
 }
 
 /*
  * Enter a PSCI CPU_SUSPEND power state.  Returns 0 once the core runs
  * again, whether it was powered down or the firmware returned without
- * doing so, or an error if the firmware refused the state.
+ * doing so, or an error if the firmware refused the state.  Only to be
+ * used once cpu_suspend_supported() has returned true.
  */
 int
 cpu_suspend_psci(uint32_t power_state)
 {
 	struct cpu_suspend_ctx *ctx;
-	bool gicv3;
 	int error;
-
-	if (cpu_suspend_entry_pa == 0)
-		cpu_suspend_entry_pa =
-		    pmap_kextract((vm_offset_t)cpu_suspend_resume_entry);
 
 	/*
 	 * The FP registers are lost, so no thread's state may be left in
@@ -115,23 +120,21 @@ cpu_suspend_psci(uint32_t power_state)
 	vfp_discard(NULL);
 
 	ctx = DPCPU_PTR(cpu_suspend_ctx);
-	gicv3 = cpu_suspend_has_gicv3();
-	ctx->cpacr = READ_SPECIALREG(cpacr_el1);
-	ctx->cntkctl = READ_SPECIALREG(cntkctl_el1);
-	ctx->mdscr = READ_SPECIALREG(mdscr_el1);
-	if (gicv3) {
-		ctx->icc_sre = READ_SPECIALREG(icc_sre_el1);
-		ctx->icc_pmr = READ_SPECIALREG(icc_pmr_el1);
-		ctx->icc_bpr1 = READ_SPECIALREG(icc_bpr1_el1);
-		ctx->icc_ctlr = READ_SPECIALREG(icc_ctlr_el1);
-		ctx->icc_igrpen1 = READ_SPECIALREG(icc_igrpen1_el1);
+	ctx->cs_cpacr = READ_SPECIALREG(cpacr_el1);
+	ctx->cs_cntkctl = READ_SPECIALREG(cntkctl_el1);
+	if (cpu_suspend_gicv3) {
+		ctx->cs_icc_sre = READ_SPECIALREG(icc_sre_el1);
+		ctx->cs_icc_pmr = READ_SPECIALREG(icc_pmr_el1);
+		ctx->cs_icc_bpr1 = READ_SPECIALREG(icc_bpr1_el1);
+		ctx->cs_icc_ctlr = READ_SPECIALREG(icc_ctlr_el1);
+		ctx->cs_icc_igrpen1 = READ_SPECIALREG(icc_igrpen1_el1);
 	}
-	ctx->asm_regs[CS_FLAGS / 8] =
+	ctx->cs_flags =
 	    (READ_SPECIALREG(sctlr_el1) & SCTLR_EnIA) != 0 ? CS_FLAG_APIA : 0;
 
 	if (cpu_suspend_save(ctx) == 0) {
-		error = psci_call(PSCI_FNID_CPU_SUSPEND, power_state,
-		    cpu_suspend_entry_pa, (register_t)ctx);
+		error = psci_cpu_suspend(power_state, cpu_suspend_entry_pa,
+		    (unsigned long)ctx);
 		/* The firmware returned: the core was not powered down. */
 		return (error == PSCI_RETVAL_SUCCESS ? 0 : EINVAL);
 	}
@@ -142,17 +145,17 @@ cpu_suspend_psci(uint32_t power_state)
 		    ".arch_extension pan	\n"
 		    "msr pan, #1		\n"
 		    ".arch_extension nopan	\n");
-	WRITE_SPECIALREG(cpacr_el1, ctx->cpacr);
-	WRITE_SPECIALREG(cntkctl_el1, ctx->cntkctl);
+	WRITE_SPECIALREG(cpacr_el1, ctx->cs_cpacr);
+	WRITE_SPECIALREG(cntkctl_el1, ctx->cs_cntkctl);
 	WRITE_SPECIALREG(oslar_el1, 0);
-	WRITE_SPECIALREG(mdscr_el1, ctx->mdscr);
-	if (gicv3) {
-		WRITE_SPECIALREG(icc_sre_el1, ctx->icc_sre);
+	dbg_register_sync(NULL);
+	if (cpu_suspend_gicv3) {
+		WRITE_SPECIALREG(icc_sre_el1, ctx->cs_icc_sre);
 		isb();
-		WRITE_SPECIALREG(icc_pmr_el1, ctx->icc_pmr);
-		WRITE_SPECIALREG(icc_bpr1_el1, ctx->icc_bpr1);
-		WRITE_SPECIALREG(icc_ctlr_el1, ctx->icc_ctlr);
-		WRITE_SPECIALREG(icc_igrpen1_el1, ctx->icc_igrpen1);
+		WRITE_SPECIALREG(icc_pmr_el1, ctx->cs_icc_pmr);
+		WRITE_SPECIALREG(icc_bpr1_el1, ctx->cs_icc_bpr1);
+		WRITE_SPECIALREG(icc_ctlr_el1, ctx->cs_icc_ctlr);
+		WRITE_SPECIALREG(icc_igrpen1_el1, ctx->cs_icc_igrpen1);
 	}
 	isb();
 	return (0);

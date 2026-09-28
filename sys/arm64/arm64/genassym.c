@@ -31,6 +31,7 @@
 #include <sys/pcpu.h>
 #include <sys/proc.h>
 
+#include <machine/cpu_suspend.h>
 #include <machine/efi.h>
 #include <machine/frame.h>
 #include <machine/machdep.h>
@@ -85,3 +86,14 @@ ASSYM(TF_ELR, offsetof(struct trapframe, tf_elr));
 ASSYM(TF_SPSR, offsetof(struct trapframe, tf_spsr));
 ASSYM(TF_ESR, offsetof(struct trapframe, tf_esr));
 ASSYM(TF_X, offsetof(struct trapframe, tf_x));
+
+ASSYM(CS_X19, offsetof(struct cpu_suspend_ctx, cs_x));
+ASSYM(CS_SP, offsetof(struct cpu_suspend_ctx, cs_sp));
+ASSYM(CS_TTBR0, offsetof(struct cpu_suspend_ctx, cs_ttbr0));
+ASSYM(CS_TCR, offsetof(struct cpu_suspend_ctx, cs_tcr));
+ASSYM(CS_SCTLR, offsetof(struct cpu_suspend_ctx, cs_sctlr));
+ASSYM(CS_TPIDR_EL1, offsetof(struct cpu_suspend_ctx, cs_tpidr_el1));
+ASSYM(CS_CONTEXTIDR, offsetof(struct cpu_suspend_ctx, cs_contextidr));
+ASSYM(CS_TPIDRRO_EL0, offsetof(struct cpu_suspend_ctx, cs_tpidrro_el0));
+ASSYM(CS_APIA_LO, offsetof(struct cpu_suspend_ctx, cs_apia_lo));
+ASSYM(CS_FLAGS, offsetof(struct cpu_suspend_ctx, cs_flags));

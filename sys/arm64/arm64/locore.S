@@ -31,7 +31,6 @@
 #include <machine/asm.h>
 #include <machine/armreg.h>
 #include <machine/cpu.h>
-#include <machine/cpu_suspend.h>
 #include <machine/hypervisor.h>
 #include <machine/param.h>
 #include <machine/pte.h>
@@ -56,6 +55,32 @@
 	movk	\reg, :abs_g3:\val
 .endif
 .endm
+
+/*
+ * Sets x22 to the shareability attribute to use in page tables.  If
+ * FEAT_LPA2 is enabled then the shareability field is moved from the page
+ * table to tcr_el1 and the bits in the page table are reused by the
+ * address field.  Clobbers x6 and x7.
+ */
+#if PAGE_SIZE == PAGE_SIZE_4K
+#define	LPA2_MASK	ID_AA64MMFR0_TGran4_MASK
+#define	LPA2_VAL	ID_AA64MMFR0_TGran4_LPA2
+#elif PAGE_SIZE == PAGE_SIZE_16K
+#define	LPA2_MASK	ID_AA64MMFR0_TGran16_MASK
+#define	LPA2_VAL	ID_AA64MMFR0_TGran16_LPA2
+#else
+#error Unsupported page size
+#endif
+.macro	pte_sh_attr
+	mrs	x6, id_aa64mmfr0_el1
+	mov	x7, LPA2_VAL
+	and	x6, x6, LPA2_MASK
+	cmp	x6, x7
+	ldr	x22, =(ATTR_SH(ATTR_SH_IS))
+	csel	x22, xzr, x22, eq
+.endm
+#undef LPA2_MASK
+#undef LPA2_VAL
 
 #if PAGE_SIZE == PAGE_SIZE_16K
 /*
@@ -406,22 +431,8 @@ ENTRY(cpu_suspend_resume_entry)
 	/* Enter the kernel exception level */
 	bl	enter_kernel_el
 
-	/* Find the shareability attributes, as in _start */
-#if PAGE_SIZE == PAGE_SIZE_4K
-#define	LPA2_MASK	ID_AA64MMFR0_TGran4_MASK
-#define	LPA2_VAL	ID_AA64MMFR0_TGran4_LPA2
-#elif PAGE_SIZE == PAGE_SIZE_16K
-#define	LPA2_MASK	ID_AA64MMFR0_TGran16_MASK
-#define	LPA2_VAL	ID_AA64MMFR0_TGran16_LPA2
-#endif
-	mrs	x6, id_aa64mmfr0_el1
-	mov	x7, LPA2_VAL
-	and	x6, x6, LPA2_MASK
-	cmp	x6, x7
-	ldr	x22, =(ATTR_SH(ATTR_SH_IS))
-	csel	x22, xzr, x22, eq
-#undef LPA2_MASK
-#undef LPA2_VAL
+	/* Find the shareability attribute, as in _start */
+	pte_sh_attr
 
 	/* Enable the MMU with the kernel and identity page tables */
 	adrp	x24, pagetable_l0_ttbr1
@@ -724,29 +735,8 @@ LENTRY(create_pagetables)
 	lsl	x21, x6, ATTR_S1_GP_SHIFT	/* Shift to the correct bit */
 #endif
 
-	/*
-	 * Find the shareability attribute we should use. If FEAT_LPA2 is
-	 * enabled then the shareability field is moved from the page table
-	 * to tcr_el1 and the bits in the page table are reused by the
-	 * address field.
-	 */
-#if PAGE_SIZE == PAGE_SIZE_4K
-#define	LPA2_MASK	ID_AA64MMFR0_TGran4_MASK
-#define	LPA2_VAL	ID_AA64MMFR0_TGran4_LPA2
-#elif PAGE_SIZE == PAGE_SIZE_16K
-#define	LPA2_MASK	ID_AA64MMFR0_TGran16_MASK
-#define	LPA2_VAL	ID_AA64MMFR0_TGran16_LPA2
-#else
-#error Unsupported page size
-#endif
-	mrs	x6, id_aa64mmfr0_el1
-	mov	x7, LPA2_VAL
-	and	x6, x6, LPA2_MASK
-	cmp	x6, x7
-	ldr	x22, =(ATTR_SH(ATTR_SH_IS))
-	csel	x22, xzr, x22, eq
-#undef LPA2_MASK
-#undef LPA2_VAL
+	/* Find the shareability attribute we should use */
+	pte_sh_attr
 
 	/*
 	 * Build the TTBR1 maps.

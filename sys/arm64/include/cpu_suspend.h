@@ -28,42 +28,40 @@
 #ifndef _MACHINE_CPU_SUSPEND_H_
 #define	_MACHINE_CPU_SUSPEND_H_
 
-/*
- * The context saved by cpu_suspend_save() and restored in assembly when a
- * core resumes from a powered-down PSCI CPU_SUSPEND state, before any C
- * code runs.  The offsets are into struct cpu_suspend_ctx.
- */
-#define	CS_X19		0	/* x19-x30, in pairs */
-#define	CS_SP		96
-#define	CS_TTBR0	104
-#define	CS_TTBR1	112
-#define	CS_TCR		120
-#define	CS_MAIR		128
-#define	CS_SCTLR	136
-#define	CS_VBAR		144
-#define	CS_TPIDR_EL1	152
-#define	CS_SP_EL0	160
-#define	CS_CONTEXTIDR	168
-#define	CS_TPIDR_EL0	176
-#define	CS_TPIDRRO_EL0	184
-#define	CS_APIA_LO	192
-#define	CS_APIA_HI	200
-#define	CS_FLAGS	208
-#define	 CS_FLAG_APIA	0x1	/* the kernel APIA key is in use */
-#define	CS_ASM_SIZE	216
+#define	CS_FLAG_APIA	0x1	/* cs_flags: the kernel APIA key is in use */
 
 #ifndef LOCORE
+/*
+ * The context of a core that may be powered down in a PSCI CPU_SUSPEND
+ * state.  The first part is saved by cpu_suspend_save() and restored in
+ * assembly before any C code runs; its offsets come from genassym.c, and
+ * fields the assembly moves in pairs must stay adjacent.
+ */
 struct cpu_suspend_ctx {
-	uint64_t	asm_regs[CS_ASM_SIZE / 8];
+	uint64_t	cs_x[12];	/* x19-x30 */
+	uint64_t	cs_sp;
+	uint64_t	cs_ttbr0;
+	uint64_t	cs_ttbr1;
+	uint64_t	cs_tcr;
+	uint64_t	cs_mair;
+	uint64_t	cs_sctlr;
+	uint64_t	cs_vbar;
+	uint64_t	cs_tpidr_el1;
+	uint64_t	cs_sp_el0;
+	uint64_t	cs_contextidr;
+	uint64_t	cs_tpidr_el0;
+	uint64_t	cs_tpidrro_el0;
+	uint64_t	cs_apia_lo;
+	uint64_t	cs_apia_hi;
+	uint64_t	cs_flags;
 	/* Restored in C once the core runs kernel code again. */
-	uint64_t	cpacr;
-	uint64_t	cntkctl;
-	uint64_t	mdscr;
-	uint64_t	icc_sre;
-	uint64_t	icc_pmr;
-	uint64_t	icc_bpr1;
-	uint64_t	icc_ctlr;
-	uint64_t	icc_igrpen1;
+	uint64_t	cs_cpacr;
+	uint64_t	cs_cntkctl;
+	uint64_t	cs_icc_sre;
+	uint64_t	cs_icc_pmr;
+	uint64_t	cs_icc_bpr1;
+	uint64_t	cs_icc_ctlr;
+	uint64_t	cs_icc_igrpen1;
 };
 
 #ifdef _KERNEL
