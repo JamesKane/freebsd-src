@@ -56,20 +56,102 @@ static char *xhci_ids[] = {
 	NULL,
 };
 
+/*
+ * A USB Role Switch device holds a dual-role controller's registers; its
+ * host-role child, with _ADR 0, holds the host controller's interrupts.
+ */
+static char *urs_ids[] = {
+	"PNP0CA1",
+	NULL,
+};
+
+#define	URS_HOST_ADR	0
+
+struct urs_irq_arg {
+	UINT32	gsiv;
+	bool	found;
+};
+
+static ACPI_STATUS
+urs_find_irq(ACPI_RESOURCE *res, void *context)
+{
+	struct urs_irq_arg *arg = context;
+
+	if (arg->found)
+		return (AE_OK);
+	if (res->Type == ACPI_RESOURCE_TYPE_EXTENDED_IRQ &&
+	    res->Data.ExtendedIrq.InterruptCount > 0) {
+		arg->gsiv = res->Data.ExtendedIrq.Interrupts[0];
+		arg->found = true;
+	} else if (res->Type == ACPI_RESOURCE_TYPE_IRQ &&
+	    res->Data.Irq.InterruptCount > 0) {
+		arg->gsiv = res->Data.Irq.Interrupts[0];
+		arg->found = true;
+	}
+	return (AE_OK);
+}
+
+/* Find the first interrupt of the role switch's host-role child. */
+static int
+urs_host_irq(device_t dev, UINT32 *gsiv)
+{
+	struct urs_irq_arg arg;
+	ACPI_HANDLE child;
+	UINT32 adr;
+
+	child = NULL;
+	while (ACPI_SUCCESS(AcpiGetNextObject(ACPI_TYPE_DEVICE,
+	    acpi_get_handle(dev), child, &child))) {
+		if (ACPI_FAILURE(acpi_GetInteger(child, "_ADR", &adr)) ||
+		    adr != URS_HOST_ADR)
+			continue;
+		arg.found = false;
+		if (ACPI_SUCCESS(AcpiWalkResources(child, "_CRS", urs_find_irq,
+		    &arg)) && arg.found) {
+			*gsiv = arg.gsiv;
+			return (0);
+		}
+	}
+	return (ENXIO);
+}
+
 static int
 generic_xhci_acpi_probe(device_t dev)
 {
-	if (ACPI_ID_PROBE(device_get_parent(dev), dev, xhci_ids, NULL) >= 0)
-		return (ENXIO);
+	UINT32 gsiv;
+
+	if (ACPI_ID_PROBE(device_get_parent(dev), dev, xhci_ids, NULL) >= 0) {
+		if (ACPI_ID_PROBE(device_get_parent(dev), dev, urs_ids,
+		    NULL) >= 0 || urs_host_irq(dev, &gsiv) != 0)
+			return (ENXIO);
+	}
 
 	device_set_desc(dev, XHCI_HC_DEVSTR);
 
 	return (BUS_PROBE_GENERIC);
 }
 
+static int
+generic_xhci_acpi_attach(device_t dev)
+{
+	UINT32 gsiv;
+
+	/*
+	 * A role switch's interrupts belong to its host-role child.  The
+	 * controller is used as firmware left it, which must be host mode.
+	 */
+	if (ACPI_ID_PROBE(device_get_parent(dev), dev, urs_ids, NULL) <= 0) {
+		if (urs_host_irq(dev, &gsiv) != 0)
+			return (ENXIO);
+		bus_set_resource(dev, SYS_RES_IRQ, 0, gsiv, 1);
+	}
+	return (generic_xhci_attach(dev));
+}
+
 static device_method_t xhci_acpi_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe, generic_xhci_acpi_probe),
+	DEVMETHOD(device_attach, generic_xhci_acpi_attach),
 
 	DEVMETHOD_END
 };
