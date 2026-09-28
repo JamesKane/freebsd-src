@@ -74,6 +74,10 @@ struct acpi_cx {
     uint32_t		 mwait_hint;
     bool		 mwait_hw_coord;
     bool		 mwait_bm_avoidance;
+#ifdef __aarch64__
+    uint32_t		 min_res;	/* _LPI minimum residency (usec). */
+    uint32_t		 psci_state;	/* _LPI PSCI CPU_SUSPEND parameter. */
+#endif
 };
 #define MAX_CX_STATES	 8
 
@@ -179,6 +183,10 @@ static void	acpi_cpu_startup_cx(struct acpi_cpu_softc *sc);
 static void	acpi_cpu_cx_list(struct acpi_cpu_softc *sc);
 #if defined(__i386__) || defined(__amd64__)
 static void	acpi_cpu_idle(sbintime_t sbt);
+#endif
+#ifdef __aarch64__
+static int	acpi_cpu_cx_lpi(struct acpi_cpu_softc *sc);
+static void	acpi_cpu_idle_lpi(sbintime_t sbt);
 #endif
 static void	acpi_cpu_notify(ACPI_HANDLE h, UINT32 notify, void *context);
 static void	acpi_cpu_quirks(void);
@@ -522,7 +530,7 @@ enable_idle(struct acpi_cpu_softc *sc)
     sc->cpu_disable_idle = FALSE;
 }
 
-#if defined(__i386__) || defined(__amd64__)
+#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__)
 static int
 is_idle_disabled(struct acpi_cpu_softc *sc)
 {
@@ -730,6 +738,12 @@ acpi_cpu_cx_probe(struct acpi_cpu_softc *sc)
     sc->cpu_prev_sleep = 1000000;
     sc->cpu_cx_lowest = 0;
     sc->cpu_cx_lowest_lim = 0;
+
+#ifdef __aarch64__
+    /* Arm systems describe their idle states with _LPI. */
+    if (!cpu_cx_generic && acpi_cpu_cx_lpi(sc) == 0)
+	return;
+#endif
 
     /*
      * Check for the ACPI 2.0 _CST sleep states object. If we can't find
@@ -1068,6 +1082,9 @@ acpi_cpu_startup(void *arg)
     }
 #if defined(__i386__) || defined(__amd64__)
     cpu_idle_hook = acpi_cpu_idle;
+#elif defined(__aarch64__)
+    if (!cpu_cx_generic)
+	cpu_idle_hook = acpi_cpu_idle_lpi;
 #endif
 }
 
@@ -1294,6 +1311,150 @@ acpi_cpu_idle(sbintime_t sbt)
 }
 #endif
 
+#ifdef __aarch64__
+/* _LPI state package fields (ACPI 6.x, 8.4.4.3). */
+#define	LPI_MIN_RESIDENCY	0
+#define	LPI_WAKE_LATENCY	1
+#define	LPI_FLAGS		2
+#define	 LPI_FLAG_ENABLED	0x1
+#define	LPI_ARCH_FLAGS		3
+#define	 LPI_ARCH_CORE_LOST	0x1	/* Arm: core context is lost. */
+#define	LPI_ENTRY_METHOD	6
+#define	LPI_STATE_FIELDS	10
+#define	LPI_PSCI_WFI		0xffffffff	/* Arm FFH: plain WFI. */
+
+/*
+ * Read this processor's own (leaf) _LPI states.  On Arm each is entered
+ * through the FFH entry method: WFI, or PSCI CPU_SUSPEND with the given
+ * power state.  States that keep the core's context are C2-type; states
+ * that lose it are C3-type.  Parent (cluster and system) states are not
+ * used.
+ */
+static int
+acpi_cpu_cx_lpi(struct acpi_cpu_softc *sc)
+{
+    struct acpi_cx *cx;
+    ACPI_BUFFER buf;
+    ACPI_OBJECT *top, *pkg;
+    uint64_t address;
+    uint32_t arch, count, flags, i;
+    int accsize, class, vendor;
+
+    buf.Pointer = NULL;
+    buf.Length = ACPI_ALLOCATE_BUFFER;
+    if (ACPI_FAILURE(AcpiEvaluateObject(sc->cpu_handle, "_LPI", NULL, &buf)))
+	return (ENXIO);
+
+    /* Revision, level ID, count, then the states from shallow to deep. */
+    top = (ACPI_OBJECT *)buf.Pointer;
+    if (!ACPI_PKG_VALID(top, 4) || acpi_PkgInt32(top, 2, &count) != 0 ||
+	count != top->Package.Count - 3) {
+	device_printf(sc->cpu_dev, "invalid _LPI package\n");
+	AcpiOsFree(buf.Pointer);
+	return (ENXIO);
+    }
+
+    sc->cpu_cx_count = 0;
+    for (i = 0; i < count && sc->cpu_cx_count < MAX_CX_STATES; i++) {
+	pkg = &top->Package.Elements[i + 3];
+	cx = &sc->cpu_cx_states[sc->cpu_cx_count];
+	memset(cx, 0, sizeof(*cx));
+	if (!ACPI_PKG_VALID(pkg, LPI_STATE_FIELDS) ||
+	    acpi_PkgInt32(pkg, LPI_MIN_RESIDENCY, &cx->min_res) != 0 ||
+	    acpi_PkgInt32(pkg, LPI_WAKE_LATENCY, &cx->trans_lat) != 0 ||
+	    acpi_PkgInt32(pkg, LPI_FLAGS, &flags) != 0 ||
+	    acpi_PkgInt32(pkg, LPI_ARCH_FLAGS, &arch) != 0 ||
+	    acpi_PkgFFH_IntelCpu(pkg, LPI_ENTRY_METHOD, &vendor, &class,
+	    &address, &accsize) != 0) {
+	    device_printf(sc->cpu_dev, "skipping invalid _LPI state %u\n", i);
+	    continue;
+	}
+	if ((flags & LPI_FLAG_ENABLED) == 0)
+	    continue;
+	cx->psci_state = address;
+	if (address == LPI_PSCI_WFI)
+	    cx->type = ACPI_STATE_C1;
+	else if ((arch & LPI_ARCH_CORE_LOST) == 0)
+	    cx->type = ACPI_STATE_C2;
+	else
+	    cx->type = ACPI_STATE_C3;
+	sc->cpu_cx_count++;
+    }
+    AcpiOsFree(buf.Pointer);
+
+    if (sc->cpu_cx_count == 0 ||
+	sc->cpu_cx_states[0].type != ACPI_STATE_C1) {
+	device_printf(sc->cpu_dev, "_LPI has no WFI state\n");
+	sc->cpu_cx_count = 0;
+	return (ENXIO);
+    }
+    sc->cpu_non_c2 = 0;
+    sc->cpu_non_c3 = 0;
+    for (i = 1; i < sc->cpu_cx_count; i++) {
+	if (sc->cpu_cx_states[i].type < ACPI_STATE_C2)
+	    sc->cpu_non_c2 = i;
+	if (sc->cpu_cx_states[i].type < ACPI_STATE_C3)
+	    sc->cpu_non_c3 = i;
+    }
+    return (0);
+}
+
+/*
+ * Whether a state can be entered yet.  Only WFI is implemented; the
+ * PSCI CPU_SUSPEND states are listed but not used.
+ */
+static bool
+acpi_cpu_lpi_usable(const struct acpi_cx *cx)
+{
+    return (cx->type == ACPI_STATE_C1);
+}
+
+/*
+ * Idle the CPU in the deepest _LPI state whose minimum residency fits
+ * before the next timer event.  Called with interrupts disabled; returns
+ * with them disabled.
+ */
+static void
+acpi_cpu_idle_lpi(sbintime_t sbt)
+{
+    struct acpi_cpu_softc *sc;
+    struct acpi_cx *cx;
+    uint64_t start_ticks, end_ticks;
+    uint32_t end_time;
+    int i, us;
+
+    sc = cpu_softc[PCPU_GET(cpuid)];
+    if (sc == NULL || is_idle_disabled(sc)) {
+	__asm __volatile("dsb sy; wfi" ::: "memory");
+	return;
+    }
+
+    us = sc->cpu_prev_sleep;
+    if (sbt >= 0 && us > (sbt >> 12))
+	us = (sbt >> 12);
+    if (cpu_disable_c2_sleep)
+	i = min(sc->cpu_cx_lowest, sc->cpu_non_c2);
+    else if (cpu_disable_c3_sleep)
+	i = min(sc->cpu_cx_lowest, sc->cpu_non_c3);
+    else
+	i = sc->cpu_cx_lowest;
+    for (; i > 0; i--) {
+	cx = &sc->cpu_cx_states[i];
+	if (cx->min_res <= us && acpi_cpu_lpi_usable(cx))
+	    break;
+    }
+    sc->cpu_cx_stats[i]++;
+
+    start_ticks = cpu_ticks();
+    __asm __volatile("dsb sy; wfi" ::: "memory");
+    end_ticks = cpu_ticks();
+
+    end_time = ((end_ticks - start_ticks) << 20) / cpu_tickrate();
+    sc->cpu_prev_sleep = (sc->cpu_prev_sleep * 3 + end_time) / 4;
+    sc->cpu_cx_duration[i] += end_time;
+}
+#endif /* __aarch64__ */
+
 /*
  * Re-evaluate the _CST object when we are notified that it changed.
  */
@@ -1316,7 +1477,10 @@ acpi_cpu_notify(ACPI_HANDLE h, UINT32 notify, void *context)
     disable_idle(sc);
 
     /* Update the list of Cx states. */
-    acpi_cpu_cx_cst(sc);
+#ifdef __aarch64__
+    if (acpi_cpu_cx_lpi(sc) != 0)
+#endif
+	acpi_cpu_cx_cst(sc);
     acpi_cpu_cx_list(sc);
     acpi_cpu_set_cx_lowest(sc);
 
@@ -1330,6 +1494,16 @@ static void
 acpi_cpu_quirks(void)
 {
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
+
+    /*
+     * Hardware-reduced ACPI has no bus master control.  Its low-power
+     * idle states are entered through firmware, which keeps the caches
+     * coherent.
+     */
+    if (AcpiGbl_ReducedHardware) {
+	cpu_quirks |= CPU_QUIRK_NO_BM_CTRL;
+	return;
+    }
 
     /*
      * Bus mastering arbitration control is needed to keep caches coherent

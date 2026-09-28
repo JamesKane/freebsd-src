@@ -313,17 +313,31 @@ cpu_idle_wakeup(int cpu)
 	return (0);
 }
 
+/*
+ * Idle hook, set by acpi_cpu(4) when firmware describes low-power idle
+ * states.  It is called with interrupts disabled, is given the time until
+ * the next timer event (or -1 if unknown), and returns with interrupts
+ * still disabled once an interrupt is pending.
+ */
+void (*cpu_idle_hook)(sbintime_t) = NULL;
+
 void
 cpu_idle(int busy)
 {
+	sbintime_t sbt;
 
+	sbt = -1;
 	spinlock_enter();
 	if (!busy)
-		cpu_idleclock();
-	if (!sched_runnable())
-		__asm __volatile(
-		    "dsb sy \n"
-		    "wfi    \n");
+		sbt = cpu_idleclock();
+	if (!sched_runnable()) {
+		if (cpu_idle_hook != NULL)
+			cpu_idle_hook(sbt);
+		else
+			__asm __volatile(
+			    "dsb sy \n"
+			    "wfi    \n");
+	}
 	if (!busy)
 		cpu_activeclock();
 	spinlock_exit();
