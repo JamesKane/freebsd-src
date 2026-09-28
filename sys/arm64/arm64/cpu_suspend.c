@@ -78,9 +78,10 @@ static bool cpu_suspend_gicv3;
 static vm_paddr_t cpu_suspend_entry_pa;
 
 /*
- * Whether cpu_suspend_psci() can be used: PSCI is present and the kernel
- * runs at EL1 (when it runs at EL2 the EL2 state would be lost), and the
- * core has no state this code does not restore (SVE).
+ * Whether cpu_suspend_psci() can be used: PSCI is present, the kernel was
+ * entered at EL1 (a core resuming at EL2 would lose the EL2 state set up
+ * since boot, such as vmm(4)'s), and the core has no state this code does
+ * not restore (SVE).
  */
 bool
 cpu_suspend_supported(void)
@@ -89,10 +90,12 @@ cpu_suspend_supported(void)
 
 	if (cpu_suspend_entry_pa == 0) {
 		get_kernel_reg(ID_AA64PFR0_EL1, &pfr0);
-		cpu_suspend_ok = psci_present && !in_vhe() &&
+		cpu_suspend_ok = psci_present && !has_hyp() &&
 		    ID_AA64PFR0_SVE_VAL(pfr0) == ID_AA64PFR0_SVE_NONE;
+		/* Only when the GIC driver uses the system registers. */
 		cpu_suspend_gicv3 =
-		    ID_AA64PFR0_GIC_VAL(pfr0) != ID_AA64PFR0_GIC_CPUIF_NONE;
+		    ID_AA64PFR0_GIC_VAL(pfr0) != ID_AA64PFR0_GIC_CPUIF_NONE &&
+		    (READ_SPECIALREG(icc_sre_el1) & ICC_SRE_EL1_SRE) != 0;
 		cpu_suspend_entry_pa =
 		    pmap_kextract((vm_offset_t)cpu_suspend_resume_entry);
 	}

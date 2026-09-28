@@ -1195,9 +1195,13 @@ LENTRY(start_mmu)
 	/* Clear the Monitor Debug System control register */
 	msr	mdscr_el1, xzr
 
-	/* Invalidate the TLB */
-	tlbi	vmalle1is
-	dsb	ish
+	/*
+	 * Invalidate this CPU's TLB.  Only this CPU starts using the page
+	 * tables here, whether at boot or resuming from a power-down, so
+	 * other CPUs' TLBs are left alone.
+	 */
+	tlbi	vmalle1
+	dsb	nsh
 	isb
 
 	ldr	x2, mair

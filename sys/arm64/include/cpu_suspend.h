@@ -68,7 +68,7 @@ struct cpu_suspend_ctx {
 int	cpu_suspend_psci(uint32_t power_state);
 bool	cpu_suspend_supported(void);
 
-int	cpu_suspend_save(struct cpu_suspend_ctx *);
+int	cpu_suspend_save(struct cpu_suspend_ctx *) __returns_twice;
 void	cpu_suspend_resume_entry(void);
 #endif
 #endif /* !LOCORE */
