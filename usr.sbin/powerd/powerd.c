@@ -92,10 +92,33 @@ static const char *modes[] = {
 #define DEVDPIPE	"/var/run/devd.pipe"
 #define DEVCTL_MAXBUF	1024
 
-static int	read_usage_times(int *load, int nonice);
-static int	read_freqs(int *numfreqs, int **freqs, int **power,
-		    int minfreq, int maxfreq);
-static int	set_freq(int freq);
+/*
+ * A frequency domain: CPUs that share one clock.  Its first CPU's
+ * dev.cpu.N.freq controls it.  CPUs whose frequency levels differ are
+ * taken to be in different domains, as on big.LITTLE systems, and a CPU
+ * without its own dev.cpu.N.freq belongs to the domain of the CPU before
+ * it.  Systems whose CPUs all offer the same levels have one domain,
+ * controlled through dev.cpu.0.freq.
+ */
+struct freq_domain {
+	int	cpu;		/* first CPU */
+	int	freq_mib[4];
+	char	*levels;	/* dev.cpu.N.freq_levels */
+	int	*freqs;		/* in the user-specified range */
+	int	*mwatts;
+	int	numfreqs;
+	int	freq;		/* wanted */
+	int	curfreq;
+	int	initfreq;
+	int	i;		/* index of curfreq in freqs */
+	int	load;		/* summed over its CPUs */
+};
+
+static int	read_usage_times(int nonice);
+static int	read_freqs(const char *levels, int *numfreqs, int **freqs,
+		    int **power, int minfreq, int maxfreq);
+static void	init_domains(int minfreq, int maxfreq);
+static int	set_freq(struct freq_domain *d, int freq);
 static void	acline_init(void);
 static void	acline_read(int rfds);
 static bool	netlink_init(void);
@@ -107,8 +130,6 @@ static void	usage(void);
 
 /* Sysctl data structures. */
 static int	cp_times_mib[2];
-static int	freq_mib[4];
-static int	levels_mib[4];
 static int	acline_mib[4];
 static size_t	acline_mib_len;
 
@@ -117,6 +138,12 @@ static int	cpu_running_mark;
 static int	cpu_idle_mark;
 static int	poll_ival;
 static int	vflag;
+
+/* Frequency domains, and the domain of each CPU. */
+static struct freq_domain *domains;
+static int	ndomains;
+static int	ncpus;
+static int	*cpu_domain;
 
 static volatile sig_atomic_t exit_requested;
 static power_src_t acline_status;
@@ -142,26 +169,25 @@ static struct snl_state ss;
 static struct timeval tried_devd;
 
 /*
- * This function returns summary load of all CPUs.  It was made so
- * intentionally to not reduce performance in scenarios when several
- * threads are processing requests as a pipeline -- running one at
- * a time on different CPUs and waiting for each other.  If nonice
- * is nonzero, only user+sys+intr time will be counted as load; any
- * nice time will be treated as if idle.
+ * This function sets each domain's load to the summary load of its
+ * CPUs.  It was made so intentionally to not reduce performance in
+ * scenarios when several threads are processing requests as a pipeline
+ * -- running one at a time on different CPUs and waiting for each
+ * other.  If nonice is nonzero, only user+sys+intr time will be counted
+ * as load; any nice time will be treated as if idle.  The first call
+ * only records the times.
  */
 static int
-read_usage_times(int *load, int nonice)
+read_usage_times(int nonice)
 {
 	static long *cp_times = NULL, *cp_times_old = NULL;
-	static int ncpus = 0;
 	size_t cp_times_len;
-	int error, cpu, i, total, excl;
+	int error, cpu, d, i, total, excl;
+	bool first;
 
-	if (cp_times == NULL) {
-		cp_times_len = 0;
-		error = sysctl(cp_times_mib, 2, NULL, &cp_times_len, NULL, 0);
-		if (error)
-			return (error);
+	first = (cp_times == NULL);
+	cp_times_len = sizeof(long) * CPUSTATES * ncpus;
+	if (first) {
 		if ((cp_times = malloc(cp_times_len)) == NULL)
 			return (errno);
 		if ((cp_times_old = malloc(cp_times_len)) == NULL) {
@@ -169,16 +195,15 @@ read_usage_times(int *load, int nonice)
 			cp_times = NULL;
 			return (errno);
 		}
-		ncpus = cp_times_len / (sizeof(long) * CPUSTATES);
 	}
 
-	cp_times_len = sizeof(long) * CPUSTATES * ncpus;
 	error = sysctl(cp_times_mib, 2, cp_times, &cp_times_len, NULL, 0);
 	if (error)
 		return (error);
 
-	if (load) {
-		*load = 0;
+	if (!first) {
+		for (d = 0; d < ndomains; d++)
+			domains[d].load = 0;
 		for (cpu = 0; cpu < ncpus; cpu++) {
 			total = 0;
 			for (i = 0; i < CPUSTATES; i++) {
@@ -192,7 +217,8 @@ read_usage_times(int *load, int nonice)
 			if (nonice)
 				excl += cp_times[cpu * CPUSTATES + CP_NICE] -
 				    cp_times_old[cpu * CPUSTATES + CP_NICE];
-			*load += 100 - excl * 100 / total;
+			domains[cpu_domain[cpu]].load +=
+			    100 - excl * 100 / total;
 		}
 	}
 
@@ -202,20 +228,14 @@ read_usage_times(int *load, int nonice)
 }
 
 static int
-read_freqs(int *numfreqs, int **freqs, int **power, int minfreq, int maxfreq)
+read_freqs(const char *levels, int *numfreqs, int **freqs, int **power,
+    int minfreq, int maxfreq)
 {
 	char *freqstr, *p, *q;
 	int i, j;
-	size_t len = 0;
 
-	if (sysctl(levels_mib, 4, NULL, &len, NULL, 0))
+	if ((freqstr = strdup(levels)) == NULL)
 		return (-1);
-	if ((freqstr = malloc(len)) == NULL)
-		return (-1);
-	if (sysctl(levels_mib, 4, freqstr, &len, NULL, 0)) {
-		free(freqstr);
-		return (-1);
-	}
 
 	*numfreqs = 1;
 	for (p = freqstr; *p != '\0'; p++)
@@ -259,26 +279,108 @@ read_freqs(int *numfreqs, int **freqs, int **power, int minfreq, int maxfreq)
 	return (0);
 }
 
+/* Return a sysctl's string value in allocated memory, or NULL. */
+static char *
+sysctl_string(const char *name)
+{
+	char *buf;
+	size_t len;
+
+	len = 0;
+	if (sysctlbyname(name, NULL, &len, NULL, 0) != 0 ||
+	    (buf = malloc(len)) == NULL)
+		return (NULL);
+	if (sysctlbyname(name, buf, &len, NULL, 0) != 0) {
+		free(buf);
+		return (NULL);
+	}
+	return (buf);
+}
+
+static void
+init_domains(int minfreq, int maxfreq)
+{
+	struct freq_domain *d;
+	char name[64], *levels;
+	size_t len;
+	int cpu, i;
+
+	len = 0;
+	if (sysctl(cp_times_mib, 2, NULL, &len, NULL, 0))
+		err(1, "read kern.cp_times");
+	ncpus = len / (sizeof(long) * CPUSTATES);
+	if ((cpu_domain = calloc(ncpus, sizeof(*cpu_domain))) == NULL ||
+	    (domains = calloc(ncpus, sizeof(*domains))) == NULL)
+		err(1, "calloc");
+
+	for (cpu = 0; cpu < ncpus; cpu++) {
+		snprintf(name, sizeof(name), "dev.cpu.%d.freq_levels", cpu);
+		if ((levels = sysctl_string(name)) == NULL) {
+			if (cpu == 0)
+				errx(EX_UNAVAILABLE,
+				    "no cpufreq(4) support -- aborting");
+			cpu_domain[cpu] = cpu_domain[cpu - 1];
+			continue;
+		}
+		for (i = 0; i < ndomains; i++)
+			if (strcmp(domains[i].levels, levels) == 0)
+				break;
+		cpu_domain[cpu] = i;
+		if (i < ndomains) {
+			free(levels);
+			continue;
+		}
+
+		d = &domains[ndomains++];
+		d->cpu = cpu;
+		d->levels = levels;
+		len = nitems(d->freq_mib);
+		snprintf(name, sizeof(name), "dev.cpu.%d.freq", cpu);
+		if (sysctlnametomib(name, d->freq_mib, &len))
+			err(EX_UNAVAILABLE, "lookup %s", name);
+		if (read_freqs(levels, &d->numfreqs, &d->freqs, &d->mwatts,
+		    minfreq, maxfreq))
+			err(1, "error reading supported CPU frequencies");
+		if (d->numfreqs == 0)
+			errx(1, "no CPU %d frequencies in user-specified range",
+			    cpu);
+	}
+	if (vflag && ndomains > 1) {
+		for (i = 0; i < ndomains; i++)
+			printf("cpu%d: %d frequencies, %d-%d MHz\n",
+			    domains[i].cpu, domains[i].numfreqs,
+			    domains[i].freqs[domains[i].numfreqs - 1],
+			    domains[i].freqs[0]);
+	}
+}
+
+static void
+print_prefix(const struct freq_domain *d)
+{
+	if (ndomains > 1)
+		printf("cpu%d: ", d->cpu);
+}
+
 static int
-get_freq(void)
+get_freq(struct freq_domain *d)
 {
 	size_t len;
 	int curfreq;
 
 	len = sizeof(curfreq);
-	if (sysctl(freq_mib, 4, &curfreq, &len, NULL, 0) != 0) {
+	if (sysctl(d->freq_mib, 4, &curfreq, &len, NULL, 0) != 0) {
 		if (vflag)
-			warn("error reading current CPU frequency");
+			warn("error reading current CPU %d frequency", d->cpu);
 		curfreq = 0;
 	}
 	return (curfreq);
 }
 
 static int
-set_freq(int freq)
+set_freq(struct freq_domain *d, int freq)
 {
 
-	if (sysctl(freq_mib, 4, NULL, NULL, &freq, sizeof(freq))) {
+	if (sysctl(d->freq_mib, 4, NULL, NULL, &freq, sizeof(freq))) {
 		if (errno != EPERM)
 			return (-1);
 	}
@@ -576,7 +678,8 @@ main(int argc, char * argv[])
 	int nfds, rfds;
 	struct pidfh *pfh = NULL;
 	const char *pidfile = NULL;
-	int freq, curfreq, initfreq, *freqs, i, j, *mwatts, numfreqs, load;
+	struct freq_domain *d;
+	int j, k, load, numfreqs, *freqs;
 	int minfreq = -1, maxfreq = -1;
 	int ch, mode, mode_ac, mode_battery, mode_none, idle, to;
 	uint64_t mjoules_used;
@@ -672,20 +775,13 @@ main(int argc, char * argv[])
 	len = 2;
 	if (sysctlnametomib("kern.cp_times", cp_times_mib, &len))
 		err(1, "lookup kern.cp_times");
-	len = 4;
-	if (sysctlnametomib("dev.cpu.0.freq", freq_mib, &len))
-		err(EX_UNAVAILABLE, "no cpufreq(4) support -- aborting");
-	len = 4;
-	if (sysctlnametomib("dev.cpu.0.freq_levels", levels_mib, &len))
-		err(1, "lookup freq_levels");
 
-	/* Check if we can read the load and supported freqs. */
-	if (read_usage_times(NULL, nonice))
+	/* Find the frequency domains and their supported freqs. */
+	init_domains(minfreq, maxfreq);
+
+	/* Check if we can read the load. */
+	if (read_usage_times(nonice))
 		err(1, "read_usage_times");
-	if (read_freqs(&numfreqs, &freqs, &mwatts, minfreq, maxfreq))
-		err(1, "error reading supported CPU frequencies");
-	if (numfreqs == 0)
-		errx(1, "no CPU frequencies in user-specified range");
 
 	/* Run in the background unless in verbose mode. */
 	if (!vflag) {
@@ -717,10 +813,12 @@ main(int argc, char * argv[])
 	signal(SIGINT, handle_sigs);
 	signal(SIGTERM, handle_sigs);
 
-	freq = initfreq = curfreq = get_freq();
-	i = get_freq_id(curfreq, freqs, numfreqs);
-	if (freq < 1)
-		freq = 1;
+	for (d = domains; d < domains + ndomains; d++) {
+		d->freq = d->initfreq = d->curfreq = get_freq(d);
+		d->i = get_freq_id(d->curfreq, d->freqs, d->numfreqs);
+		if (d->freq < 1)
+			d->freq = 1;
+	}
 
 	/*
 	 * If we are in adaptive mode and the current frequency is outside the
@@ -735,31 +833,40 @@ main(int argc, char * argv[])
 	    (mode_battery == MODE_ADAPTIVE || mode_battery == MODE_HIADAPTIVE)) ||
 	    (acline_status == SRC_UNKNOWN &&
 	    (mode_none == MODE_ADAPTIVE || mode_none == MODE_HIADAPTIVE))) {
-		/* Read the current frequency. */
-		len = sizeof(curfreq);
-		if (sysctl(freq_mib, 4, &curfreq, &len, NULL, 0) != 0) {
-			if (vflag)
-				warn("error reading current CPU frequency");
-		}
-		if (curfreq < freqs[numfreqs - 1]) {
-			if (vflag) {
-				printf("CPU frequency is below user-defined "
-				    "minimum; changing frequency to %d "
-				    "MHz\n", freqs[numfreqs - 1]);
+		for (d = domains; d < domains + ndomains; d++) {
+			freqs = d->freqs;
+			numfreqs = d->numfreqs;
+			/* Read the current frequency. */
+			len = sizeof(d->curfreq);
+			if (sysctl(d->freq_mib, 4, &d->curfreq, &len, NULL,
+			    0) != 0) {
+				if (vflag)
+					warn("error reading current CPU "
+					    "frequency");
 			}
-			if (set_freq(freqs[numfreqs - 1]) != 0) {
-				warn("error setting CPU freq %d",
-				    freqs[numfreqs - 1]);
-			}
-		} else if (curfreq > freqs[0]) {
-			if (vflag) {
-				printf("CPU frequency is above user-defined "
-				    "maximum; changing frequency to %d "
-				    "MHz\n", freqs[0]);
-			}
-			if (set_freq(freqs[0]) != 0) {
-				warn("error setting CPU freq %d",
-				    freqs[0]);
+			if (d->curfreq < freqs[numfreqs - 1]) {
+				if (vflag) {
+					print_prefix(d);
+					printf("CPU frequency is below "
+					    "user-defined minimum; changing "
+					    "frequency to %d MHz\n",
+					    freqs[numfreqs - 1]);
+				}
+				if (set_freq(d, freqs[numfreqs - 1]) != 0) {
+					warn("error setting CPU freq %d",
+					    freqs[numfreqs - 1]);
+				}
+			} else if (d->curfreq > freqs[0]) {
+				if (vflag) {
+					print_prefix(d);
+					printf("CPU frequency is above "
+					    "user-defined maximum; changing "
+					    "frequency to %d MHz\n", freqs[0]);
+				}
+				if (set_freq(d, freqs[0]) != 0) {
+					warn("error setting CPU freq %d",
+					    freqs[0]);
+				}
 			}
 		}
 	}
@@ -814,117 +921,128 @@ main(int argc, char * argv[])
 
 		/* Read the current frequency. */
 		if (idle % 32 == 0) {
-			if ((curfreq = get_freq()) == 0)
+			for (d = domains; d < domains + ndomains; d++) {
+				if ((d->curfreq = get_freq(d)) == 0)
+					break;
+				d->i = get_freq_id(d->curfreq, d->freqs,
+				    d->numfreqs);
+			}
+			if (d < domains + ndomains)
 				continue;
-			i = get_freq_id(curfreq, freqs, numfreqs);
 		}
 		idle++;
 		if (vflag) {
 			/* Keep a sum of all power actually used. */
-			if (mwatts[i] != -1)
-				mjoules_used +=
-				    (mwatts[i] * (poll_ival / 1000)) / 1000;
+			for (d = domains; d < domains + ndomains; d++)
+				if (d->mwatts[d->i] != -1)
+					mjoules_used += (d->mwatts[d->i] *
+					    (poll_ival / 1000)) / 1000;
 		}
 
-		/* Always switch to the lowest frequency in min mode. */
-		if (mode == MODE_MIN) {
-			freq = freqs[numfreqs - 1];
-			if (curfreq != freq) {
+		/*
+		 * Always switch to the lowest frequency in min mode, and
+		 * to the highest in max mode.
+		 */
+		if (mode == MODE_MIN || mode == MODE_MAX) {
+			for (d = domains; d < domains + ndomains; d++) {
+				d->freq = (mode == MODE_MIN) ?
+				    d->freqs[d->numfreqs - 1] : d->freqs[0];
+				if (d->curfreq == d->freq)
+					continue;
 				if (vflag) {
+					print_prefix(d);
 					printf("now operating on %s power; "
 					    "changing frequency to %d MHz\n",
-					    modes[acline_status], freq);
+					    modes[acline_status], d->freq);
 				}
 				idle = 0;
-				if (set_freq(freq) != 0) {
+				if (set_freq(d, d->freq) != 0)
 					warn("error setting CPU freq %d",
-					    freq);
-					continue;
-				}
-			}
-			continue;
-		}
-
-		/* Always switch to the highest frequency in max mode. */
-		if (mode == MODE_MAX) {
-			freq = freqs[0];
-			if (curfreq != freq) {
-				if (vflag) {
-					printf("now operating on %s power; "
-					    "changing frequency to %d MHz\n",
-					    modes[acline_status], freq);
-				}
-				idle = 0;
-				if (set_freq(freq) != 0) {
-					warn("error setting CPU freq %d",
-					    freq);
-					continue;
-				}
+					    d->freq);
 			}
 			continue;
 		}
 
 		/* Adaptive mode; get the current CPU usage times. */
-		if (read_usage_times(&load, nonice)) {
+		if (read_usage_times(nonice)) {
 			if (vflag)
 				warn("read_usage_times() failed");
 			continue;
 		}
 
-		if (mode == MODE_ADAPTIVE) {
-			if (load > cpu_running_mark) {
-				if (load > 95 || load > cpu_running_mark * 2)
-					freq *= 2;
-				else
-					freq = freq * load / cpu_running_mark;
-				if (freq > freqs[0])
-					freq = freqs[0];
-			} else if (load < cpu_idle_mark &&
-			    curfreq * load < freqs[get_freq_id(
-			    freq * 7 / 8, freqs, numfreqs)] *
-			    cpu_running_mark) {
-				freq = freq * 7 / 8;
-				if (freq < freqs[numfreqs - 1])
-					freq = freqs[numfreqs - 1];
+		for (d = domains; d < domains + ndomains; d++) {
+			freqs = d->freqs;
+			numfreqs = d->numfreqs;
+			load = d->load;
+			if (mode == MODE_ADAPTIVE) {
+				if (load > cpu_running_mark) {
+					if (load > 95 ||
+					    load > cpu_running_mark * 2)
+						d->freq *= 2;
+					else
+						d->freq = d->freq * load /
+						    cpu_running_mark;
+					if (d->freq > freqs[0])
+						d->freq = freqs[0];
+				} else if (load < cpu_idle_mark &&
+				    d->curfreq * load < freqs[get_freq_id(
+				    d->freq * 7 / 8, freqs, numfreqs)] *
+				    cpu_running_mark) {
+					d->freq = d->freq * 7 / 8;
+					if (d->freq < freqs[numfreqs - 1])
+						d->freq = freqs[numfreqs - 1];
+				}
+			} else { /* MODE_HIADAPTIVE */
+				if (load > cpu_running_mark / 2) {
+					if (load > 95 ||
+					    load > cpu_running_mark)
+						d->freq *= 4;
+					else
+						d->freq = d->freq * load * 2 /
+						    cpu_running_mark;
+					if (d->freq > freqs[0] * 2)
+						d->freq = freqs[0] * 2;
+				} else if (load < cpu_idle_mark / 2 &&
+				    d->curfreq * load < freqs[get_freq_id(
+				    d->freq * 31 / 32, freqs, numfreqs)] *
+				    cpu_running_mark / 2) {
+					d->freq = d->freq * 31 / 32;
+					if (d->freq < freqs[numfreqs - 1])
+						d->freq = freqs[numfreqs - 1];
+				}
 			}
-		} else { /* MODE_HIADAPTIVE */
-			if (load > cpu_running_mark / 2) {
-				if (load > 95 || load > cpu_running_mark)
-					freq *= 4;
-				else
-					freq = freq * load * 2 / cpu_running_mark;
-				if (freq > freqs[0] * 2)
-					freq = freqs[0] * 2;
-			} else if (load < cpu_idle_mark / 2 &&
-			    curfreq * load < freqs[get_freq_id(
-			    freq * 31 / 32, freqs, numfreqs)] *
-			    cpu_running_mark / 2) {
-				freq = freq * 31 / 32;
-				if (freq < freqs[numfreqs - 1])
-					freq = freqs[numfreqs - 1];
-			}
-		}
-		if (vflag) {
-		    printf("load %3d%%, current freq %4d MHz (%2d), wanted freq %4d MHz\n",
-			load, curfreq, i, freq);
-		}
-		j = get_freq_id(freq, freqs, numfreqs);
-		if (i != j) {
 			if (vflag) {
-				printf("changing clock"
-				    " speed from %d MHz to %d MHz\n",
-				    freqs[i], freqs[j]);
+				print_prefix(d);
+				printf("load %3d%%, current freq %4d MHz "
+				    "(%2d), wanted freq %4d MHz\n",
+				    load, d->curfreq, d->i, d->freq);
 			}
-			idle = 0;
-			if (set_freq(freqs[j]))
-				warn("error setting CPU frequency %d",
-				    freqs[j]);
+			j = get_freq_id(d->freq, freqs, numfreqs);
+			if (d->i != j) {
+				if (vflag) {
+					print_prefix(d);
+					printf("changing clock"
+					    " speed from %d MHz to %d MHz\n",
+					    freqs[d->i], freqs[j]);
+				}
+				idle = 0;
+				if (set_freq(d, freqs[j]))
+					warn("error setting CPU frequency %d",
+					    freqs[j]);
+			}
 		}
 	}
-	if (set_freq(initfreq))
-		warn("error setting CPU frequency %d", initfreq);
-	free(freqs);
-	free(mwatts);
+	for (d = domains; d < domains + ndomains; d++) {
+		if (set_freq(d, d->initfreq))
+			warn("error setting CPU frequency %d", d->initfreq);
+	}
+	for (k = 0; k < ndomains; k++) {
+		free(domains[k].freqs);
+		free(domains[k].mwatts);
+		free(domains[k].levels);
+	}
+	free(domains);
+	free(cpu_domain);
 	devd_close();
 	if (!vflag)
 		pidfile_remove(pfh);

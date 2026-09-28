@@ -22,7 +22,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd February 25, 2023
+.Dd September 28, 2026
 .Dt POWERD 8
 .Os
 .Sh NAME
@@ -81,6 +81,28 @@ The default mode is
 for battery power and
 .Cm hiadaptive
 for the rest.
+.Pp
+CPUs whose
+.Va dev.cpu.\& Ns Ar N Ns Va .freq_levels
+differ, such as the clusters of a big.LITTLE system, are taken to have
+separate clocks.
+.Nm
+manages each such frequency domain on its own, from the load of its
+CPUs, through the
+.Va dev.cpu.\& Ns Ar N Ns Va .freq
+of its first CPU;
+a CPU without
+.Va dev.cpu.\& Ns Ar N Ns Va .freq
+belongs to the domain of the CPU before it.
+When all CPUs offer the same levels,
+.Nm
+manages them together through
+.Va dev.cpu.0.freq .
+The
+.Fl m
+and
+.Fl M
+limits apply to every domain.
 .Pp
 .Nm
 recognizes these runtime options:
