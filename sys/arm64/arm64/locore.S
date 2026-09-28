@@ -31,6 +31,7 @@
 #include <machine/asm.h>
 #include <machine/armreg.h>
 #include <machine/cpu.h>
+#include <machine/cpu_suspend.h>
 #include <machine/hypervisor.h>
 #include <machine/param.h>
 #include <machine/pte.h>
@@ -338,6 +339,154 @@ mp_cpu_spin_table_release_addr:
 mp_cpu_spinloop_end:
 END(mp_cpu_spinloop)
 #endif
+
+/*
+ * int
+ * cpu_suspend_save(struct cpu_suspend_ctx *ctx)
+ *
+ * Save what cpu_suspend_resume_entry needs to resume the calling context
+ * after the core has been powered down.  Returns 0; returns again, with
+ * 1, when the core resumes.  The caller sets CS_FLAGS beforehand.
+ */
+ENTRY(cpu_suspend_save)
+	stp	x19, x20, [x0, #(CS_X19 + 0 * 8)]
+	stp	x21, x22, [x0, #(CS_X19 + 2 * 8)]
+	stp	x23, x24, [x0, #(CS_X19 + 4 * 8)]
+	stp	x25, x26, [x0, #(CS_X19 + 6 * 8)]
+	stp	x27, x28, [x0, #(CS_X19 + 8 * 8)]
+	stp	x29, x30, [x0, #(CS_X19 + 10 * 8)]
+	mov	x1, sp
+	str	x1, [x0, #CS_SP]
+
+	mrs	x1, ttbr0_el1
+	mrs	x2, ttbr1_el1
+	stp	x1, x2, [x0, #CS_TTBR0]
+	mrs	x1, tcr_el1
+	mrs	x2, mair_el1
+	stp	x1, x2, [x0, #CS_TCR]
+	mrs	x1, sctlr_el1
+	mrs	x2, vbar_el1
+	stp	x1, x2, [x0, #CS_SCTLR]
+	mrs	x1, tpidr_el1
+	mrs	x2, sp_el0
+	stp	x1, x2, [x0, #CS_TPIDR_EL1]
+	mrs	x1, contextidr_el1
+	mrs	x2, tpidr_el0
+	stp	x1, x2, [x0, #CS_CONTEXTIDR]
+	mrs	x1, tpidrro_el0
+	str	x1, [x0, #CS_TPIDRRO_EL0]
+
+	ldr	x1, [x0, #CS_FLAGS]
+	tbz	x1, #0, 1f		/* CS_FLAG_APIA */
+	.arch_extension pauth
+	mrs	x1, APIAKeyLo_EL1_REG
+	mrs	x2, APIAKeyHi_EL1_REG
+	.arch_extension nopauth
+	stp	x1, x2, [x0, #CS_APIA_LO]
+1:
+	mov	x0, #0
+	ret
+END(cpu_suspend_save)
+
+/*
+ * void
+ * cpu_suspend_resume_entry(void)
+ *
+ * PSCI enters here, at its physical address with the MMU off, when a core
+ * resumes from a powered-down CPU_SUSPEND state.  x0 is the context id:
+ * the virtual address of the context cpu_suspend_save saved.  Turn the
+ * MMU on as for a secondary core, restore that context and return 1 from
+ * cpu_suspend_save.
+ */
+ENTRY(cpu_suspend_resume_entry)
+	/* Disable interrupts */
+	msr	daifset, #DAIF_INTR
+	mov	x19, x0
+
+	/* Enter the kernel exception level */
+	bl	enter_kernel_el
+
+	/* Find the shareability attributes, as in _start */
+#if PAGE_SIZE == PAGE_SIZE_4K
+#define	LPA2_MASK	ID_AA64MMFR0_TGran4_MASK
+#define	LPA2_VAL	ID_AA64MMFR0_TGran4_LPA2
+#elif PAGE_SIZE == PAGE_SIZE_16K
+#define	LPA2_MASK	ID_AA64MMFR0_TGran16_MASK
+#define	LPA2_VAL	ID_AA64MMFR0_TGran16_LPA2
+#endif
+	mrs	x6, id_aa64mmfr0_el1
+	mov	x7, LPA2_VAL
+	and	x6, x6, LPA2_MASK
+	cmp	x6, x7
+	ldr	x22, =(ATTR_SH(ATTR_SH_IS))
+	csel	x22, xzr, x22, eq
+#undef LPA2_MASK
+#undef LPA2_VAL
+
+	/* Enable the MMU with the kernel and identity page tables */
+	adrp	x24, pagetable_l0_ttbr1
+	add	x24, x24, :lo12:pagetable_l0_ttbr1
+	adrp	x27, pagetable_l0_ttbr0_bootstrap
+	add	x27, x27, :lo12:pagetable_l0_ttbr0_bootstrap
+	bl	start_mmu
+
+	/* Jump to the virtual address space */
+	ldr	x15, =cpu_suspend_resume_virt
+	br	x15
+
+cpu_suspend_resume_virt:
+	BTI_J
+	mov	x0, x19
+
+	/* Restore the translation regime the core was using */
+	ldp	x1, x2, [x0, #CS_TCR]
+	msr	tcr_el1, x1
+	msr	mair_el1, x2
+	ldp	x1, x2, [x0, #CS_TTBR0]
+	msr	ttbr0_el1, x1
+	msr	ttbr1_el1, x2
+	isb
+	tlbi	vmalle1
+	dsb	nsh
+	isb
+	ldp	x1, x2, [x0, #CS_SCTLR]
+	msr	sctlr_el1, x1
+	msr	vbar_el1, x2
+	isb
+
+	/* x18 is the kernel's pcpu pointer, kept in tpidr_el1 */
+	ldp	x1, x2, [x0, #CS_TPIDR_EL1]
+	msr	tpidr_el1, x1
+	mov	x18, x1
+	msr	sp_el0, x2
+	ldp	x1, x2, [x0, #CS_CONTEXTIDR]
+	msr	contextidr_el1, x1
+	msr	tpidr_el0, x2
+	ldr	x1, [x0, #CS_TPIDRRO_EL0]
+	msr	tpidrro_el0, x1
+
+	/* The key must match before a signed return address is checked. */
+	ldr	x1, [x0, #CS_FLAGS]
+	tbz	x1, #0, 1f		/* CS_FLAG_APIA */
+	ldp	x1, x2, [x0, #CS_APIA_LO]
+	.arch_extension pauth
+	msr	APIAKeyLo_EL1_REG, x1
+	msr	APIAKeyHi_EL1_REG, x2
+	.arch_extension nopauth
+1:
+	isb
+
+	ldr	x1, [x0, #CS_SP]
+	mov	sp, x1
+	ldp	x19, x20, [x0, #(CS_X19 + 0 * 8)]
+	ldp	x21, x22, [x0, #(CS_X19 + 2 * 8)]
+	ldp	x23, x24, [x0, #(CS_X19 + 4 * 8)]
+	ldp	x25, x26, [x0, #(CS_X19 + 6 * 8)]
+	ldp	x27, x28, [x0, #(CS_X19 + 8 * 8)]
+	ldp	x29, x30, [x0, #(CS_X19 + 10 * 8)]
+	mov	x0, #1
+	ret
+END(cpu_suspend_resume_entry)
 
 /*
  * Enter the exception level the kernel will use:

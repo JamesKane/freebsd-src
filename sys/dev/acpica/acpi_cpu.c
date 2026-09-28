@@ -48,6 +48,9 @@
 #include <machine/specialreg.h>
 #include <machine/md_var.h>
 #endif
+#ifdef __aarch64__
+#include <machine/cpu_suspend.h>
+#endif
 #include <sys/rman.h>
 
 #include <contrib/dev/acpica/include/acpi.h>
@@ -77,6 +80,7 @@ struct acpi_cx {
 #ifdef __aarch64__
     uint32_t		 min_res;	/* _LPI minimum residency (usec). */
     uint32_t		 psci_state;	/* _LPI PSCI CPU_SUSPEND parameter. */
+    bool		 lpi_failed;	/* Firmware refused the state. */
 #endif
 };
 #define MAX_CX_STATES	 8
@@ -1400,13 +1404,18 @@ acpi_cpu_cx_lpi(struct acpi_cpu_softc *sc)
 }
 
 /*
- * Whether a state can be entered yet.  Only WFI is implemented; the
- * PSCI CPU_SUSPEND states are listed but not used.
+ * Whether a state can be entered: WFI always; PSCI CPU_SUSPEND states
+ * once the firmware has not refused them, and states that power the core
+ * down only where cpu_suspend_psci() can restore it.
  */
 static bool
 acpi_cpu_lpi_usable(const struct acpi_cx *cx)
 {
-    return (cx->type == ACPI_STATE_C1);
+    if (cx->type == ACPI_STATE_C1)
+	return (true);
+    if (cx->lpi_failed)
+	return (false);
+    return (cx->type < ACPI_STATE_C3 || cpu_suspend_supported());
 }
 
 /*
@@ -1443,10 +1452,18 @@ acpi_cpu_idle_lpi(sbintime_t sbt)
 	if (cx->min_res <= us && acpi_cpu_lpi_usable(cx))
 	    break;
     }
+    cx = &sc->cpu_cx_states[i];
     sc->cpu_cx_stats[i]++;
 
     start_ticks = cpu_ticks();
-    __asm __volatile("dsb sy; wfi" ::: "memory");
+    if (cx->type == ACPI_STATE_C1) {
+	__asm __volatile("dsb sy; wfi" ::: "memory");
+    } else if (cpu_suspend_psci(cx->psci_state) != 0) {
+	cx->lpi_failed = true;
+	device_printf(sc->cpu_dev,
+	    "PSCI refused idle state C%d (0x%x), not using it\n", i + 1,
+	    cx->psci_state);
+    }
     end_ticks = cpu_ticks();
 
     end_time = ((end_ticks - start_ticks) << 20) / cpu_tickrate();
