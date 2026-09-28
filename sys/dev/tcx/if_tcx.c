@@ -50,11 +50,13 @@
 #include <sys/bus.h>
 #include <sys/endian.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/mbuf.h>
 #include <sys/module.h>
 #include <sys/rman.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
+#include <sys/sx.h>
 #include <sys/sysctl.h>
 
 #include <machine/atomic.h>
@@ -122,8 +124,8 @@
  * Transmit interrupt moderation.  iflib asks for a completion interrupt
  * as often as every other packet when the ring is nearly empty; honour
  * the request only once tx_coal_frames descriptors have been queued since
- * the last one.  iflib also reclaims descriptors when it transmits and
- * from its timer, so completions are never stranded.
+ * the last one, and at least every quarter ring, so that a ring iflib
+ * sees filling up always holds a descriptor that will interrupt.
  */
 #define	TCX_TX_COAL_FRAMES_DEFAULT 128
 #define	TCX_PBL			32
@@ -136,6 +138,7 @@
 #define	TCX_MDIO_CR		0
 #define	TCX_MDIO_TIMEOUT	10000	/* microseconds */
 #define	TCX_SWR_TIMEOUT		100000	/* microseconds */
+#define	TCX_STOP_TIMEOUT	100000	/* microseconds */
 #define	TCX_PMA_TIMEOUT		1000000	/* microseconds */
 #define	TCX_XPCS_RESET_TIMEOUT	600000	/* microseconds */
 
@@ -223,6 +226,7 @@ struct tcx_softc {
 	u_int			tx_since_ioc;
 	u_long			stat_rx_err;	/* frames with ES set */
 	uint32_t		rx_err_des3;	/* status of the last */
+	uint32_t		rx_pause_last;	/* MMC PAUSE count seen */
 	u_long			stat_intr;	/* interrupts taken */
 	u_long			stat_intr_rx;	/* ... with RI set */
 	u_long			stat_intr_tx;	/* ... with TI set */
@@ -343,7 +347,12 @@ static struct if_txrx tcx_txrx = {
 
 static struct if_shared_ctx tcx_sctx_init = {
 	.isc_magic = IFLIB_MAGIC,
-	.isc_q_align = PAGE_SIZE,
+	/*
+	 * The DMA keeps only the low 32 bits of its descriptor pointers, so a
+	 * ring must not cross a 4GB boundary; one aligned to its largest
+	 * possible size cannot.
+	 */
+	.isc_q_align = TCX_NDESC_MAX * sizeof(struct tcx_desc),
 
 	.isc_tx_maxsize = TCX_TX_MAXSIZE,
 	.isc_tx_maxsegsize = PAGE_SIZE,
@@ -936,6 +945,12 @@ tcx_sysctl_serdes(SYSCTL_HANDLER_ARGS)
 	char buf[256];
 
 	sc = arg1;
+	/* The XPCS viewport is shared with the link code. */
+	sx_xlock(iflib_ctx_lock_get(sc->ctx));
+	if (sc->sfr_res == NULL) {
+		sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+		return (ENXIO);
+	}
 	snprintf(buf, sizeof(buf), "EMACCTL 0x%08x, set for %u Mb/s; "
 	    "PCS CTRL2 0x%04x, BMCR 0x%04x, BMSR 0x%04x, DIG_CTRL1 0x%04x, "
 	    "AN_CTRL 0x%04x, AN_INTR_STS 0x%04x",
@@ -946,6 +961,7 @@ tcx_sysctl_serdes(SYSCTL_HANDLER_ARGS)
 	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_VR_MII_DIG_CTRL1),
 	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_VR_MII_AN_CTRL),
 	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_VR_MII_AN_INTR_STS));
+	sx_xunlock(iflib_ctx_lock_get(sc->ctx));
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
@@ -968,9 +984,11 @@ tcx_sysctl_rx_riwt(SYSCTL_HANDLER_ARGS)
 	 * it does no harm once every frame interrupts.  The next init
 	 * clears it.
 	 */
-	if (v != 0)
+	sx_xlock(iflib_ctx_lock_get(sc->ctx));
+	if (v != 0 && sc->sfr_res != NULL)
 		MAC_WRITE(sc, XGMAC_DMA_CH_RX_WATCHDOG(0), v);
 	sc->rx_riwt = v;
+	sx_xunlock(iflib_ctx_lock_get(sc->ctx));
 	return (0);
 }
 
@@ -986,8 +1004,11 @@ tcx_sysctl_serdes_reset(SYSCTL_HANDLER_ARGS)
 	error = sysctl_handle_int(oidp, &v, 0, req);
 	if (error != 0 || req->newptr == NULL)
 		return (error);
-	if (v != 0)
+	if (v != 0) {
+		sx_xlock(iflib_ctx_lock_get(sc->ctx));
 		sc->serdes_speed = 0;
+		sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+	}
 	return (0);
 }
 
@@ -1089,8 +1110,12 @@ tcx_attach_pre(if_ctx_t ctx)
 	scctx->isc_tx_tso_segments_max = TCX_TX_MAXSEGS;
 	scctx->isc_tx_tso_size_max = TCX_TSO_SIZE;
 	scctx->isc_tx_tso_segsize_max = PAGE_SIZE;
-	/* A TSO packet may need an MSS context and a split header buffer. */
-	scctx->isc_tx_pad = 2;
+	/*
+	 * A TSO packet may need an MSS context and a split header buffer on
+	 * top of its segments, and one descriptor must stay free so that a
+	 * full ring is not mistaken for an empty one.
+	 */
+	scctx->isc_tx_pad = 3;
 	scctx->isc_ntxqsets_max = scctx->isc_ntxqsets = 1;
 	scctx->isc_nrxqsets_max = scctx->isc_nrxqsets = 1;
 	scctx->isc_capabilities = scctx->isc_capenable = IFCAP_VLAN_MTU |
@@ -1136,9 +1161,15 @@ tcx_sysctl_reg(SYSCTL_HANDLER_ARGS)
 
 	sc = arg1;
 	reg = arg2 & ~1;
+	sx_xlock(iflib_ctx_lock_get(sc->ctx));
+	if (sc->sfr_res == NULL) {
+		sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+		return (ENXIO);
+	}
 	v = MAC_READ(sc, reg);
 	if ((arg2 & 1) != 0)
 		v |= (uint64_t)MAC_READ(sc, reg + 4) << 32;
+	sx_xunlock(iflib_ctx_lock_get(sc->ctx));
 	return (sysctl_handle_64(oidp, &v, 0, req));
 }
 
@@ -1217,6 +1248,11 @@ tcx_attach_post(if_ctx_t ctx)
 	ifmedia_add(sc->media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0, NULL);
 	ifmedia_add(sc->media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
 	ifmedia_add(sc->media, IFM_ETHER | IFM_10_T | IFM_FDX, 0, NULL);
+	/* The MAC is full duplex only; accept the speeds without the option. */
+	ifmedia_add(sc->media, IFM_ETHER | IFM_2500_T, 0, NULL);
+	ifmedia_add(sc->media, IFM_ETHER | IFM_1000_T, 0, NULL);
+	ifmedia_add(sc->media, IFM_ETHER | IFM_100_TX, 0, NULL);
+	ifmedia_add(sc->media, IFM_ETHER | IFM_10_T, 0, NULL);
 	ifmedia_set(sc->media, IFM_ETHER | IFM_AUTO);
 
 	if (!tcx_phy_poll(sc)) {
@@ -1435,6 +1471,8 @@ tcx_init(if_ctx_t ctx)
 
 	sc->txq.cidx = sc->txq.pidx = 0;
 	sc->txq.tso_mss = 0;
+	sc->tx_since_ioc = 0;
+	sc->rx_ioc_count = 0;
 	a = tcx_dma_addr(sc->txq.paddr);
 	MAC_WRITE(sc, XGMAC_DMA_CH_TXDESC_HADDR(0), a >> 32);
 	MAC_WRITE(sc, XGMAC_DMA_CH_TXDESC_LADDR(0), (uint32_t)a);
@@ -1476,22 +1514,42 @@ tcx_stop(if_ctx_t ctx)
 {
 	struct tcx_softc *sc;
 	uint32_t v;
+	int i;
 
 	sc = iflib_get_softc(ctx);
 	MSI_WRITE(sc, TC956X_MSI_OUT_EN, 0);
 	MAC_WRITE(sc, XGMAC_DMA_CH_INT_EN(0), 0);
 
+	/*
+	 * iflib frees the buffers once this returns, so the DMA must have
+	 * stopped reading them: let the transmit DMA finish its current
+	 * packet, and the MAC send what it holds, before turning it off.
+	 */
 	v = MAC_READ(sc, XGMAC_DMA_CH_TX_CONTROL(0));
 	MAC_WRITE(sc, XGMAC_DMA_CH_TX_CONTROL(0), v & ~XGMAC_DMA_CH_TXST);
+	for (i = 0; i < TCX_STOP_TIMEOUT; i += 100) {
+		if ((MAC_READ(sc, XGMAC_DMA_CH_STATUS(0)) &
+		    XGMAC_DMA_CH_TPS) != 0 &&
+		    (MAC_READ(sc, XGMAC_MTL_TXQ_DEBUG(0)) &
+		    XGMAC_MTL_TXQ_NOT_EMPTY) == 0)
+			break;
+		tcx_delay(100);
+	}
 	v = MAC_READ(sc, XGMAC_TX_CONFIG);
 	MAC_WRITE(sc, XGMAC_TX_CONFIG, v & ~XGMAC_TX_CONFIG_TE);
+
+	/* Stop receiving, then let the DMA drain what the MTL holds. */
 	v = MAC_READ(sc, XGMAC_RX_CONFIG);
 	MAC_WRITE(sc, XGMAC_RX_CONFIG, v & ~XGMAC_RX_CONFIG_RE);
+	for (i = 0; i < TCX_STOP_TIMEOUT; i += 100) {
+		if ((MAC_READ(sc, XGMAC_MTL_RXQ_DEBUG(0)) &
+		    XGMAC_MTL_RXQ_NOT_EMPTY) == 0)
+			break;
+		tcx_delay(100);
+	}
 	v = MAC_READ(sc, XGMAC_DMA_CH_RX_CONTROL(0));
 	MAC_WRITE(sc, XGMAC_DMA_CH_RX_CONTROL(0), v & ~XGMAC_DMA_CH_RXST);
-
-	/* Let a transfer in flight finish before iflib frees the buffers. */
-	DELAY(1000);
+	MAC_WRITE(sc, XGMAC_DMA_CH_STATUS(0), 0xffffffff);
 }
 
 /*
@@ -1543,8 +1601,11 @@ tcx_intr(void *arg)
 	if ((st & XGMAC_DMA_CH_RBU) != 0)
 		sc->stat_rbu++;
 	if ((st & XGMAC_DMA_CH_FBE) != 0) {
+		/* The channel has stopped; only a reinit restarts it. */
 		sc->stat_fbe++;
 		device_printf(sc->dev, "DMA bus error, status 0x%08x\n", st);
+		iflib_request_reset(sc->ctx);
+		iflib_admin_intr_deferred(sc->ctx);
 	}
 
 	/* iflib runs the queues and then calls tcx_intr_enable(). */
@@ -1643,7 +1704,8 @@ tcx_txd_encap(void *arg, if_pkt_info_t pi)
 				des3 |= TDES3_LD;
 				sc->tx_since_ioc += ndesc + 1;
 				if ((pi->ipi_flags & IPI_TX_INTR) != 0 &&
-				    sc->tx_since_ioc >= sc->tx_coal_frames) {
+				    sc->tx_since_ioc >= MIN(sc->tx_coal_frames,
+				    (u_int)n / 4)) {
 					des2 |= TDES2_IOC;
 					sc->tx_since_ioc = 0;
 				}
@@ -1677,24 +1739,35 @@ tcx_txd_credits_update(void *arg, uint16_t qid, bool clear)
 {
 	struct tcx_softc *sc;
 	struct tcx_txq *q;
+	uint32_t des3;
 	qidx_t idx;
-	int count, n;
+	int count, done, n;
 
 	sc = arg;
 	q = &sc->txq;
 	n = sc->scctx->isc_ntxd[0];
 
-	/* The DMA clears OWN in every descriptor it has finished with. */
-	count = 0;
+	/*
+	 * The DMA clears OWN in every descriptor it has finished with, but
+	 * only whole packets may be reported: iflib frees a packet's mbufs
+	 * once the credits pass its first descriptor, and holds back just
+	 * isc_tx_nsegments, fewer than a TSO packet can use.
+	 */
+	count = done = 0;
 	for (idx = q->cidx; idx != q->pidx; idx = (idx + 1) % n) {
-		if ((le32toh(q->ring[idx].des3) & TDES3_OWN) != 0)
+		des3 = le32toh(q->ring[idx].des3);
+		if ((des3 & TDES3_OWN) != 0)
 			break;
 		count++;
-		if (!clear)
-			return (1);
+		if ((des3 & (TDES3_CTXT | TDES3_LD)) == TDES3_LD) {
+			done = count;
+			if (!clear)
+				return (1);
+		}
 	}
-	q->cidx = idx;
-	return (count);
+	if (clear)
+		q->cidx = (q->cidx + done) % n;
+	return (done);
 }
 
 /*
@@ -1889,9 +1962,25 @@ tcx_mtu_set(if_ctx_t ctx, uint32_t mtu)
 static void
 tcx_timer(if_ctx_t ctx, uint16_t qid)
 {
+	struct tcx_softc *sc;
+	uint32_t pause;
+
+	if (qid != 0)
+		return;
+	sc = iflib_get_softc(ctx);
+
+	/*
+	 * A link partner that keeps sending PAUSE holds our transmitter;
+	 * tell iflib, whose watchdog would otherwise reset the interface.
+	 */
+	pause = MAC_READ(sc, XGMAC_MMC_RX_PAUSE);
+	if (pause != sc->rx_pause_last) {
+		sc->rx_pause_last = pause;
+		sc->scctx->isc_pause_frames = 1;
+	}
+
 	/* No link interrupt yet, so poll the PHY from the admin task. */
-	if (qid == 0)
-		iflib_admin_intr_deferred(ctx);
+	iflib_admin_intr_deferred(ctx);
 }
 
 static void
@@ -1930,6 +2019,9 @@ tcx_update_admin_status(if_ctx_t ctx)
 	sc->txpause_reported = sc->link_txpause;
 	sc->rxpause_reported = sc->link_rxpause;
 	if (state == LINK_STATE_UP) {
+		if (!sc->link_fdx)
+			device_printf(sc->dev, "half-duplex link: the MAC only "
+			    "does full duplex, expect errors\n");
 		tcx_mac_set_speed(sc);
 		iflib_link_state_change(ctx, LINK_STATE_UP,
 		    IF_Mbps(sc->link_speed));

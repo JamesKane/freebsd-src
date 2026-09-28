@@ -240,11 +240,16 @@
 #define	XGMAC_MMC_BASE			0x0800
 #define	XGMAC_MMC_RX_PKT_GB		(XGMAC_MMC_BASE + 0x100)	/* 64 */
 #define	XGMAC_MMC_RX_CRC_ERR		(XGMAC_MMC_BASE + 0x128)	/* 64 */
+#define	XGMAC_MMC_RX_PAUSE		(XGMAC_MMC_BASE + 0x188)	/* 64 */
 #define	XGMAC_MMC_RX_FIFOOVER_PKT	(XGMAC_MMC_BASE + 0x190)	/* 64 */
 #define	XGMAC_MMC_RX_DISCARD_PKT_GB	(XGMAC_MMC_BASE + 0x1ac)	/* 64 */
 
 /* MTL, one queue */
+#define	XGMAC_MTL_TXQ_DEBUG(q)		(0x1108 + (q) * 0x80)
+#define	 XGMAC_MTL_TXQ_NOT_EMPTY	(1u << 4)	/* TXQSTS */
 #define	XGMAC_MTL_RXQ_MISSED(q)		(0x1144 + (q) * 0x80)
+#define	XGMAC_MTL_RXQ_DEBUG(q)		(0x1148 + (q) * 0x80)
+#define	 XGMAC_MTL_RXQ_NOT_EMPTY	((0x3fffu << 16) | (0x3u << 4))
 /* Thresholds count down from full: FIFO size - (1KB + n * 512 bytes). */
 #define	XGMAC_MTL_RXQ_FLOW_CONTROL(q)	(0x1150 + (q) * 0x80)
 #define	 XGMAC_MTL_RFA_SHIFT		1	/* send PAUSE above this */
@@ -299,6 +304,7 @@
 #define	 XGMAC_DMA_CH_RWT_MASK		0xffu
 #define	XGMAC_DMA_CH_STATUS(c)		(0x3160 + (c) * 0x80)
 #define	 XGMAC_DMA_CH_TI		(1u << 0)
+#define	 XGMAC_DMA_CH_TPS		(1u << 1)	/* TX stopped */
 #define	 XGMAC_DMA_CH_TPS		(1u << 1)
 #define	 XGMAC_DMA_CH_TBU		(1u << 2)
 #define	 XGMAC_DMA_CH_RI		(1u << 6)

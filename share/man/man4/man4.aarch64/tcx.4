@@ -123,7 +123,9 @@ Selecting a fixed media type limits what the PHY advertises to that
 speed; the link is still auto-negotiated.
 Only
 .Cm full-duplex
-operation is supported.
+operation is supported, and it is used whether or not
+.Cm mediaopt full-duplex
+is given.
 .Sh HARDWARE
 The
 .Nm
@@ -169,7 +171,9 @@ An interrupt is raised this long after the first received frame that
 has not been reported yet.
 Larger values mean fewer interrupts and more latency.
 The default is 64, about 130 microseconds;
-0 raises an interrupt for every frame.
+0 raises an interrupt for every frame,
+fully so only once the interface is next reinitialized,
+as receive buffers already posted keep the old setting.
 .It Va rx_coal_frames
 When
 .Va rx_riwt
@@ -198,7 +202,8 @@ Frames discarded by the MAC.
 .It Va mtl_rxq0_missed
 The raw missed and overflow packet counts of receive queue 0.
 .It Va rx_buf_unavail
-The number of times the receive DMA found no free descriptor.
+The number of interrupts that found the receive DMA had run out of free
+descriptors.
 .It Va dma_bus_errors
 The number of fatal DMA bus errors.
 .It Va serdes
@@ -210,8 +215,9 @@ link check.
 .Sh DIAGNOSTICS
 .Bl -diag
 .It "tcx%d: function 0 has not set up the chip"
-Function 1 attached before function 0,
-which must set up the parts of the chip that both functions share.
+Function 1 attached without function 0 having attached successfully
+first;
+function 0 sets up the parts of the chip that both functions share.
 .It "tcx%d: cannot allocate an MSI"
 The driver needs one MSI per function.
 .It "tcx%d: MAC %d did not start cleanly"
