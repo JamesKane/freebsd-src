@@ -42,6 +42,8 @@
 #define	DWC3_GSBUSCFG1		0xc104
 #define	DWC3_GTXTHRCFG		0xc108
 #define	DWC3_GRXTHRCFG		0xc10C
+#define	 DWC3_GRXTHRCFG_PKTCNTSEL	(1 << 29)
+#define	 DWC31_GRXTHRCFG_PKTCNTSEL	(1 << 26)
 
 /* Global Core Control Register */
 #define	DWC3_GCTL			0xc110

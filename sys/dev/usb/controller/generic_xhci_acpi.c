@@ -52,7 +52,10 @@
 #include <contrib/dev/acpica/include/acpi.h>
 #include <dev/acpica/acpivar.h>
 
+#include <dev/usb/controller/dwc3/dwc3.h>
+
 #include "generic_xhci.h"
+#include "acpi_bus_if.h"
 
 static char *xhci_ids[] = {
 	"PNP0D10",
@@ -61,8 +64,9 @@ static char *xhci_ids[] = {
 };
 
 /*
- * A USB Role Switch device holds a dual-role controller's registers; its
- * host-role child, with _ADR 0, holds the host controller's interrupts.
+ * A USB Role Switch device (PNP0CA1) holds a dual-role controller's
+ * registers; its host-role child, with _ADR 0, holds the host
+ * controller's interrupts, the controller's own first.
  */
 static char *urs_ids[] = {
 	"PNP0CA1",
@@ -71,37 +75,41 @@ static char *urs_ids[] = {
 
 #define	URS_HOST_ADR	0
 
-struct urs_irq_arg {
+struct urs_irq {
 	UINT32	gsiv;
+	int	trig;
+	int	pol;
 	bool	found;
 };
 
 static ACPI_STATUS
 urs_find_irq(ACPI_RESOURCE *res, void *context)
 {
-	struct urs_irq_arg *arg = context;
+	struct urs_irq *irq = context;
+	ACPI_RESOURCE_EXTENDED_IRQ *ext;
 
-	if (arg->found)
+	/* A GIC interrupt consumed by the device, not a routed one. */
+	if (res->Type != ACPI_RESOURCE_TYPE_EXTENDED_IRQ)
 		return (AE_OK);
-	if (res->Type == ACPI_RESOURCE_TYPE_EXTENDED_IRQ &&
-	    res->Data.ExtendedIrq.InterruptCount > 0) {
-		arg->gsiv = res->Data.ExtendedIrq.Interrupts[0];
-		arg->found = true;
-	} else if (res->Type == ACPI_RESOURCE_TYPE_IRQ &&
-	    res->Data.Irq.InterruptCount > 0) {
-		arg->gsiv = res->Data.Irq.Interrupts[0];
-		arg->found = true;
-	}
-	return (AE_OK);
+	ext = &res->Data.ExtendedIrq;
+	if (ext->ProducerConsumer != ACPI_CONSUMER ||
+	    ext->ResourceSource.StringLength != 0 || ext->InterruptCount == 0)
+		return (AE_OK);
+	irq->gsiv = ext->Interrupts[0];
+	irq->trig = ext->Triggering == ACPI_EDGE_SENSITIVE ?
+	    INTR_TRIGGER_EDGE : INTR_TRIGGER_LEVEL;
+	irq->pol = ext->Polarity == ACPI_ACTIVE_LOW ?
+	    INTR_POLARITY_LOW : INTR_POLARITY_HIGH;
+	irq->found = true;
+	return (AE_CTRL_TERMINATE);
 }
 
-/* Find the first interrupt of the role switch's host-role child. */
+/* Find the interrupt of the role switch's present host-role child. */
 static int
-urs_host_irq(device_t dev, UINT32 *gsiv)
+urs_host_irq(device_t dev, struct urs_irq *irq)
 {
-	struct urs_irq_arg arg;
 	ACPI_HANDLE child;
-	UINT32 adr;
+	UINT32 adr, sta;
 
 	child = NULL;
 	while (ACPI_SUCCESS(AcpiGetNextObject(ACPI_TYPE_DEVICE,
@@ -109,67 +117,75 @@ urs_host_irq(device_t dev, UINT32 *gsiv)
 		if (ACPI_FAILURE(acpi_GetInteger(child, "_ADR", &adr)) ||
 		    adr != URS_HOST_ADR)
 			continue;
-		arg.found = false;
-		if (ACPI_SUCCESS(AcpiWalkResources(child, "_CRS", urs_find_irq,
-		    &arg)) && arg.found) {
-			*gsiv = arg.gsiv;
+		if (ACPI_SUCCESS(acpi_GetInteger(child, "_STA", &sta)) &&
+		    !ACPI_DEVICE_PRESENT(sta))
+			continue;
+		irq->found = false;
+		AcpiWalkResources(child, "_CRS", urs_find_irq, irq);
+		if (irq->found)
 			return (0);
-		}
 	}
 	return (ENXIO);
+}
+
+/* A role switch that is not also described as an xHCI controller. */
+static bool
+generic_xhci_acpi_is_urs(device_t dev)
+{
+	device_t bus = device_get_parent(dev);
+
+	return (ACPI_ID_PROBE(bus, dev, xhci_ids, NULL) > 0 &&
+	    ACPI_ID_PROBE(bus, dev, urs_ids, NULL) <= 0);
 }
 
 static int
 generic_xhci_acpi_probe(device_t dev)
 {
-	UINT32 gsiv;
+	struct urs_irq irq;
 
-	if (ACPI_ID_PROBE(device_get_parent(dev), dev, xhci_ids, NULL) >= 0) {
-		if (ACPI_ID_PROBE(device_get_parent(dev), dev, urs_ids,
-		    NULL) >= 0 || urs_host_irq(dev, &gsiv) != 0)
-			return (ENXIO);
-	}
+	if (ACPI_ID_PROBE(device_get_parent(dev), dev, xhci_ids, NULL) > 0 &&
+	    (!generic_xhci_acpi_is_urs(dev) || urs_host_irq(dev, &irq) != 0))
+		return (ENXIO);
 
 	device_set_desc(dev, XHCI_HC_DEVSTR);
 
 	return (BUS_PROBE_GENERIC);
 }
 
-/* Synopsys DWC_usb3x global registers, after the xHCI registers. */
-#define	DWC3_GSNPSID		0xc120
-#define	 DWC3_GSNPSID_USB3	0x5533
-#define	 DWC3_GSNPSID_USB31	0x3331
-#define	 DWC3_GSNPSID_USB32	0x3332
-#define	DWC3_GRXTHRCFG		0xc10c
-#define	 DWC3_GRXTHRCFG_PKTCNTSEL	(1u << 29)
-#define	 DWC31_GRXTHRCFG_PKTCNTSEL	(1u << 26)
-#define	DWC3_MIN_SIZE		0xc200
-
 /*
- * Firmware may leave a DWC3 core's receive threshold enabled, which on
- * the SC8280XP's USB-C controllers cuts SuperSpeed reads to a third.
- * Disable it, as the core's reset default does.
+ * A role switch's controller is used as firmware left it, which must be
+ * host mode.  If it is a Synopsys DWC_usb3x core, check that, and disable
+ * a receive threshold firmware may have left enabled: on the SC8280XP's
+ * USB-C controllers it cuts SuperSpeed reads to a third.  The core's
+ * reset default has it disabled.
  */
-static void
-generic_xhci_acpi_dwc3_fixup(device_t dev)
+static int
+generic_xhci_acpi_urs_setup(device_t dev)
 {
 	struct resource *mem;
 	uint32_t id, reg, sel;
-	int rid;
+	int error, rid;
 
 	rid = 0;
 	mem = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
 	if (mem == NULL)
-		return;
-	if (rman_get_size(mem) < DWC3_MIN_SIZE)
+		return (ENXIO);
+	error = 0;
+	if (rman_get_size(mem) <= DWC3_GSNPSID)
 		goto out;
-	id = bus_read_4(mem, DWC3_GSNPSID) >> 16;
-	if (id == DWC3_GSNPSID_USB3)
+	id = DWC3_VERSION(bus_read_4(mem, DWC3_GSNPSID));
+	if (id == DWC3_IP_ID)
 		sel = DWC3_GRXTHRCFG_PKTCNTSEL;
-	else if (id == DWC3_GSNPSID_USB31 || id == DWC3_GSNPSID_USB32)
+	else if (id == DWC3_1_IP_ID || id == DWC3_2_IP_ID)
 		sel = DWC31_GRXTHRCFG_PKTCNTSEL;
 	else
 		goto out;
+	if ((bus_read_4(mem, DWC3_GCTL) & DWC3_GCTL_PRTCAPDIR_MASK) !=
+	    DWC3_GCTL_PRTCAPDIR_HOST) {
+		device_printf(dev, "controller is not in host mode\n");
+		error = ENXIO;
+		goto out;
+	}
 	reg = bus_read_4(mem, DWC3_GRXTHRCFG);
 	if ((reg & sel) != 0) {
 		if (bootverbose)
@@ -179,23 +195,36 @@ generic_xhci_acpi_dwc3_fixup(device_t dev)
 	}
 out:
 	bus_release_resource(dev, SYS_RES_MEMORY, rid, mem);
+	return (error);
 }
 
 static int
 generic_xhci_acpi_attach(device_t dev)
 {
-	UINT32 gsiv;
+	struct resource_list *rl;
+	struct urs_irq irq;
+	device_t bus;
+	int error, irqno;
 
-	/*
-	 * A role switch's interrupts belong to its host-role child.  The
-	 * controller is used as firmware left it, which must be host mode.
-	 */
-	if (ACPI_ID_PROBE(device_get_parent(dev), dev, urs_ids, NULL) <= 0) {
-		if (urs_host_irq(dev, &gsiv) != 0)
+	if (generic_xhci_acpi_is_urs(dev)) {
+		error = generic_xhci_acpi_urs_setup(dev);
+		if (error != 0)
+			return (error);
+		if (urs_host_irq(dev, &irq) != 0)
 			return (ENXIO);
-		bus_set_resource(dev, SYS_RES_IRQ, 0, gsiv, 1);
+		/*
+		 * Map the child's interrupt with its own trigger and
+		 * polarity; bus_set_resource() would look them up in the
+		 * role switch's _CRS.
+		 */
+		bus = device_get_parent(dev);
+		rl = BUS_GET_RESOURCE_LIST(bus, dev);
+		if (rl == NULL)
+			return (ENXIO);
+		irqno = ACPI_BUS_MAP_INTR(bus, dev, irq.gsiv, irq.trig,
+		    irq.pol);
+		resource_list_add(rl, SYS_RES_IRQ, 0, irqno, irqno, 1);
 	}
-	generic_xhci_acpi_dwc3_fixup(dev);
 	return (generic_xhci_attach(dev));
 }
 
