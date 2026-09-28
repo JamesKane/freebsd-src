@@ -1323,54 +1323,65 @@ acpi_cpu_idle(sbintime_t sbt)
 #define	 LPI_FLAG_ENABLED	0x1
 #define	LPI_ARCH_FLAGS		3
 #define	 LPI_ARCH_CORE_LOST	0x1	/* Arm: core context is lost. */
+#define	LPI_ENABLED_PARENT	5
 #define	LPI_ENTRY_METHOD	6
 #define	LPI_STATE_FIELDS	10
 #define	LPI_PSCI_WFI		0xffffffff	/* Arm FFH: plain WFI. */
 
-#define	LPI_ENABLED_PARENT	5
-
-/* A processor container's _LPI state (ACPI 6.x, 8.4.4.3). */
-struct acpi_lpi_parent {
+/* An _LPI state, of a processor or of a processor container. */
+struct acpi_lpi_state {
     uint32_t	min_res;
     uint32_t	wake_lat;
-    uint32_t	enabled_parent;	/* its own parent states it allows */
-    uint32_t	entry;		/* added to the child's entry value */
-    bool	enabled;
+    uint32_t	flags;
+    uint32_t	arch_flags;
+    uint32_t	enabled_parent;	/* parent states it may be combined with */
+    uint64_t	entry;		/* FFH register address, or integer */
+    bool	ffh;		/* entry is an FFH register */
+    bool	valid;
 };
-#define	LPI_MAX_PARENT_STATES	4
 
 /*
- * Read the _LPI states of the processor container h, in order; entry i
- * is parent state i + 1 in the children's EnabledParentState numbering.
+ * Read the _LPI states of h, shallowest first, into st.  Returns the
+ * number of states read, keeping invalid ones in place so that state i is
+ * number i + 1 of EnabledParentState, or -1 without a valid _LPI.
  */
 static int
-acpi_cpu_lpi_parent(ACPI_HANDLE h, struct acpi_lpi_parent *st)
+acpi_cpu_lpi_read(ACPI_HANDLE h, struct acpi_lpi_state *st, int max)
 {
     ACPI_BUFFER buf;
     ACPI_OBJECT *top, *pkg;
-    uint32_t count, flags, i;
-    int n;
+    uint32_t count, entry;
+    int accsize, class, n, vendor;
 
     buf.Pointer = NULL;
     buf.Length = ACPI_ALLOCATE_BUFFER;
     if (ACPI_FAILURE(AcpiEvaluateObject(h, "_LPI", NULL, &buf)))
-	return (0);
+	return (-1);
+
+    /* Revision, level ID, count, then the states. */
     top = (ACPI_OBJECT *)buf.Pointer;
-    n = 0;
+    n = -1;
     if (ACPI_PKG_VALID(top, 4) && acpi_PkgInt32(top, 2, &count) == 0 &&
 	count == top->Package.Count - 3) {
-	for (i = 0; i < count && n < LPI_MAX_PARENT_STATES; i++, n++) {
-	    pkg = &top->Package.Elements[i + 3];
+	for (n = 0; n < count && n < max; n++) {
+	    pkg = &top->Package.Elements[n + 3];
 	    memset(&st[n], 0, sizeof(st[n]));
 	    if (!ACPI_PKG_VALID(pkg, LPI_STATE_FIELDS) ||
 		acpi_PkgInt32(pkg, LPI_MIN_RESIDENCY, &st[n].min_res) != 0 ||
 		acpi_PkgInt32(pkg, LPI_WAKE_LATENCY, &st[n].wake_lat) != 0 ||
-		acpi_PkgInt32(pkg, LPI_FLAGS, &flags) != 0 ||
+		acpi_PkgInt32(pkg, LPI_FLAGS, &st[n].flags) != 0 ||
+		acpi_PkgInt32(pkg, LPI_ARCH_FLAGS, &st[n].arch_flags) != 0 ||
 		acpi_PkgInt32(pkg, LPI_ENABLED_PARENT,
-		&st[n].enabled_parent) != 0 ||
-		acpi_PkgInt32(pkg, LPI_ENTRY_METHOD, &st[n].entry) != 0)
-		continue;	/* not enabled */
-	    st[n].enabled = (flags & LPI_FLAG_ENABLED) != 0;
+		&st[n].enabled_parent) != 0)
+		continue;
+	    if (acpi_PkgInt32(pkg, LPI_ENTRY_METHOD, &entry) == 0) {
+		st[n].entry = entry;
+		st[n].valid = true;
+	    } else if (acpi_PkgFFH_IntelCpu(pkg, LPI_ENTRY_METHOD, &vendor,
+		&class, &st[n].entry, &accsize) == 0) {
+		st[n].ffh = true;
+		st[n].valid = true;
+	    }
 	}
     }
     AcpiOsFree(buf.Pointer);
@@ -1378,116 +1389,103 @@ acpi_cpu_lpi_parent(ACPI_HANDLE h, struct acpi_lpi_parent *st)
 }
 
 /*
- * Read this processor's own (leaf) _LPI states.  On Arm each is entered
- * through the FFH entry method: WFI, or PSCI CPU_SUSPEND with the given
- * power state.  States that keep the core's context are C2-type; states
- * that lose it are C3-type.  Deeper C3-type states are then composed
- * with the processor's container (cluster and system) states.
+ * Add child composed with the container state p as a deeper state: p's
+ * integer entry value is added to the child's PSCI power state, and the
+ * composite takes the deeper state's residency and latency.  Returns the
+ * new state, or NULL if p is not usable.
+ */
+static struct acpi_cx *
+acpi_cpu_lpi_compose(struct acpi_cpu_softc *sc, const struct acpi_cx *child,
+    const struct acpi_lpi_state *p)
+{
+    struct acpi_cx *cx;
+
+    if (!p->valid || p->ffh || (p->flags & LPI_FLAG_ENABLED) == 0 ||
+	sc->cpu_cx_count == MAX_CX_STATES)
+	return (NULL);
+    cx = &sc->cpu_cx_states[sc->cpu_cx_count++];
+    *cx = *child;
+    cx->psci_state += p->entry;
+    cx->min_res = max(cx->min_res, p->min_res);
+    cx->trans_lat = max(cx->trans_lat, p->wake_lat);
+    return (cx);
+}
+
+/*
+ * Read this processor's _LPI states.  On Arm each is entered through the
+ * FFH entry method: WFI, or PSCI CPU_SUSPEND with the given power state.
+ * States that keep the core's context are C2-type; states that lose it
+ * are C3-type, used only where cpu_suspend_psci() can restore the core,
+ * and are also composed with the states of the processor's container (a
+ * cluster) and of its parent (the system).  The platform only enters a
+ * container state once every child has requested it.
  */
 static int
 acpi_cpu_cx_lpi(struct acpi_cpu_softc *sc)
 {
-    struct acpi_cx *cx, *sys_cx;
-    ACPI_BUFFER buf;
-    ACPI_OBJECT *top, *pkg;
-    struct acpi_lpi_parent cl[LPI_MAX_PARENT_STATES];
-    struct acpi_lpi_parent sys[LPI_MAX_PARENT_STATES];
+    struct acpi_lpi_state leaf[MAX_CX_STATES], cl[MAX_CX_STATES];
+    struct acpi_lpi_state sys[MAX_CX_STATES];
+    struct acpi_cx *cx, *clcx;
     ACPI_HANDLE clh, sysh;
     uint32_t enparent[MAX_CX_STATES];
-    uint64_t address;
-    uint32_t arch, count, flags, i, j, k;
-    int accsize, class, vendor, ncl, nsys, nleaf;
+    int i, j, k, n, ncl, nsys, nleaf;
 
-    buf.Pointer = NULL;
-    buf.Length = ACPI_ALLOCATE_BUFFER;
-    if (ACPI_FAILURE(AcpiEvaluateObject(sc->cpu_handle, "_LPI", NULL, &buf)))
-	return (ENXIO);
-
-    /* Revision, level ID, count, then the states from shallow to deep. */
-    top = (ACPI_OBJECT *)buf.Pointer;
-    if (!ACPI_PKG_VALID(top, 4) || acpi_PkgInt32(top, 2, &count) != 0 ||
-	count != top->Package.Count - 3) {
+    (void)cpu_suspend_supported();	/* sets up cpu_suspend_psci() */
+    n = acpi_cpu_lpi_read(sc->cpu_handle, leaf, MAX_CX_STATES);
+    if (n < 0) {
 	device_printf(sc->cpu_dev, "invalid _LPI package\n");
-	AcpiOsFree(buf.Pointer);
 	return (ENXIO);
     }
 
     sc->cpu_cx_count = 0;
-    for (i = 0; i < count && sc->cpu_cx_count < MAX_CX_STATES; i++) {
-	pkg = &top->Package.Elements[i + 3];
-	cx = &sc->cpu_cx_states[sc->cpu_cx_count];
-	memset(cx, 0, sizeof(*cx));
-	if (!ACPI_PKG_VALID(pkg, LPI_STATE_FIELDS) ||
-	    acpi_PkgInt32(pkg, LPI_MIN_RESIDENCY, &cx->min_res) != 0 ||
-	    acpi_PkgInt32(pkg, LPI_WAKE_LATENCY, &cx->trans_lat) != 0 ||
-	    acpi_PkgInt32(pkg, LPI_FLAGS, &flags) != 0 ||
-	    acpi_PkgInt32(pkg, LPI_ARCH_FLAGS, &arch) != 0 ||
-	    acpi_PkgFFH_IntelCpu(pkg, LPI_ENTRY_METHOD, &vendor, &class,
-	    &address, &accsize) != 0) {
-	    device_printf(sc->cpu_dev, "skipping invalid _LPI state %u\n", i);
+    for (i = 0; i < n; i++) {
+	if (!leaf[i].valid || !leaf[i].ffh) {
+	    device_printf(sc->cpu_dev, "skipping invalid _LPI state %d\n", i);
 	    continue;
 	}
-	if ((flags & LPI_FLAG_ENABLED) == 0 ||
-	    acpi_PkgInt32(pkg, LPI_ENABLED_PARENT,
-	    &enparent[sc->cpu_cx_count]) != 0)
+	if ((leaf[i].flags & LPI_FLAG_ENABLED) == 0)
 	    continue;
-	cx->psci_state = address;
-	if (address == LPI_PSCI_WFI)
+	cx = &sc->cpu_cx_states[sc->cpu_cx_count];
+	memset(cx, 0, sizeof(*cx));
+	cx->min_res = leaf[i].min_res;
+	cx->trans_lat = leaf[i].wake_lat;
+	cx->psci_state = leaf[i].entry;
+	if (leaf[i].entry == LPI_PSCI_WFI)
 	    cx->type = ACPI_STATE_C1;
-	else if ((arch & LPI_ARCH_CORE_LOST) == 0)
+	else if ((leaf[i].arch_flags & LPI_ARCH_CORE_LOST) == 0)
 	    cx->type = ACPI_STATE_C2;
-	else
+	else if (cpu_suspend_supported())
 	    cx->type = ACPI_STATE_C3;
-	sc->cpu_cx_count++;
+	else
+	    continue;
+	enparent[sc->cpu_cx_count++] = leaf[i].enabled_parent;
     }
-    AcpiOsFree(buf.Pointer);
-
     if (sc->cpu_cx_count == 0 ||
 	sc->cpu_cx_states[0].type != ACPI_STATE_C1) {
 	device_printf(sc->cpu_dev, "_LPI has no WFI state\n");
 	sc->cpu_cx_count = 0;
 	return (ENXIO);
     }
-    /*
-     * Compose the leaf states that allow it with the enabled states of
-     * the processor container (a cluster) and of its parent (the
-     * system): the parent's integer entry value is added to the child's
-     * PSCI power state, and the composite takes the deeper state's
-     * residency and latency.  The platform only enters a parent state
-     * once every child has requested it.
-     */
+
     nleaf = sc->cpu_cx_count;
     ncl = nsys = 0;
-    if (ACPI_SUCCESS(AcpiGetParent(sc->cpu_handle, &clh))) {
-	ncl = acpi_cpu_lpi_parent(clh, cl);
-	if (ncl > 0 && ACPI_SUCCESS(AcpiGetParent(clh, &sysh)))
-	    nsys = acpi_cpu_lpi_parent(sysh, sys);
-    }
+    if (ACPI_SUCCESS(AcpiGetParent(sc->cpu_handle, &clh)) &&
+	(ncl = acpi_cpu_lpi_read(clh, cl, MAX_CX_STATES)) > 0 &&
+	ACPI_SUCCESS(AcpiGetParent(clh, &sysh)))
+	nsys = acpi_cpu_lpi_read(sysh, sys, MAX_CX_STATES);
     for (i = 1; i < nleaf; i++) {
 	if (sc->cpu_cx_states[i].type != ACPI_STATE_C3)
 	    continue;
 	for (j = 0; j < ncl && j < enparent[i]; j++) {
-	    if (!cl[j].enabled || sc->cpu_cx_count == MAX_CX_STATES)
-		continue;
-	    cx = &sc->cpu_cx_states[sc->cpu_cx_count++];
-	    *cx = sc->cpu_cx_states[i];
-	    cx->psci_state += cl[j].entry;
-	    cx->min_res = max(cx->min_res, cl[j].min_res);
-	    cx->trans_lat = max(cx->trans_lat, cl[j].wake_lat);
-	    for (k = 0; k < nsys && k < cl[j].enabled_parent; k++) {
-		if (!sys[k].enabled || sc->cpu_cx_count == MAX_CX_STATES)
-		    continue;
-		sys_cx = &sc->cpu_cx_states[sc->cpu_cx_count++];
-		*sys_cx = *cx;
-		sys_cx->psci_state += sys[k].entry;
-		sys_cx->min_res = max(sys_cx->min_res, sys[k].min_res);
-		sys_cx->trans_lat = max(sys_cx->trans_lat, sys[k].wake_lat);
-	    }
+	    clcx = acpi_cpu_lpi_compose(sc, &sc->cpu_cx_states[i], &cl[j]);
+	    for (k = 0; clcx != NULL && k < nsys &&
+		k < cl[j].enabled_parent; k++)
+		acpi_cpu_lpi_compose(sc, clcx, &sys[k]);
 	}
     }
     if (bootverbose && device_get_unit(sc->cpu_dev) == 0)
 	for (i = 0; i < sc->cpu_cx_count; i++)
-	    device_printf(sc->cpu_dev, "_LPI C%u: PSCI 0x%x, %u/%u us\n",
+	    device_printf(sc->cpu_dev, "_LPI C%d: PSCI 0x%x, %u/%u us\n",
 		i + 1, sc->cpu_cx_states[i].psci_state,
 		sc->cpu_cx_states[i].min_res, sc->cpu_cx_states[i].trans_lat);
 
@@ -1500,21 +1498,6 @@ acpi_cpu_cx_lpi(struct acpi_cpu_softc *sc)
 	    sc->cpu_non_c3 = i;
     }
     return (0);
-}
-
-/*
- * Whether a state can be entered: WFI always; PSCI CPU_SUSPEND states
- * once the firmware has not refused them, and states that power the core
- * down only where cpu_suspend_psci() can restore it.
- */
-static bool
-acpi_cpu_lpi_usable(const struct acpi_cx *cx)
-{
-    if (cx->type == ACPI_STATE_C1)
-	return (true);
-    if (cx->lpi_failed)
-	return (false);
-    return (cx->type < ACPI_STATE_C3 || cpu_suspend_supported());
 }
 
 /*
@@ -1553,7 +1536,7 @@ acpi_cpu_idle_lpi(sbintime_t sbt)
 	i = sc->cpu_cx_lowest;
     for (; i > 0; i--) {
 	cx = &sc->cpu_cx_states[i];
-	if (cx->min_res <= us && acpi_cpu_lpi_usable(cx))
+	if (cx->min_res <= us && !cx->lpi_failed)
 	    break;
     }
     cx = &sc->cpu_cx_states[i];
