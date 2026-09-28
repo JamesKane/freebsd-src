@@ -50,12 +50,10 @@
 
 #include <machine/armreg.h>
 #include <machine/bus.h>
-#include <machine/cpufunc.h>
 #include <machine/resource.h>
 
 #include <contrib/dev/acpica/include/acpi.h>
 #include <dev/acpica/acpivar.h>
-
 
 /* CNTCTLBase registers */
 #define	CNTCTL_CNTTIDR		0x08
@@ -73,7 +71,6 @@
 #define	GT_MEM_SIZE		0x1000
 
 struct gt_mem_softc {
-	device_t		dev;
 	struct resource		*ctl;
 	struct resource		*frame;
 	struct resource		*irq;
@@ -202,7 +199,6 @@ gt_mem_acpi_attach(device_t dev)
 	uint32_t acr, freq;
 	int frame, rid;
 
-	sc->dev = dev;
 	frame = (uintptr_t)acpi_get_private(dev) - 1;
 	rid = 0;
 	sc->ctl = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
