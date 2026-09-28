@@ -157,7 +157,7 @@ qcom_tsens_poll(void *arg)
 		}
 	}
 	/* Require two readings in a row, so a single glitch is ignored. */
-	if (hottest < crit * 10) {
+	if (hottest < (int64_t)crit * 10) {
 		sc->hot_polls = 0;
 		goto out;
 	}
