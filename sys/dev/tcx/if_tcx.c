@@ -87,13 +87,12 @@
 #define	TCX_TX_MAXSEGS		32
 #define	TCX_TX_MAXSIZE		16384
 #define	TCX_TSO_SIZE		IP_MAXPACKET	/* iflib adds a VLAN header */
-#define	TCX_MAX_MTU		9000
 
 /*
- * MTL FIFO per queue.  Linux gives each of its four queues 8KB of a 32KB
- * budget; with a single queue an 8KB receive FIFO overflows on 2.5G
- * bursts, so give it the whole budget.  In store-and-forward mode a frame
- * must fit in the transmit FIFO, so that holds a jumbo frame.
+ * MTL FIFO per queue.  With a single queue an 8KB receive FIFO overflows
+ * on 2.5G bursts, so it gets the 32KB that Linux shares among four.  In
+ * store-and-forward mode a frame must fit in the transmit FIFO, so that
+ * holds a jumbo frame.
  */
 #define	TCX_TX_FIFO_BYTES	16384
 #define	TCX_RX_FIFO_BYTES	32768
@@ -131,10 +130,7 @@
 #define	TCX_PBL			32
 #define	TCX_DMA_WIDTH		36	/* the translation window is 64GB */
 
-/*
- * MDC divider.  The CSR clock is 125MHz and 0 divides it by 62, giving
- * 2MHz, which is what Linux uses on this chip.
- */
+/* MDC divider: 0 divides the 125MHz CSR clock by 62, giving 2MHz. */
 #define	TCX_MDIO_CR		0
 #define	TCX_MDIO_TIMEOUT	10000	/* microseconds */
 #define	TCX_SWR_TIMEOUT		100000	/* microseconds */
@@ -142,49 +138,75 @@
 #define	TCX_PMA_TIMEOUT		1000000	/* microseconds */
 #define	TCX_XPCS_RESET_TIMEOUT	600000	/* microseconds */
 
+/* The Qualcomm QCA8081 PHY */
+#define	QCA8081_ID		0x004dd101	/* PHYIDR1 << 16 | PHYIDR2 */
+#define	QCA808X_PHY_SPEC_STATUS	0x11
+#define	 QCA808X_SS_LINK	(1u << 10)
+#define	 QCA808X_SS_DUPLEX	(1u << 13)
+#define	 QCA808X_SS_SPEED_SHIFT	7
+#define	 QCA808X_SS_SPEED_MASK	(0x7u << 7)
+#define	 QCA808X_SS_SPEED_10	0
+#define	 QCA808X_SS_SPEED_100	1
+#define	 QCA808X_SS_SPEED_1000	2
+#define	 QCA808X_SS_SPEED_2500	4
+#define	MMD_AN			7	/* through the MII_MMDACR window */
+#define	MMD_AN_10GBT_CTRL	0x0020
+#define	 MMD_AN_10GBT_ADV2_5G	0x0080
+
 /*
  * The QCA8081's SerDes answers at the next MDIO address.  Its FIFO toward
  * the MAC must be taken out of reset on each link up and put back on link
- * down, as Linux does; while it is held no frames pass, although the
- * SerDes link and SGMII autonegotiation work.  Firmware only releases it
- * on ports that had a link when it ran.
+ * down; while it is held no frames pass, although the SerDes link and
+ * SGMII autonegotiation work.  Firmware only releases it on ports that
+ * had a link when it ran.
  */
 #define	QCA8081_SERDES_ADDR		(TC956X_PHY_ADDR + 1)
 #define	QCA8081_SERDES_FIFO_CTRL	0x9072		/* MMD 1 */
 #define	 QCA8081_SERDES_FIFO_RSTN	(1u << 11)
 
-/* QCA8081 registers reached through the clause 22 MMD window */
-#define	MII_MMDCTRL		0x0d
-#define	 MMDCTRL_DATA_NOINC	0x4000
-#define	MII_MMDDATA		0x0e
-#define	MMD_AN			7
-#define	MMD_AN_10GBT_CTRL	0x0020
-#define	 MMD_AN_10GBT_ADV2_5G	0x0080
-
 /*
- * Attach restarts each MAC, SerDes and PCS from reset, as Linux does, so
- * the result does not depend on what firmware left behind.  Set
- * hw.tcx.cold_init=0 to keep a MAC that firmware left running, for
- * example to keep the link while booting from the network.
+ * Attach restarts each MAC, SerDes and PCS from reset, so the result does
+ * not depend on what firmware left behind.  Set hw.tcx.cold_init=0 to
+ * keep a MAC that firmware left running, for example to keep the link
+ * while booting from the network.
  */
 static int tcx_cold_init = 1;
 TUNABLE_INT("hw.tcx.cold_init", &tcx_cold_init);
 
-/* QCA8081 PHY-specific status register */
-#define	QCA808X_PHY_SPEC_STATUS		0x11
-#define	 QCA808X_SS_LINK		(1u << 10)
-#define	 QCA808X_SS_DUPLEX		(1u << 13)
-#define	 QCA808X_SS_SPEED_SHIFT		7
-#define	 QCA808X_SS_SPEED_MASK		(0x7u << 7)
-#define	 QCA808X_SS_SPEED_10		0
-#define	 QCA808X_SS_SPEED_100		1
-#define	 QCA808X_SS_SPEED_1000		2
-#define	 QCA808X_SS_SPEED_2500		4
+/*
+ * The link speeds, with how the PHY reports each, how it is advertised,
+ * and how the SerDes and the MAC are set for it.
+ */
+static const struct tcx_speed {
+	u_int		mbps;
+	int		ifm;		/* IFM_ subtype */
+	uint32_t	qca_ss;		/* QCA808X_SS_SPEED_* */
+	uint32_t	sp_sel;		/* TC956X_EMACCTL_SP_* */
+	uint32_t	xgmac_ss;	/* XGMAC_SS_* */
+	uint16_t	anar;		/* advertisement, full duplex */
+	uint16_t	gtcr;
+	uint16_t	adv2_5g;
+} tcx_speeds[] = {
+	{ 2500, IFM_2500_T, QCA808X_SS_SPEED_2500, TC956X_EMACCTL_SP_2500,
+	    XGMAC_SS_2500_GMII, 0, 0, MMD_AN_10GBT_ADV2_5G },
+	{ 1000, IFM_1000_T, QCA808X_SS_SPEED_1000, TC956X_EMACCTL_SP_1000,
+	    XGMAC_SS_1000_GMII, 0, GTCR_ADV_1000TFDX, 0 },
+	{ 100, IFM_100_TX, QCA808X_SS_SPEED_100, TC956X_EMACCTL_SP_100,
+	    XGMAC_SS_100_MII, ANAR_TX_FD, 0, 0 },
+	{ 10, IFM_10_T, QCA808X_SS_SPEED_10, TC956X_EMACCTL_SP_10,
+	    XGMAC_SS_10_MII, ANAR_10_FD, 0, 0 },
+};
 
-struct tcx_softc;
+/* The link as the PHY reports it, with the PAUSE use resolved. */
+struct tcx_link {
+	bool		up;
+	bool		fdx;
+	bool		txpause;	/* we may send PAUSE */
+	bool		rxpause;	/* we obey PAUSE */
+	u_int		speed;		/* Mb/s, 0 if unknown */
+};
 
 struct tcx_txq {
-	struct tcx_softc	*sc;
 	struct tcx_desc		*ring;
 	uint64_t		paddr;
 	qidx_t			cidx;	/* oldest descriptor not reclaimed */
@@ -193,7 +215,6 @@ struct tcx_txq {
 };
 
 struct tcx_rxq {
-	struct tcx_softc	*sc;
 	struct tcx_desc		*ring;
 	uint64_t		paddr;
 	qidx_t			pidx;	/* next descriptor to refill */
@@ -209,16 +230,11 @@ struct tcx_softc {
 	int			mac;		/* PCI function, 0 or 1 */
 	struct tcx_txq		txq;
 	struct tcx_rxq		rxq;
-	bool			link_up;
-	bool			link_fdx;
-	u_int			link_speed;	/* Mb/s */
-	bool			link_txpause;	/* we may send PAUSE */
-	bool			link_rxpause;	/* we obey PAUSE */
+	struct tcx_link		link;		/* as last given to iflib */
+	bool			link_known;	/* link is valid */
 	u_int			serdes_speed;	/* what the SerDes is set to */
-	int			link_reported;	/* LINK_STATE_* for iflib */
-	u_int			speed_reported;
-	bool			txpause_reported;
-	bool			rxpause_reported;
+	u_int			rx_bufsz;	/* set at init */
+	uint32_t		rx_csum_caps;	/* IFCAP_RXCSUM*, set at init */
 	u_int			rx_riwt;	/* RX watchdog, 256 cycles */
 	u_int			rx_coal_frames;	/* IOC every n; 0 never */
 	u_int			rx_ioc_count;
@@ -243,8 +259,8 @@ struct tcx_softc {
 	SFR_WRITE((sc), TC956X_XGMAC_BASE((sc)->mac) + (reg), (val))
 #define	MSI_WRITE(sc, reg, val)	\
 	SFR_WRITE((sc), TC956X_MSIGEN_BASE((sc)->mac) + (reg), (val))
-#define	MSI_READ(sc, reg)	\
-	SFR_READ((sc), TC956X_MSIGEN_BASE((sc)->mac) + (reg))
+/* A MAC register's offset in the SFR space. */
+#define	MAC_OFF(sc, reg)	(TC956X_XGMAC_BASE((sc)->mac) + (reg))
 
 static device_register_t	tcx_register;
 
@@ -393,6 +409,30 @@ tcx_register(device_t dev)
  */
 
 static void
+tcx_delay(int us)
+{
+	if (cold || us < 1000)
+		DELAY(us);
+	else
+		pause_sbt("tcxdly", ustosbt(us), 0, C_PREL(1));
+}
+
+/* Wait for (SFR[off] & mask) == val.  Returns 0 or ETIMEDOUT. */
+static int
+tcx_wait(struct tcx_softc *sc, bus_size_t off, uint32_t mask, uint32_t val,
+    int step, int timeout)
+{
+	int i;
+
+	for (i = 0; i < timeout; i += step) {
+		if ((SFR_READ(sc, off) & mask) == val)
+			return (0);
+		tcx_delay(step);
+	}
+	return (ETIMEDOUT);
+}
+
+static void
 tcx_sfr_update(struct tcx_softc *sc, bus_size_t reg, uint32_t clr,
     uint32_t set)
 {
@@ -417,27 +457,25 @@ tcx_mac_running(struct tcx_softc *sc)
 /*
  * Chip-wide setup, done by function 0.  Firmware has been seen to leave
  * the translation table programmed already, but it is cheap to redo and
- * must be right before the MACs can DMA.
+ * must be right before the MACs can DMA.  Only entry 0 is used.
  */
 static void
 tcx_chip_init(struct tcx_softc *sc)
 {
 	bus_size_t e;
+	uint32_t hi, lo;
 	int i;
 
-	e = TC956X_TAMAP_BASE;
-	BRIDGE_WRITE(sc, e + TC956X_TAMAP_SRC_LO,
-	    (uint32_t)TC956X_DMA_OFFSET |
-	    (TC956X_TAMAP_SIZE << TC956X_TAMAP_SIZE_SHIFT) | TC956X_TAMAP_IMPL);
-	BRIDGE_WRITE(sc, e + TC956X_TAMAP_SRC_HI,
-	    (uint32_t)(TC956X_DMA_OFFSET >> 32));
-	BRIDGE_WRITE(sc, e + TC956X_TAMAP_TRSL_LO, 0);
-	BRIDGE_WRITE(sc, e + TC956X_TAMAP_TRSL_HI, 0);
-	BRIDGE_WRITE(sc, e + TC956X_TAMAP_TRSL_PARAM, 0);
-	for (i = 1; i < TC956X_TAMAP_NENTRIES; i++) {
+	for (i = 0; i < TC956X_TAMAP_NENTRIES; i++) {
 		e = TC956X_TAMAP_BASE + i * TC956X_TAMAP_STRIDE;
-		BRIDGE_WRITE(sc, e + TC956X_TAMAP_SRC_LO, 0);
-		BRIDGE_WRITE(sc, e + TC956X_TAMAP_SRC_HI, 0);
+		lo = hi = 0;
+		if (i == 0) {
+			lo = (uint32_t)TC956X_DMA_OFFSET | TC956X_TAMAP_IMPL |
+			    (TC956X_TAMAP_SIZE << TC956X_TAMAP_SIZE_SHIFT);
+			hi = (uint32_t)(TC956X_DMA_OFFSET >> 32);
+		}
+		BRIDGE_WRITE(sc, e + TC956X_TAMAP_SRC_LO, lo);
+		BRIDGE_WRITE(sc, e + TC956X_TAMAP_SRC_HI, hi);
 		BRIDGE_WRITE(sc, e + TC956X_TAMAP_TRSL_LO, 0);
 		BRIDGE_WRITE(sc, e + TC956X_TAMAP_TRSL_HI, 0);
 		BRIDGE_WRITE(sc, e + TC956X_TAMAP_TRSL_PARAM, 0);
@@ -449,59 +487,102 @@ tcx_chip_init(struct tcx_softc *sc)
 }
 
 /*
- * MDIO and PHY
+ * MDIO
+ */
+
+/*
+ * One MDIO transaction on the XGMAC's controller.  addr is the address
+ * register's register and device fields; the port is marked clause 22 or
+ * clause 45 to match.  Returns the data read, or -1 if the bus stays
+ * busy.
+ */
+static int
+tcx_mdio_xfer(struct tcx_softc *sc, int phy, uint32_t addr, bool c22,
+    uint32_t cmd, uint16_t val)
+{
+	bus_size_t data;
+	uint32_t c22p;
+
+	data = MAC_OFF(sc, XGMAC_MDIO_DATA);
+	if (tcx_wait(sc, data, XGMAC_MDIO_BUSY, 0, 1, TCX_MDIO_TIMEOUT) != 0)
+		return (-1);
+	c22p = c22 ? 1u << phy : MAC_READ(sc, XGMAC_MDIO_C22P) & ~(1u << phy);
+	MAC_WRITE(sc, XGMAC_MDIO_C22P, c22p);
+	MAC_WRITE(sc, XGMAC_MDIO_ADDR, (phy << XGMAC_MDIO_ADDR_PA_SHIFT) |
+	    addr);
+	MAC_WRITE(sc, XGMAC_MDIO_DATA,
+	    (TCX_MDIO_CR << XGMAC_MDIO_CR_SHIFT) | cmd | XGMAC_MDIO_BUSY | val);
+	if (tcx_wait(sc, data, XGMAC_MDIO_BUSY, 0, 1, TCX_MDIO_TIMEOUT) != 0)
+		return (-1);
+	return (SFR_READ(sc, data) & XGMAC_MDIO_DATA_MASK);
+}
+
+static int
+tcx_mdio_read(struct tcx_softc *sc, int phy, int reg)
+{
+	return (tcx_mdio_xfer(sc, phy, reg & XGMAC_MDIO_ADDR_C22_REG_MASK,
+	    true, XGMAC_MDIO_CMD_READ, 0));
+}
+
+static void
+tcx_mdio_write(struct tcx_softc *sc, int phy, int reg, uint16_t val)
+{
+	(void)tcx_mdio_xfer(sc, phy, reg & XGMAC_MDIO_ADDR_C22_REG_MASK,
+	    true, XGMAC_MDIO_CMD_WRITE, val);
+}
+
+static int
+tcx_mdio_read_c45(struct tcx_softc *sc, int phy, int mmd, int reg)
+{
+	return (tcx_mdio_xfer(sc, phy, (mmd << XGMAC_MDIO_ADDR_DA_SHIFT) |
+	    (reg & 0xffff), false, XGMAC_MDIO_CMD_READ, 0));
+}
+
+static void
+tcx_mdio_write_c45(struct tcx_softc *sc, int phy, int mmd, int reg,
+    uint16_t val)
+{
+	(void)tcx_mdio_xfer(sc, phy, (mmd << XGMAC_MDIO_ADDR_DA_SHIFT) |
+	    (reg & 0xffff), false, XGMAC_MDIO_CMD_WRITE, val);
+}
+
+/*
+ * PHY
  */
 
 static int
-tcx_mdio_wait(struct tcx_softc *sc)
+tcx_phy_read(struct tcx_softc *sc, int reg)
 {
-	int i;
-
-	for (i = 0; i < TCX_MDIO_TIMEOUT; i++) {
-		if ((MAC_READ(sc, XGMAC_MDIO_DATA) & XGMAC_MDIO_BUSY) == 0)
-			return (0);
-		DELAY(1);
-	}
-	return (ETIMEDOUT);
+	return (tcx_mdio_read(sc, TC956X_PHY_ADDR, reg));
 }
 
-/* Clause 22 read.  Returns the register value, or -1 on timeout. */
-static int
-tcx_mdio_read_c22(struct tcx_softc *sc, int phy, int reg)
+static void
+tcx_phy_write(struct tcx_softc *sc, int reg, uint16_t val)
 {
-	if (tcx_mdio_wait(sc) != 0)
-		return (-1);
-
-	MAC_WRITE(sc, XGMAC_MDIO_C22P, 1u << phy);
-	MAC_WRITE(sc, XGMAC_MDIO_ADDR, (phy << XGMAC_MDIO_ADDR_PA_SHIFT) |
-	    (reg & XGMAC_MDIO_ADDR_C22_REG_MASK));
-	MAC_WRITE(sc, XGMAC_MDIO_DATA,
-	    (TCX_MDIO_CR << XGMAC_MDIO_CR_SHIFT) | XGMAC_MDIO_CMD_READ |
-	    XGMAC_MDIO_BUSY);
-
-	if (tcx_mdio_wait(sc) != 0)
-		return (-1);
-	return (MAC_READ(sc, XGMAC_MDIO_DATA) & XGMAC_MDIO_DATA_MASK);
+	tcx_mdio_write(sc, TC956X_PHY_ADDR, reg, val);
 }
 
-/* Clause 45 access; the port must not be marked clause 22 in C22P. */
-static int
-tcx_mdio_c45(struct tcx_softc *sc, int phy, int mmd, int reg, uint32_t cmd,
-    uint16_t val)
+/* Point the PHY's clause 22 MMD window at an MMD register. */
+static void
+tcx_phy_mmd_select(struct tcx_softc *sc, int mmd, int reg)
 {
-	if (tcx_mdio_wait(sc) != 0)
-		return (-1);
+	tcx_phy_write(sc, MII_MMDACR, mmd);
+	tcx_phy_write(sc, MII_MMDAADR, reg);
+	tcx_phy_write(sc, MII_MMDACR, MMDACR_FN_DATANPI | mmd);
+}
 
-	MAC_WRITE(sc, XGMAC_MDIO_C22P,
-	    MAC_READ(sc, XGMAC_MDIO_C22P) & ~(1u << phy));
-	MAC_WRITE(sc, XGMAC_MDIO_ADDR, (phy << XGMAC_MDIO_ADDR_PA_SHIFT) |
-	    (mmd << XGMAC_MDIO_ADDR_DA_SHIFT) | (reg & 0xffff));
-	MAC_WRITE(sc, XGMAC_MDIO_DATA,
-	    (TCX_MDIO_CR << XGMAC_MDIO_CR_SHIFT) | cmd | XGMAC_MDIO_BUSY | val);
+static int
+tcx_phy_mmd_read(struct tcx_softc *sc, int mmd, int reg)
+{
+	tcx_phy_mmd_select(sc, mmd, reg);
+	return (tcx_phy_read(sc, MII_MMDAADR));
+}
 
-	if (tcx_mdio_wait(sc) != 0)
-		return (-1);
-	return (MAC_READ(sc, XGMAC_MDIO_DATA) & XGMAC_MDIO_DATA_MASK);
+static void
+tcx_phy_mmd_write(struct tcx_softc *sc, int mmd, int reg, uint16_t val)
+{
+	tcx_phy_mmd_select(sc, mmd, reg);
+	tcx_phy_write(sc, MII_MMDAADR, val);
 }
 
 /* Hold the PHY's SerDes FIFO in reset while the link is down. */
@@ -510,32 +591,16 @@ tcx_phy_serdes_fifo(struct tcx_softc *sc, bool up)
 {
 	int v;
 
-	v = tcx_mdio_c45(sc, QCA8081_SERDES_ADDR, 1, QCA8081_SERDES_FIFO_CTRL,
-	    XGMAC_MDIO_CMD_READ, 0);
+	v = tcx_mdio_read_c45(sc, QCA8081_SERDES_ADDR, 1,
+	    QCA8081_SERDES_FIFO_CTRL);
 	if (v < 0)
 		return;
 	if (up)
 		v |= QCA8081_SERDES_FIFO_RSTN;
 	else
 		v &= ~QCA8081_SERDES_FIFO_RSTN;
-	tcx_mdio_c45(sc, QCA8081_SERDES_ADDR, 1, QCA8081_SERDES_FIFO_CTRL,
-	    XGMAC_MDIO_CMD_WRITE, v);
-}
-
-/* Clause 22 write.  Returns 0 or ETIMEDOUT. */
-static int
-tcx_mdio_write_c22(struct tcx_softc *sc, int phy, int reg, uint16_t val)
-{
-	if (tcx_mdio_wait(sc) != 0)
-		return (ETIMEDOUT);
-
-	MAC_WRITE(sc, XGMAC_MDIO_C22P, 1u << phy);
-	MAC_WRITE(sc, XGMAC_MDIO_ADDR, (phy << XGMAC_MDIO_ADDR_PA_SHIFT) |
-	    (reg & XGMAC_MDIO_ADDR_C22_REG_MASK));
-	MAC_WRITE(sc, XGMAC_MDIO_DATA,
-	    (TCX_MDIO_CR << XGMAC_MDIO_CR_SHIFT) | XGMAC_MDIO_CMD_WRITE |
-	    XGMAC_MDIO_BUSY | val);
-	return (tcx_mdio_wait(sc));
+	tcx_mdio_write_c45(sc, QCA8081_SERDES_ADDR, 1,
+	    QCA8081_SERDES_FIFO_CTRL, v);
 }
 
 /*
@@ -549,9 +614,9 @@ tcx_phy_fix_advert(struct tcx_softc *sc)
 {
 	int anar, bmcr, gtcr, nanar, ngtcr;
 
-	anar = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_ANAR);
-	gtcr = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_100T2CR);
-	bmcr = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_BMCR);
+	anar = tcx_phy_read(sc, MII_ANAR);
+	gtcr = tcx_phy_read(sc, MII_100T2CR);
+	bmcr = tcx_phy_read(sc, MII_BMCR);
 	if (anar < 0 || gtcr < 0 || bmcr < 0)
 		return;
 	nanar = (anar & ~(ANAR_10 | ANAR_TX)) | ANAR_PAUSE_SYM |
@@ -562,30 +627,9 @@ tcx_phy_fix_advert(struct tcx_softc *sc)
 
 	device_printf(sc->dev, "updating PHY advertisement, "
 	    "renegotiating\n");
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_ANAR, nanar);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_100T2CR, ngtcr);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_BMCR,
-	    bmcr | BMCR_AUTOEN | BMCR_STARTNEG);
-}
-
-static int
-tcx_phy_mmd_read(struct tcx_softc *sc, int mmd, int reg)
-{
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_MMDCTRL, mmd);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_MMDDATA, reg);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_MMDCTRL,
-	    MMDCTRL_DATA_NOINC | mmd);
-	return (tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_MMDDATA));
-}
-
-static void
-tcx_phy_mmd_write(struct tcx_softc *sc, int mmd, int reg, uint16_t val)
-{
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_MMDCTRL, mmd);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_MMDDATA, reg);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_MMDCTRL,
-	    MMDCTRL_DATA_NOINC | mmd);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_MMDDATA, val);
+	tcx_phy_write(sc, MII_ANAR, nanar);
+	tcx_phy_write(sc, MII_100T2CR, ngtcr);
+	tcx_phy_write(sc, MII_BMCR, bmcr | BMCR_AUTOEN | BMCR_STARTNEG);
 }
 
 /*
@@ -595,10 +639,12 @@ tcx_phy_mmd_write(struct tcx_softc *sc, int mmd, int reg, uint16_t val)
 static int
 tcx_phy_set_media(struct tcx_softc *sc, int subtype)
 {
+	const struct tcx_speed *sp;
 	int anar, gtcr, adv25;
+	bool found;
 
-	anar = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_ANAR);
-	gtcr = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_100T2CR);
+	anar = tcx_phy_read(sc, MII_ANAR);
+	gtcr = tcx_phy_read(sc, MII_100T2CR);
 	adv25 = tcx_phy_mmd_read(sc, MMD_AN, MMD_AN_10GBT_CTRL);
 	if (anar < 0 || gtcr < 0 || adv25 < 0)
 		return (EIO);
@@ -606,121 +652,110 @@ tcx_phy_set_media(struct tcx_softc *sc, int subtype)
 	gtcr &= ~(GTCR_ADV_1000TFDX | GTCR_ADV_1000THDX);
 	adv25 &= ~MMD_AN_10GBT_ADV2_5G;
 
-	switch (subtype) {
-	case IFM_AUTO:
-		anar |= ANAR_10_FD | ANAR_TX_FD;
-		gtcr |= GTCR_ADV_1000TFDX;
-		adv25 |= MMD_AN_10GBT_ADV2_5G;
-		break;
-	case IFM_2500_T:
-		adv25 |= MMD_AN_10GBT_ADV2_5G;
-		break;
-	case IFM_1000_T:
-		gtcr |= GTCR_ADV_1000TFDX;
-		break;
-	case IFM_100_TX:
-		anar |= ANAR_TX_FD;
-		break;
-	case IFM_10_T:
-		anar |= ANAR_10_FD;
-		break;
-	default:
-		return (EINVAL);
+	found = false;
+	for (sp = tcx_speeds; sp < &tcx_speeds[nitems(tcx_speeds)]; sp++) {
+		if (subtype != IFM_AUTO && subtype != sp->ifm)
+			continue;
+		anar |= sp->anar;
+		gtcr |= sp->gtcr;
+		adv25 |= sp->adv2_5g;
+		found = true;
 	}
+	if (!found)
+		return (EINVAL);
 	anar |= ANAR_PAUSE_SYM | ANAR_PAUSE_ASYM;
 
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_ANAR, anar);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_100T2CR, gtcr);
+	tcx_phy_write(sc, MII_ANAR, anar);
+	tcx_phy_write(sc, MII_100T2CR, gtcr);
 	tcx_phy_mmd_write(sc, MMD_AN, MMD_AN_10GBT_CTRL, adv25);
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_BMCR,
-	    BMCR_AUTOEN | BMCR_STARTNEG);
+	tcx_phy_write(sc, MII_BMCR, BMCR_AUTOEN | BMCR_STARTNEG);
 	return (0);
 }
 
 /* Resolve PAUSE use from both sides' advertisements (802.3 Annex 28B). */
 static void
-tcx_phy_resolve_pause(struct tcx_softc *sc)
+tcx_phy_resolve_pause(struct tcx_softc *sc, struct tcx_link *l)
 {
 	int anar, anlpar;
 
-	sc->link_txpause = sc->link_rxpause = false;
-	if (!sc->link_up || !sc->link_fdx)
+	l->txpause = l->rxpause = false;
+	if (!l->up || !l->fdx)
 		return;
-	anar = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_ANAR);
-	anlpar = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_ANLPAR);
+	anar = tcx_phy_read(sc, MII_ANAR);
+	anlpar = tcx_phy_read(sc, MII_ANLPAR);
 	if (anar < 0 || anlpar < 0)
 		return;
 
 	if ((anar & ANAR_PAUSE_SYM) != 0 && (anlpar & ANLPAR_PAUSE_SYM) != 0)
-		sc->link_txpause = sc->link_rxpause = true;
+		l->txpause = l->rxpause = true;
 	else if ((anar & ANAR_PAUSE_ASYM) != 0 &&
 	    (anlpar & ANLPAR_PAUSE_ASYM) != 0) {
 		if ((anar & ANAR_PAUSE_SYM) != 0)
-			sc->link_rxpause = true;
+			l->rxpause = true;
 		else if ((anlpar & ANLPAR_PAUSE_SYM) != 0)
-			sc->link_txpause = true;
+			l->txpause = true;
 	}
 }
 
-/* Read the link state from the PHY.  Returns false if the PHY is silent. */
+/*
+ * Read the link state from the PHY.  Returns false if the PHY is silent.
+ * PAUSE use only changes with a new negotiation, which takes the link
+ * down, so it is only read again when the link comes up or changes speed.
+ */
 static bool
-tcx_phy_poll(struct tcx_softc *sc)
+tcx_phy_poll(struct tcx_softc *sc, struct tcx_link *l)
 {
+	const struct tcx_speed *sp;
+	uint32_t code;
 	int ss;
 
-	ss = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, QCA808X_PHY_SPEC_STATUS);
+	ss = tcx_phy_read(sc, QCA808X_PHY_SPEC_STATUS);
 	if (ss < 0)
 		return (false);
 
-	sc->link_up = (ss & QCA808X_SS_LINK) != 0;
-	sc->link_fdx = (ss & QCA808X_SS_DUPLEX) != 0;
-	switch ((ss & QCA808X_SS_SPEED_MASK) >> QCA808X_SS_SPEED_SHIFT) {
-	case QCA808X_SS_SPEED_10:
-		sc->link_speed = 10;
-		break;
-	case QCA808X_SS_SPEED_100:
-		sc->link_speed = 100;
-		break;
-	case QCA808X_SS_SPEED_1000:
-		sc->link_speed = 1000;
-		break;
-	case QCA808X_SS_SPEED_2500:
-		sc->link_speed = 2500;
-		break;
-	default:
-		sc->link_speed = 0;
-		break;
-	}
-	tcx_phy_resolve_pause(sc);
+	l->up = (ss & QCA808X_SS_LINK) != 0;
+	l->fdx = (ss & QCA808X_SS_DUPLEX) != 0;
+	l->speed = 0;
+	code = (ss & QCA808X_SS_SPEED_MASK) >> QCA808X_SS_SPEED_SHIFT;
+	for (sp = tcx_speeds; sp < &tcx_speeds[nitems(tcx_speeds)]; sp++)
+		if (sp->qca_ss == code)
+			l->speed = sp->mbps;
+
+	if (sc->link_known && sc->link.up && l->up &&
+	    l->speed == sc->link.speed) {
+		l->txpause = sc->link.txpause;
+		l->rxpause = sc->link.rxpause;
+	} else
+		tcx_phy_resolve_pause(sc, l);
 	return (true);
 }
 
-/* Set the MAC's port speed and PAUSE use. */
-static void
-tcx_mac_set_speed(struct tcx_softc *sc)
+static const struct tcx_speed *
+tcx_speed_lookup(u_int mbps)
 {
+	const struct tcx_speed *sp;
+
+	for (sp = tcx_speeds; sp < &tcx_speeds[nitems(tcx_speeds)]; sp++)
+		if (sp->mbps == mbps)
+			return (sp);
+	return (NULL);
+}
+
+/* Set the MAC's port speed and PAUSE use for the current link. */
+static void
+tcx_mac_set_link(struct tcx_softc *sc)
+{
+	const struct tcx_speed *sp;
 	uint32_t ss, v;
 
-	switch (sc->link_speed) {
-	case 10:
-		ss = XGMAC_SS_10_MII;
-		break;
-	case 100:
-		ss = XGMAC_SS_100_MII;
-		break;
-	case 1000:
-		ss = XGMAC_SS_1000_GMII;
-		break;
-	default:
-		ss = XGMAC_SS_2500_GMII;
-		break;
-	}
+	sp = tcx_speed_lookup(sc->link.speed);
+	ss = sp != NULL ? sp->xgmac_ss : XGMAC_SS_2500_GMII;
 	v = MAC_READ(sc, XGMAC_TX_CONFIG) & ~XGMAC_TX_CONFIG_SS_MASK;
 	MAC_WRITE(sc, XGMAC_TX_CONFIG, v | (ss << XGMAC_TX_CONFIG_SS_SHIFT));
 
-	MAC_WRITE(sc, XGMAC_Q_TX_FLOW_CTRL(0), sc->link_txpause ?
+	MAC_WRITE(sc, XGMAC_Q_TX_FLOW_CTRL(0), sc->link.txpause ?
 	    XGMAC_TX_FLOW_TFE | (TCX_PAUSE_TIME << XGMAC_TX_FLOW_PT_SHIFT) : 0);
-	MAC_WRITE(sc, XGMAC_RX_FLOW_CTRL, sc->link_rxpause ?
+	MAC_WRITE(sc, XGMAC_RX_FLOW_CTRL, sc->link.rxpause ?
 	    XGMAC_RX_FLOW_RFE : 0);
 }
 
@@ -728,37 +763,29 @@ tcx_mac_set_speed(struct tcx_softc *sc)
  * SerDes and PCS
  */
 
-static void
-tcx_delay(int us)
+/* Point the XPCS viewport at an MMD register; returns its SFR offset. */
+static bus_size_t
+tcx_xpcs_select(struct tcx_softc *sc, int mmd, int reg)
 {
-	if (cold || us < 1000)
-		DELAY(us);
-	else
-		pause_sbt("tcxdly", ustosbt(us), 0, C_PREL(1));
+	bus_size_t win;
+	uint32_t csr;
+
+	win = MAC_OFF(sc, TC956X_XPCS_OFFSET);
+	csr = (mmd << 16) | reg;
+	SFR_WRITE(sc, win + TC956X_XPCS_VIEWPORT, csr >> 8);
+	return (win + (csr & 0xff) * 4);
 }
 
 static int
 tcx_xpcs_read(struct tcx_softc *sc, int mmd, int reg)
 {
-	bus_size_t win;
-	uint32_t csr;
-
-	win = TC956X_XGMAC_BASE(sc->mac) + TC956X_XPCS_OFFSET;
-	csr = (mmd << 16) | reg;
-	SFR_WRITE(sc, win + TC956X_XPCS_VIEWPORT, csr >> 8);
-	return (SFR_READ(sc, win + (csr & 0xff) * 4) & 0xffff);
+	return (SFR_READ(sc, tcx_xpcs_select(sc, mmd, reg)) & 0xffff);
 }
 
 static void
 tcx_xpcs_write(struct tcx_softc *sc, int mmd, int reg, uint16_t val)
 {
-	bus_size_t win;
-	uint32_t csr;
-
-	win = TC956X_XGMAC_BASE(sc->mac) + TC956X_XPCS_OFFSET;
-	csr = (mmd << 16) | reg;
-	SFR_WRITE(sc, win + TC956X_XPCS_VIEWPORT, csr >> 8);
-	SFR_WRITE(sc, win + (csr & 0xff) * 4, val);
+	SFR_WRITE(sc, tcx_xpcs_select(sc, mmd, reg), val);
 }
 
 static void
@@ -769,59 +796,44 @@ tcx_xpcs_update(struct tcx_softc *sc, int mmd, int reg, uint16_t clr,
 	    (tcx_xpcs_read(sc, mmd, reg) & ~clr) | set);
 }
 
+/* The speed the SerDes selector in EMACCTL is set for, or 0. */
 static u_int
 tcx_sp_sel_speed(uint32_t emacctl)
 {
-	switch (emacctl & TC956X_EMACCTL_SP_SEL_MASK) {
-	case TC956X_EMACCTL_SP_2500:
-		return (2500);
-	case TC956X_EMACCTL_SP_1000:
-		return (1000);
-	case TC956X_EMACCTL_SP_100:
-		return (100);
-	case TC956X_EMACCTL_SP_10:
-		return (10);
-	default:
-		return (0);
-	}
+	const struct tcx_speed *sp;
+
+	for (sp = tcx_speeds; sp < &tcx_speeds[nitems(tcx_speeds)]; sp++)
+		if (sp->sp_sel == (emacctl & TC956X_EMACCTL_SP_SEL_MASK))
+			return (sp->mbps);
+	return (0);
 }
 
 /*
  * Restart the SerDes.  It takes its rate from the speed selector, so that
  * must be valid first: out of reset it holds 8, which is no SGMII rate,
- * and in-band autonegotiation then never completes.
+ * and in-band autonegotiation then never completes.  An unknown speed
+ * gets SGMII at 1G.
  */
 static int
 tcx_pma_init(struct tcx_softc *sc, u_int speed)
 {
+	const struct tcx_speed *sp;
 	bus_size_t pma, emacctl;
-	uint32_t sp_sel, v;
+	uint32_t v;
 	int i;
 
-	switch (speed) {
-	case 2500:
-		sp_sel = TC956X_EMACCTL_SP_2500;
-		break;
-	case 100:
-		sp_sel = TC956X_EMACCTL_SP_100;
-		break;
-	case 10:
-		sp_sel = TC956X_EMACCTL_SP_10;
-		break;
-	default:
-		sp_sel = TC956X_EMACCTL_SP_1000;
-		break;
-	}
+	sp = tcx_speed_lookup(speed);
 	emacctl = TC956X_NEMACCTL(sc->mac);
 	v = SFR_READ(sc, emacctl);
 	v &= ~(TC956X_EMACCTL_SP_SEL_MASK | TC956X_EMACCTL_PHY_INF_MASK |
 	    TC956X_EMACCTL_INV_SGM_SIGDET);
-	v |= sp_sel | TC956X_EMACCTL_PHY_INF_PHYCLK | TC956X_EMACCTL_LPIHWCLKEN;
+	v |= (sp != NULL ? sp->sp_sel : TC956X_EMACCTL_SP_1000) |
+	    TC956X_EMACCTL_PHY_INF_PHYCLK | TC956X_EMACCTL_LPIHWCLKEN;
 	SFR_WRITE(sc, emacctl, v);
 
 	/* The clock settings may only change with the PMA in reset. */
 	tcx_sfr_update(sc, TC956X_NRSTCTRL(sc->mac), 0, TC956X_RST_PMA);
-	pma = TC956X_XGMAC_BASE(sc->mac) + TC956X_PMA_OFFSET;
+	pma = MAC_OFF(sc, TC956X_PMA_OFFSET);
 	SFR_WRITE(sc, pma + TC956X_PMA_CML_GL_PM_CFG0, 0);
 	for (i = 0; i < TC956X_PMA_NLANES; i++) {
 		SFR_WRITE(sc, pma + TC956X_PMA_HWT_REFCK_R_EN(i), 0);
@@ -831,29 +843,30 @@ tcx_pma_init(struct tcx_softc *sc, u_int speed)
 	}
 	tcx_sfr_update(sc, TC956X_NRSTCTRL(sc->mac), TC956X_RST_PMA, 0);
 
-	for (i = 0; i < TCX_PMA_TIMEOUT; i += 100) {
-		if ((SFR_READ(sc, emacctl) & TC956X_EMACCTL_INIT_DONE) != 0)
-			return (0);
-		tcx_delay(100);
+	if (tcx_wait(sc, emacctl, TC956X_EMACCTL_INIT_DONE,
+	    TC956X_EMACCTL_INIT_DONE, 100, TCX_PMA_TIMEOUT) != 0) {
+		device_printf(sc->dev, "SerDes did not come up at %u Mb/s\n",
+		    speed);
+		return (ETIMEDOUT);
 	}
-	device_printf(sc->dev, "SerDes did not come up at %u Mb/s\n", speed);
-	return (ETIMEDOUT);
+	return (0);
 }
 
 /*
  * Set the XPCS up for 2500BASE-X, or for MAC-side SGMII with in-band
- * autonegotiation and automatic speed switching.
+ * autonegotiation and automatic speed switching.  Its MMD 31 starts with
+ * clause 22 registers, laid out as in mii.h.
  */
 static int
 tcx_xpcs_config(struct tcx_softc *sc, bool sgmii)
 {
 	int bmcr, i;
 
-	tcx_xpcs_write(sc, XPCS_MMD_VEND2, XPCS_MII_BMCR, XPCS_BMCR_RESET);
+	tcx_xpcs_write(sc, XPCS_MMD_VEND2, MII_BMCR, BMCR_RESET);
 	for (i = 0; i < TCX_XPCS_RESET_TIMEOUT; i += 1000) {
 		tcx_delay(1000);
-		if ((tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_MII_BMCR) &
-		    XPCS_BMCR_RESET) == 0)
+		if ((tcx_xpcs_read(sc, XPCS_MMD_VEND2, MII_BMCR) &
+		    BMCR_RESET) == 0)
 			break;
 	}
 	if (i >= TCX_XPCS_RESET_TIMEOUT) {
@@ -870,23 +883,22 @@ tcx_xpcs_config(struct tcx_softc *sc, bool sgmii)
 		tcx_xpcs_write(sc, XPCS_MMD_PCS, XPCS_PCS_CTRL2,
 		    XPCS_PCS_TYPE_SEL_MODAL);
 
-	bmcr = tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_MII_BMCR);
+	bmcr = tcx_xpcs_read(sc, XPCS_MMD_VEND2, MII_BMCR);
 	if (sgmii) {
-		tcx_xpcs_write(sc, XPCS_MMD_VEND2, XPCS_MII_BMCR,
-		    bmcr & ~XPCS_BMCR_ANENABLE);
+		tcx_xpcs_write(sc, XPCS_MMD_VEND2, MII_BMCR,
+		    bmcr & ~BMCR_AUTOEN);
 		tcx_xpcs_update(sc, XPCS_MMD_VEND2, XPCS_VR_MII_AN_CTRL,
 		    XPCS_AN_CTRL_PCS_MODE_MASK | XPCS_AN_CTRL_TX_CONFIG_PHY,
 		    XPCS_AN_CTRL_PCS_MODE_SGMII);
 		tcx_xpcs_update(sc, XPCS_MMD_VEND2, XPCS_VR_MII_DIG_CTRL1,
 		    XPCS_DIG_CTRL1_2G5_EN, XPCS_DIG_CTRL1_MAC_AUTO_SW);
-		tcx_xpcs_write(sc, XPCS_MMD_VEND2, XPCS_MII_BMCR,
-		    bmcr | XPCS_BMCR_ANENABLE);
+		tcx_xpcs_write(sc, XPCS_MMD_VEND2, MII_BMCR,
+		    bmcr | BMCR_AUTOEN);
 	} else {
 		tcx_xpcs_update(sc, XPCS_MMD_VEND2, XPCS_VR_MII_DIG_CTRL1,
 		    XPCS_DIG_CTRL1_MAC_AUTO_SW, XPCS_DIG_CTRL1_2G5_EN);
-		tcx_xpcs_write(sc, XPCS_MMD_VEND2, XPCS_MII_BMCR,
-		    (bmcr & ~(XPCS_BMCR_ANENABLE | XPCS_BMCR_SPEED100)) |
-		    XPCS_BMCR_SPEED1000);
+		tcx_xpcs_write(sc, XPCS_MMD_VEND2, MII_BMCR,
+		    (bmcr & ~(BMCR_AUTOEN | BMCR_S100)) | BMCR_S1000);
 	}
 	return (0);
 }
@@ -906,6 +918,44 @@ tcx_serdes_config(struct tcx_softc *sc, u_int speed)
 }
 
 /*
+ * Bring the port in line with a link state read from the PHY: SerDes and
+ * PCS for the new speed, the PHY's SerDes FIFO, the MAC's speed and PAUSE
+ * use, and what iflib is told.
+ */
+static void
+tcx_link_apply(struct tcx_softc *sc, const struct tcx_link *l)
+{
+	bool changed;
+
+	if (l->up && l->speed != 0 && l->speed != sc->serdes_speed) {
+		if (bootverbose)
+			device_printf(sc->dev, "SerDes %u -> %u Mb/s\n",
+			    sc->serdes_speed, l->speed);
+		tcx_serdes_config(sc, l->speed);
+	}
+
+	if (sc->link_known && l->up == sc->link.up && (!l->up ||
+	    (l->speed == sc->link.speed && l->fdx == sc->link.fdx &&
+	    l->txpause == sc->link.txpause && l->rxpause == sc->link.rxpause)))
+		return;
+
+	changed = !sc->link_known || l->up != sc->link.up;
+	sc->link = *l;
+	sc->link_known = true;
+	if (changed)
+		tcx_phy_serdes_fifo(sc, l->up);
+	if (!l->up) {
+		iflib_link_state_change(sc->ctx, LINK_STATE_DOWN, 0);
+		return;
+	}
+	if (!l->fdx)
+		device_printf(sc->dev, "half-duplex link: the MAC only does "
+		    "full duplex, expect errors\n");
+	tcx_mac_set_link(sc);
+	iflib_link_state_change(sc->ctx, LINK_STATE_UP, IF_Mbps(l->speed));
+}
+
+/*
  * Start a MAC from reset: clocks, then MAC reset, then the SerDes at a
  * valid rate, then the PCS.  The PHY's current speed is used if it has a
  * link; otherwise SGMII at 1G, which the next link change corrects.
@@ -913,11 +963,12 @@ tcx_serdes_config(struct tcx_softc *sc, u_int speed)
 static int
 tcx_mac_start(struct tcx_softc *sc)
 {
+	struct tcx_link l;
 	uint32_t clk;
 	u_int speed;
 	int error;
 
-	/* Put the MAC, SerDes and PCS in reset, as Linux does. */
+	/* Put the MAC, SerDes and PCS in reset. */
 	tcx_sfr_update(sc, TC956X_NRSTCTRL(sc->mac), 0,
 	    TC956X_RST_MAC | TC956X_RST_PMA | TC956X_RST_XPCS);
 
@@ -927,8 +978,8 @@ tcx_mac_start(struct tcx_softc *sc)
 	tcx_sfr_update(sc, TC956X_NCLKCTRL(sc->mac), 0, clk);
 	tcx_sfr_update(sc, TC956X_NRSTCTRL(sc->mac), TC956X_RST_MAC, 0);
 
-	speed = (tcx_phy_poll(sc) && sc->link_up && sc->link_speed != 0) ?
-	    sc->link_speed : 1000;
+	speed = (tcx_phy_poll(sc, &l) && l.up && l.speed != 0) ?
+	    l.speed : 1000;
 	error = tcx_pma_init(sc, speed);
 	tcx_sfr_update(sc, TC956X_NRSTCTRL(sc->mac), TC956X_RST_XPCS, 0);
 	if (error == 0)
@@ -937,31 +988,49 @@ tcx_mac_start(struct tcx_softc *sc)
 	return (error);
 }
 
+/*
+ * Sysctl handlers that touch the hardware take the ctx lock, which the
+ * link code holds too, and fail once detach has released the registers.
+ */
+static int
+tcx_hw_lock(struct tcx_softc *sc)
+{
+	sx_xlock(iflib_ctx_lock_get(sc->ctx));
+	if (sc->sfr_res == NULL) {
+		sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+		return (ENXIO);
+	}
+	return (0);
+}
+
+static void
+tcx_hw_unlock(struct tcx_softc *sc)
+{
+	sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+}
+
 /* Report the SerDes and PCS state, for debugging. */
 static int
 tcx_sysctl_serdes(SYSCTL_HANDLER_ARGS)
 {
 	struct tcx_softc *sc;
 	char buf[256];
+	int error;
 
 	sc = arg1;
-	/* The XPCS viewport is shared with the link code. */
-	sx_xlock(iflib_ctx_lock_get(sc->ctx));
-	if (sc->sfr_res == NULL) {
-		sx_xunlock(iflib_ctx_lock_get(sc->ctx));
-		return (ENXIO);
-	}
+	if ((error = tcx_hw_lock(sc)) != 0)
+		return (error);
 	snprintf(buf, sizeof(buf), "EMACCTL 0x%08x, set for %u Mb/s; "
 	    "PCS CTRL2 0x%04x, BMCR 0x%04x, BMSR 0x%04x, DIG_CTRL1 0x%04x, "
 	    "AN_CTRL 0x%04x, AN_INTR_STS 0x%04x",
 	    SFR_READ(sc, TC956X_NEMACCTL(sc->mac)), sc->serdes_speed,
 	    tcx_xpcs_read(sc, XPCS_MMD_PCS, XPCS_PCS_CTRL2),
-	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_MII_BMCR),
-	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_MII_BMSR),
+	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, MII_BMCR),
+	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, MII_BMSR),
 	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_VR_MII_DIG_CTRL1),
 	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_VR_MII_AN_CTRL),
 	    tcx_xpcs_read(sc, XPCS_MMD_VEND2, XPCS_VR_MII_AN_INTR_STS));
-	sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+	tcx_hw_unlock(sc);
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
@@ -978,17 +1047,18 @@ tcx_sysctl_rx_riwt(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (v < 0 || v > XGMAC_DMA_CH_RWT_MASK)
 		return (EINVAL);
+	if ((error = tcx_hw_lock(sc)) != 0)
+		return (error);
 	/*
 	 * Descriptors already on the ring keep their setting, so when
 	 * moderation is turned off the watchdog is left running for them;
 	 * it does no harm once every frame interrupts.  The next init
 	 * clears it.
 	 */
-	sx_xlock(iflib_ctx_lock_get(sc->ctx));
-	if (v != 0 && sc->sfr_res != NULL)
+	if (v != 0)
 		MAC_WRITE(sc, XGMAC_DMA_CH_RX_WATCHDOG(0), v);
 	sc->rx_riwt = v;
-	sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+	tcx_hw_unlock(sc);
 	return (0);
 }
 
@@ -1002,13 +1072,12 @@ tcx_sysctl_serdes_reset(SYSCTL_HANDLER_ARGS)
 	sc = arg1;
 	v = 0;
 	error = sysctl_handle_int(oidp, &v, 0, req);
-	if (error != 0 || req->newptr == NULL)
+	if (error != 0 || req->newptr == NULL || v == 0)
 		return (error);
-	if (v != 0) {
-		sx_xlock(iflib_ctx_lock_get(sc->ctx));
-		sc->serdes_speed = 0;
-		sx_xunlock(iflib_ctx_lock_get(sc->ctx));
-	}
+	if ((error = tcx_hw_lock(sc)) != 0)
+		return (error);
+	sc->serdes_speed = 0;
+	tcx_hw_unlock(sc);
 	return (0);
 }
 
@@ -1078,7 +1147,7 @@ tcx_attach_pre(if_ctx_t ctx)
 	ea.octet[4] = hi;
 	ea.octet[5] = hi >> 8;
 	if ((hi & XGMAC_ADDR_HIGH_AE) == 0 || ETHER_IS_MULTICAST(ea.octet) ||
-	    (lo == 0 && (hi & 0xffff) == 0))
+	    ETHER_IS_ZERO(ea.octet))
 		ether_gen_addr(iflib_get_ifp(ctx), &ea);
 	iflib_set_mac(ctx, ea.octet);
 
@@ -1158,18 +1227,16 @@ tcx_sysctl_reg(SYSCTL_HANDLER_ARGS)
 	struct tcx_softc *sc;
 	uint64_t v;
 	bus_size_t reg;
+	int error;
 
 	sc = arg1;
 	reg = arg2 & ~1;
-	sx_xlock(iflib_ctx_lock_get(sc->ctx));
-	if (sc->sfr_res == NULL) {
-		sx_xunlock(iflib_ctx_lock_get(sc->ctx));
-		return (ENXIO);
-	}
+	if ((error = tcx_hw_lock(sc)) != 0)
+		return (error);
 	v = MAC_READ(sc, reg);
 	if ((arg2 & 1) != 0)
 		v |= (uint64_t)MAC_READ(sc, reg + 4) << 32;
-	sx_xunlock(iflib_ctx_lock_get(sc->ctx));
+	tcx_hw_unlock(sc);
 	return (sysctl_handle_64(oidp, &v, 0, req));
 }
 
@@ -1239,27 +1306,31 @@ static int
 tcx_attach_post(if_ctx_t ctx)
 {
 	struct tcx_softc *sc;
+	int i, id1, id2;
 
 	sc = iflib_get_softc(ctx);
 	tcx_add_sysctls(sc);
 	sc->media = iflib_get_media(ctx);
 	ifmedia_add(sc->media, IFM_ETHER | IFM_AUTO, 0, NULL);
-	ifmedia_add(sc->media, IFM_ETHER | IFM_2500_T | IFM_FDX, 0, NULL);
-	ifmedia_add(sc->media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0, NULL);
-	ifmedia_add(sc->media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
-	ifmedia_add(sc->media, IFM_ETHER | IFM_10_T | IFM_FDX, 0, NULL);
 	/* The MAC is full duplex only; accept the speeds without the option. */
-	ifmedia_add(sc->media, IFM_ETHER | IFM_2500_T, 0, NULL);
-	ifmedia_add(sc->media, IFM_ETHER | IFM_1000_T, 0, NULL);
-	ifmedia_add(sc->media, IFM_ETHER | IFM_100_TX, 0, NULL);
-	ifmedia_add(sc->media, IFM_ETHER | IFM_10_T, 0, NULL);
+	for (i = 0; i < nitems(tcx_speeds); i++) {
+		ifmedia_add(sc->media, IFM_ETHER | tcx_speeds[i].ifm | IFM_FDX,
+		    0, NULL);
+		ifmedia_add(sc->media, IFM_ETHER | tcx_speeds[i].ifm, 0, NULL);
+	}
 	ifmedia_set(sc->media, IFM_ETHER | IFM_AUTO);
 
-	if (!tcx_phy_poll(sc)) {
+	id1 = tcx_phy_read(sc, MII_PHYIDR1);
+	id2 = tcx_phy_read(sc, MII_PHYIDR2);
+	if (id1 < 0 || id2 < 0) {
 		device_printf(sc->dev, "PHY at %d does not answer\n",
 		    TC956X_PHY_ADDR);
 		return (0);
 	}
+	if (((uint32_t)id1 << 16 | id2) != QCA8081_ID)
+		device_printf(sc->dev, "PHY at %d is 0x%04x%04x, not a "
+		    "QCA8081; link state will be misread\n", TC956X_PHY_ADDR,
+		    id1, id2);
 	tcx_phy_fix_advert(sc);
 	return (0);
 }
@@ -1292,7 +1363,6 @@ tcx_tx_queues_alloc(if_ctx_t ctx, caddr_t *vaddrs, uint64_t *paddrs,
 
 	sc = iflib_get_softc(ctx);
 	MPASS(ntxqs == 1 && ntxqsets == 1);
-	sc->txq.sc = sc;
 	sc->txq.ring = (struct tcx_desc *)vaddrs[0];
 	sc->txq.paddr = paddrs[0];
 	return (0);
@@ -1306,7 +1376,6 @@ tcx_rx_queues_alloc(if_ctx_t ctx, caddr_t *vaddrs, uint64_t *paddrs,
 
 	sc = iflib_get_softc(ctx);
 	MPASS(nrxqs == 1 && nrxqsets == 1);
-	sc->rxq.sc = sc;
 	sc->rxq.ring = (struct tcx_desc *)vaddrs[0];
 	sc->rxq.paddr = paddrs[0];
 	return (0);
@@ -1336,15 +1405,12 @@ tcx_dma_addr(bus_addr_t pa)
 static u_int
 tcx_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
 {
-	uint32_t *hash, crc, rev;
-	int i;
+	uint32_t *hash, bin;
 
 	hash = arg;
-	crc = ~ether_crc32_le(LLADDR(sdl), ETHER_ADDR_LEN);
-	for (rev = 0, i = 0; i < 32; i++, crc >>= 1)
-		rev = (rev << 1) | (crc & 1);
-	rev >>= 32 - XGMAC_HASH_BITS_LOG2;
-	hash[rev >> 5] |= 1u << (rev & 0x1f);
+	bin = ~ether_crc32_be(LLADDR(sdl), ETHER_ADDR_LEN) >>
+	    (32 - XGMAC_HASH_BITS_LOG2);
+	hash[bin >> 5] |= 1u << (bin & 0x1f);
 	return (1);
 }
 
@@ -1371,16 +1437,6 @@ tcx_set_filter(struct tcx_softc *sc, int flags)
 }
 
 /*
- * The receive buffer size given to the DMA.  A frame larger than this,
- * such as a jumbo frame in 4KB clusters, spans several descriptors.
- */
-static u_int
-tcx_rx_bufsz(struct tcx_softc *sc)
-{
-	return (iflib_get_rx_mbuf_sz(sc->ctx));
-}
-
-/*
  * The MTL flow control thresholds, which count down from a full FIFO in
  * steps of 512 bytes after the first 1KB.
  */
@@ -1403,20 +1459,15 @@ tcx_init(if_ctx_t ctx)
 	if_t ifp;
 	const uint8_t *ea;
 	uint64_t a;
-	uint32_t bufsz, v;
-	int i;
+	uint32_t v;
 
 	sc = iflib_get_softc(ctx);
 	ifp = iflib_get_ifp(ctx);
 
 	/* Reset the DMA, MTL and MAC.  This does not touch the PCS or PMA. */
 	MAC_WRITE(sc, XGMAC_DMA_MODE, XGMAC_DMA_MODE_SWR);
-	for (i = 0; i < TCX_SWR_TIMEOUT; i += 10) {
-		if ((MAC_READ(sc, XGMAC_DMA_MODE) & XGMAC_DMA_MODE_SWR) == 0)
-			break;
-		DELAY(10);
-	}
-	if (i >= TCX_SWR_TIMEOUT) {
+	if (tcx_wait(sc, MAC_OFF(sc, XGMAC_DMA_MODE), XGMAC_DMA_MODE_SWR, 0,
+	    10, TCX_SWR_TIMEOUT) != 0) {
 		device_printf(sc->dev, "DMA reset timed out\n");
 		iflib_init_failed(ctx);
 		return;
@@ -1451,23 +1502,29 @@ tcx_init(if_ctx_t ctx)
 	v = XGMAC_RX_CONFIG_ACS | XGMAC_RX_CONFIG_CST |
 	    XGMAC_RX_CONFIG_GPSLCE | XGMAC_RX_CONFIG_WD |
 	    (XGMAC_RX_CONFIG_GPSL_MAX << XGMAC_RX_CONFIG_GPSL_SHIFT);
-	if ((if_getcapenable(ifp) & (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6)) != 0)
+	sc->rx_csum_caps = if_getcapenable(ifp) &
+	    (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6);
+	if (sc->rx_csum_caps != 0)
 		v |= XGMAC_RX_CONFIG_IPC;
 	MAC_WRITE(sc, XGMAC_RX_CONFIG, v);
 	MAC_WRITE(sc, XGMAC_TX_CONFIG, XGMAC_TX_CONFIG_JD);
-	tcx_phy_poll(sc);
-	tcx_mac_set_speed(sc);
+	/* The reset cleared the port speed; the link code keeps it current. */
+	tcx_mac_set_link(sc);
 	MAC_WRITE(sc, XGMAC_RXQ_CTRL0, XGMAC_RXQ_EN_DCB);
 	MAC_WRITE(sc, XGMAC_INT_EN, 0);
 
-	/* DMA channel 0 */
-	bufsz = tcx_rx_bufsz(sc);
+	/*
+	 * DMA channel 0.  A frame larger than the receive buffers, such as
+	 * a jumbo frame in 4KB clusters, spans several descriptors.
+	 */
+	sc->rx_bufsz = iflib_get_rx_mbuf_sz(ctx);
 	MAC_WRITE(sc, XGMAC_DMA_CH_CONTROL(0), XGMAC_DMA_CH_PBLX8);
 	MAC_WRITE(sc, XGMAC_DMA_CH_TX_CONTROL(0),
 	    (TCX_PBL << XGMAC_DMA_CH_PBL_SHIFT) | XGMAC_DMA_CH_TSE);
 	MAC_WRITE(sc, XGMAC_DMA_CH_RX_CONTROL(0),
 	    (TCX_PBL << XGMAC_DMA_CH_PBL_SHIFT) |
-	    ((bufsz << XGMAC_DMA_CH_RBSZ_SHIFT) & XGMAC_DMA_CH_RBSZ_MASK));
+	    ((sc->rx_bufsz << XGMAC_DMA_CH_RBSZ_SHIFT) &
+	    XGMAC_DMA_CH_RBSZ_MASK));
 
 	sc->txq.cidx = sc->txq.pidx = 0;
 	sc->txq.tso_mss = 0;
@@ -1541,12 +1598,8 @@ tcx_stop(if_ctx_t ctx)
 	/* Stop receiving, then let the DMA drain what the MTL holds. */
 	v = MAC_READ(sc, XGMAC_RX_CONFIG);
 	MAC_WRITE(sc, XGMAC_RX_CONFIG, v & ~XGMAC_RX_CONFIG_RE);
-	for (i = 0; i < TCX_STOP_TIMEOUT; i += 100) {
-		if ((MAC_READ(sc, XGMAC_MTL_RXQ_DEBUG(0)) &
-		    XGMAC_MTL_RXQ_NOT_EMPTY) == 0)
-			break;
-		tcx_delay(100);
-	}
+	(void)tcx_wait(sc, MAC_OFF(sc, XGMAC_MTL_RXQ_DEBUG(0)),
+	    XGMAC_MTL_RXQ_NOT_EMPTY, 0, 100, TCX_STOP_TIMEOUT);
 	v = MAC_READ(sc, XGMAC_DMA_CH_RX_CONTROL(0));
 	MAC_WRITE(sc, XGMAC_DMA_CH_RX_CONTROL(0), v & ~XGMAC_DMA_CH_RXST);
 	MAC_WRITE(sc, XGMAC_DMA_CH_STATUS(0), 0xffffffff);
@@ -1554,10 +1607,6 @@ tcx_stop(if_ctx_t ctx)
 
 /*
  * Interrupts
- *
- * The DMA channel interrupts are level signals into the MSI generator.
- * It sends one MSI and then holds off until MASK_CLR is written, when it
- * sends another if a source is still asserted.
  */
 
 static void
@@ -1587,11 +1636,14 @@ tcx_intr(void *arg)
 	uint32_t st;
 
 	sc = arg;
-	if (MSI_READ(sc, TC956X_MSI_INT_STS) == 0)
-		return (FILTER_STRAY);
-
-	MSI_WRITE(sc, TC956X_MSI_OUT_EN, 0);
+	/* The MSI is ours alone; the channel status says what happened. */
 	st = MAC_READ(sc, XGMAC_DMA_CH_STATUS(0));
+	if (st == 0) {
+		/* Re-arm the generator, which holds off after each MSI. */
+		MSI_WRITE(sc, TC956X_MSI_MASK_CLR, TC956X_MSI_MASK_CLR_ALL);
+		return (FILTER_STRAY);
+	}
+	MSI_WRITE(sc, TC956X_MSI_OUT_EN, 0);
 	MAC_WRITE(sc, XGMAC_DMA_CH_STATUS(0), st);
 	sc->stat_intr++;
 	if ((st & XGMAC_DMA_CH_RI) != 0)
@@ -1637,12 +1689,24 @@ tcx_tx_desc(struct tcx_desc *d, uint64_t a, uint32_t des2, uint32_t des3)
 	d->des3 = htole32(des3);
 }
 
+/* Should the last descriptor of a packet of ndesc ask for an interrupt? */
+static bool
+tcx_tx_want_ioc(struct tcx_softc *sc, if_pkt_info_t pi, u_int ndesc)
+{
+	sc->tx_since_ioc += ndesc;
+	if ((pi->ipi_flags & IPI_TX_INTR) == 0 || sc->tx_since_ioc <
+	    MIN(sc->tx_coal_frames, (u_int)sc->scctx->isc_ntxd[0] / 4))
+		return (false);
+	sc->tx_since_ioc = 0;
+	return (true);
+}
+
 /*
  * A plain packet takes one descriptor per segment.  For TSO the first
- * descriptor must hold exactly the headers, so the first segment is split
- * if it carries payload too, and a context descriptor goes ahead of it
- * whenever the MSS changes.  isc_tx_pad reserves those two extra
- * descriptors.
+ * descriptor must hold exactly the headers, so they get a descriptor of
+ * their own, and a context descriptor goes ahead of it whenever the MSS
+ * changes.  isc_tx_pad reserves those two extra descriptors.  iflib's
+ * rings are a power of two in size.
  */
 static int
 tcx_txd_encap(void *arg, if_pkt_info_t pi)
@@ -1650,23 +1714,22 @@ tcx_txd_encap(void *arg, if_pkt_info_t pi)
 	struct tcx_softc *sc;
 	struct tcx_txq *q;
 	bus_dma_segment_t *segs;
-	uint64_t a;
-	uint32_t des2, des3, first3, len;
-	u_int hdrlen, ndesc, off;
-	qidx_t pidx;
-	int i, last, n;
+	bus_addr_t addr;
+	uint32_t des2, des3, len;
+	u_int hdrlen, ndesc;
+	qidx_t mask, pidx;
+	int i, last;
 	bool tso;
 
 	sc = arg;
 	q = &sc->txq;
 	segs = pi->ipi_segs;
-	n = sc->scctx->isc_ntxd[0];
+	mask = sc->scctx->isc_ntxd[0] - 1;
 	last = pi->ipi_nsegs - 1;
 	pidx = pi->ipi_pidx;
 	ndesc = 0;
-
 	tso = (pi->ipi_csum_flags & (CSUM_IP_TSO | CSUM_IP6_TSO)) != 0;
-	hdrlen = 0;
+
 	if (tso) {
 		hdrlen = pi->ipi_ehdrlen + pi->ipi_ip_hlen + pi->ipi_tcp_hlen;
 		if (segs[0].ds_len < hdrlen)
@@ -1676,44 +1739,41 @@ tcx_txd_encap(void *arg, if_pkt_info_t pi)
 			    pi->ipi_tso_segsz & TDES2_MSS_MASK,
 			    TDES3_OWN | TDES3_CTXT | TDES3_TCMSSV);
 			q->tso_mss = pi->ipi_tso_segsz;
-			pidx = (pidx + 1) % n;
+			pidx = (pidx + 1) & mask;
 			ndesc++;
 		}
-		first3 = TDES3_FD | TDES3_TSE |
+		tcx_tx_desc(&q->ring[pidx], tcx_dma_addr(segs[0].ds_addr),
+		    hdrlen, TDES3_OWN | TDES3_FD | TDES3_TSE |
 		    ((pi->ipi_tcp_hlen / 4) << TDES3_THL_SHIFT) |
-		    ((pi->ipi_len - hdrlen) & TDES3_TPL_MASK);
+		    ((pi->ipi_len - hdrlen) & TDES3_TPL_MASK));
+		pidx = (pidx + 1) & mask;
+		ndesc++;
 	} else
-		first3 = TDES3_FD | tcx_tx_cic(pi->ipi_csum_flags) |
-		    (pi->ipi_len & TDES3_FL_MASK);
+		hdrlen = 0;
 
 	for (i = 0; i <= last; i++) {
-		off = 0;
-		do {
-			a = tcx_dma_addr(segs[i].ds_addr + off);
-			len = segs[i].ds_len - off;
-			if (i == 0 && off == 0) {
-				if (tso)
-					len = hdrlen;
-				des3 = TDES3_OWN | first3;
-			} else
-				des3 = TDES3_OWN | (tso ? 0 :
-				    (pi->ipi_len & TDES3_FL_MASK));
-			off += len;
-			des2 = len & TDES2_B1L_MASK;
-			if (i == last && off == segs[i].ds_len) {
-				des3 |= TDES3_LD;
-				sc->tx_since_ioc += ndesc + 1;
-				if ((pi->ipi_flags & IPI_TX_INTR) != 0 &&
-				    sc->tx_since_ioc >= MIN(sc->tx_coal_frames,
-				    (u_int)n / 4)) {
-					des2 |= TDES2_IOC;
-					sc->tx_since_ioc = 0;
-				}
-			}
-			tcx_tx_desc(&q->ring[pidx], a, des2, des3);
-			pidx = (pidx + 1) % n;
-			ndesc++;
-		} while (off < segs[i].ds_len);
+		addr = segs[i].ds_addr;
+		len = segs[i].ds_len;
+		if (i == 0) {
+			addr += hdrlen;
+			len -= hdrlen;
+			if (len == 0)
+				continue;	/* TSO payload starts later */
+		}
+		des3 = TDES3_OWN;
+		if (!tso)
+			des3 |= pi->ipi_len & TDES3_FL_MASK;
+		if (!tso && i == 0)
+			des3 |= TDES3_FD | tcx_tx_cic(pi->ipi_csum_flags);
+		des2 = len & TDES2_B1L_MASK;
+		if (i == last) {
+			des3 |= TDES3_LD;
+			if (tcx_tx_want_ioc(sc, pi, ndesc + 1))
+				des2 |= TDES2_IOC;
+		}
+		tcx_tx_desc(&q->ring[pidx], tcx_dma_addr(addr), des2, des3);
+		pidx = (pidx + 1) & mask;
+		ndesc++;
 	}
 
 	pi->ipi_new_pidx = pidx;
@@ -1740,12 +1800,12 @@ tcx_txd_credits_update(void *arg, uint16_t qid, bool clear)
 	struct tcx_softc *sc;
 	struct tcx_txq *q;
 	uint32_t des3;
-	qidx_t idx;
-	int count, done, n;
+	qidx_t idx, mask;
+	int count, done;
 
 	sc = arg;
 	q = &sc->txq;
-	n = sc->scctx->isc_ntxd[0];
+	mask = sc->scctx->isc_ntxd[0] - 1;
 
 	/*
 	 * The DMA clears OWN in every descriptor it has finished with, but
@@ -1754,7 +1814,7 @@ tcx_txd_credits_update(void *arg, uint16_t qid, bool clear)
 	 * isc_tx_nsegments, fewer than a TSO packet can use.
 	 */
 	count = done = 0;
-	for (idx = q->cidx; idx != q->pidx; idx = (idx + 1) % n) {
+	for (idx = q->cidx; idx != q->pidx; idx = (idx + 1) & mask) {
 		des3 = le32toh(q->ring[idx].des3);
 		if ((des3 & TDES3_OWN) != 0)
 			break;
@@ -1766,7 +1826,7 @@ tcx_txd_credits_update(void *arg, uint16_t qid, bool clear)
 		}
 	}
 	if (clear)
-		q->cidx = (q->cidx + done) % n;
+		q->cidx = (q->cidx + done) & mask;
 	return (done);
 }
 
@@ -1780,15 +1840,16 @@ tcx_rxd_available(void *arg, uint16_t qid, qidx_t idx, qidx_t budget)
 	struct tcx_softc *sc;
 	struct tcx_rxq *q;
 	uint32_t des3;
-	int count, n;
+	qidx_t mask;
+	int count;
 
 	sc = arg;
 	q = &sc->rxq;
-	n = sc->scctx->isc_nrxd[0];
+	mask = sc->scctx->isc_nrxd[0] - 1;
 
 	/* Descriptors from rxq.pidx on have not been handed to the DMA. */
 	count = 0;
-	for (; idx != q->pidx && count < budget; idx = (idx + 1) % n) {
+	for (; idx != q->pidx && count < budget; idx = (idx + 1) & mask) {
 		des3 = le32toh(q->ring[idx].des3);
 		if ((des3 & RDES3_OWN) != 0)
 			break;
@@ -1812,20 +1873,16 @@ tcx_rx_csum(struct tcx_softc *sc, if_rxd_info_t ri, uint32_t des3)
 		sc->rx_err_des3 = des3;
 		return;
 	}
-	if ((if_getcapenable(ri->iri_ifp) &
-	    (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6)) == 0)
-		return;
-
 	switch ((des3 & RDES3_L34T_MASK) >> RDES3_L34T_SHIFT) {
 	case RDES3_L34T_IP4TCP:
 	case RDES3_L34T_IP4UDP:
-		if ((if_getcapenable(ri->iri_ifp) & IFCAP_RXCSUM) == 0)
+		if ((sc->rx_csum_caps & IFCAP_RXCSUM) == 0)
 			return;
 		ri->iri_csum_flags = CSUM_IP_CHECKED | CSUM_IP_VALID;
 		break;
 	case RDES3_L34T_IP6TCP:
 	case RDES3_L34T_IP6UDP:
-		if ((if_getcapenable(ri->iri_ifp) & IFCAP_RXCSUM_IPV6) == 0)
+		if ((sc->rx_csum_caps & IFCAP_RXCSUM_IPV6) == 0)
 			return;
 		break;
 	default:
@@ -1841,14 +1898,13 @@ tcx_rxd_pkt_get(void *arg, if_rxd_info_t ri)
 	struct tcx_softc *sc;
 	struct tcx_rxq *q;
 	uint32_t des3;
-	u_int bufsz, len, pktlen;
-	qidx_t idx;
-	int i, n;
+	u_int len, pktlen;
+	qidx_t idx, mask;
+	int i;
 
 	sc = arg;
 	q = &sc->rxq;
-	n = sc->scctx->isc_nrxd[0];
-	bufsz = tcx_rx_bufsz(sc);
+	mask = sc->scctx->isc_nrxd[0] - 1;
 	idx = ri->iri_cidx;
 	len = 0;
 
@@ -1856,7 +1912,7 @@ tcx_rxd_pkt_get(void *arg, if_rxd_info_t ri)
 		des3 = le32toh(q->ring[idx].des3);
 		ri->iri_frags[i].irf_flid = 0;
 		ri->iri_frags[i].irf_idx = idx;
-		idx = (idx + 1) % n;
+		idx = (idx + 1) & mask;
 		if ((des3 & RDES3_LD) != 0) {
 			/* The last descriptor holds the whole length. */
 			pktlen = des3 & RDES3_PL_MASK;
@@ -1866,8 +1922,8 @@ tcx_rxd_pkt_get(void *arg, if_rxd_info_t ri)
 			tcx_rx_csum(sc, ri, des3);
 			return (0);
 		}
-		ri->iri_frags[i].irf_len = bufsz;
-		len += bufsz;
+		ri->iri_frags[i].irf_len = sc->rx_bufsz;
+		len += sc->rx_bufsz;
 	}
 	return (EBADMSG);
 }
@@ -1892,11 +1948,11 @@ tcx_rxd_refill(void *arg, if_rxd_update_t iru)
 	struct tcx_softc *sc;
 	struct tcx_desc *d;
 	uint64_t a;
-	qidx_t idx;
-	int i, n;
+	qidx_t idx, mask;
+	int i;
 
 	sc = arg;
-	n = sc->scctx->isc_nrxd[0];
+	mask = sc->scctx->isc_nrxd[0] - 1;
 	idx = iru->iru_pidx;
 	for (i = 0; i < iru->iru_count; i++) {
 		d = &sc->rxq.ring[idx];
@@ -1906,7 +1962,7 @@ tcx_rxd_refill(void *arg, if_rxd_update_t iru)
 		d->des2 = 0;
 		d->des3 = htole32(RDES3_OWN |
 		    (tcx_rx_want_ioc(sc) ? RDES3_IOC : 0));
-		idx = (idx + 1) % n;
+		idx = (idx + 1) & mask;
 	}
 }
 
@@ -1951,7 +2007,7 @@ tcx_mtu_set(if_ctx_t ctx, uint32_t mtu)
 {
 	struct tcx_softc *sc;
 
-	if (mtu > TCX_MAX_MTU)
+	if (mtu > ETHERMTU_JUMBO)
 		return (EINVAL);
 	sc = iflib_get_softc(ctx);
 	sc->scctx->isc_max_frame_size = mtu + ETHER_HDR_LEN + ETHER_CRC_LEN +
@@ -1987,82 +2043,33 @@ static void
 tcx_update_admin_status(if_ctx_t ctx)
 {
 	struct tcx_softc *sc;
-	int state;
+	struct tcx_link l;
 
 	sc = iflib_get_softc(ctx);
-	if (!tcx_phy_poll(sc))
-		return;
-	if (sc->link_up && sc->link_speed != 0 &&
-	    sc->link_speed != sc->serdes_speed) {
-		if (bootverbose)
-			device_printf(sc->dev, "SerDes %u -> %u Mb/s\n",
-			    sc->serdes_speed, sc->link_speed);
-		tcx_serdes_config(sc, sc->link_speed);
-		sc->link_reported = LINK_STATE_UNKNOWN;
-	}
-
-	/*
-	 * Compare with what iflib was last told, not with the previous
-	 * poll: attach and init poll the PHY too.
-	 */
-	state = sc->link_up ? LINK_STATE_UP : LINK_STATE_DOWN;
-	if (state == sc->link_reported && (state == LINK_STATE_DOWN ||
-	    (sc->link_speed == sc->speed_reported &&
-	    sc->link_txpause == sc->txpause_reported &&
-	    sc->link_rxpause == sc->rxpause_reported)))
-		return;
-
-	if (state != sc->link_reported)
-		tcx_phy_serdes_fifo(sc, state == LINK_STATE_UP);
-	sc->link_reported = state;
-	sc->speed_reported = sc->link_speed;
-	sc->txpause_reported = sc->link_txpause;
-	sc->rxpause_reported = sc->link_rxpause;
-	if (state == LINK_STATE_UP) {
-		if (!sc->link_fdx)
-			device_printf(sc->dev, "half-duplex link: the MAC only "
-			    "does full duplex, expect errors\n");
-		tcx_mac_set_speed(sc);
-		iflib_link_state_change(ctx, LINK_STATE_UP,
-		    IF_Mbps(sc->link_speed));
-	} else
-		iflib_link_state_change(ctx, LINK_STATE_DOWN, 0);
+	if (tcx_phy_poll(sc, &l))
+		tcx_link_apply(sc, &l);
 }
 
 static void
 tcx_media_status(if_ctx_t ctx, struct ifmediareq *ifmr)
 {
 	struct tcx_softc *sc;
+	const struct tcx_speed *sp;
 
 	sc = iflib_get_softc(ctx);
 	ifmr->ifm_status = IFM_AVALID;
 	ifmr->ifm_active = IFM_ETHER;
-	if (!sc->link_up) {
+	if (!sc->link_known || !sc->link.up) {
 		ifmr->ifm_active |= IFM_NONE;
 		return;
 	}
 	ifmr->ifm_status |= IFM_ACTIVE;
-	switch (sc->link_speed) {
-	case 10:
-		ifmr->ifm_active |= IFM_10_T;
-		break;
-	case 100:
-		ifmr->ifm_active |= IFM_100_TX;
-		break;
-	case 1000:
-		ifmr->ifm_active |= IFM_1000_T;
-		break;
-	case 2500:
-		ifmr->ifm_active |= IFM_2500_T;
-		break;
-	default:
-		ifmr->ifm_active |= IFM_UNKNOWN;
-		break;
-	}
-	ifmr->ifm_active |= sc->link_fdx ? IFM_FDX : IFM_HDX;
-	if (sc->link_txpause)
+	sp = tcx_speed_lookup(sc->link.speed);
+	ifmr->ifm_active |= sp != NULL ? sp->ifm : IFM_UNKNOWN;
+	ifmr->ifm_active |= sc->link.fdx ? IFM_FDX : IFM_HDX;
+	if (sc->link.txpause)
 		ifmr->ifm_active |= IFM_ETH_TXPAUSE;
-	if (sc->link_rxpause)
+	if (sc->link.rxpause)
 		ifmr->ifm_active |= IFM_ETH_RXPAUSE;
 }
 

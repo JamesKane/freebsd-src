@@ -226,6 +226,8 @@ the driver attaches anyway and tries again at the next link check
 that finds the PHY up.
 .It "tcx%d: PHY at %d does not answer"
 No PHY responded on the controller's MDIO bus.
+.It "tcx%d: PHY at %d is 0x%04x%04x, not a QCA8081; link state will be misread"
+The driver reads the link state from registers only the QCA8081 has.
 .It "tcx%d: SerDes did not come up at %u Mb/s"
 The SerDes did not finish initializing for the new link speed.
 .It "tcx%d: PCS reset timed out"
