@@ -350,7 +350,7 @@ qcom_epss_type(device_t dev, int *type)
 {
 	if (type == NULL)
 		return (EINVAL);
-	*type = CPUFREQ_TYPE_ABSOLUTE;
+	*type = CPUFREQ_TYPE_ABSOLUTE | CPUFREQ_FLAG_DOMAIN;
 	return (0);
 }
 

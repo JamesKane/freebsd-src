@@ -943,12 +943,10 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 {
 	struct cpufreq_softc *sc;
 	struct cf_level *levels;
-	int best, count, diff, bdiff, devcount, error, freq, i, n, nfreqs;
-	int *freqs;
+	int best, count, diff, bdiff, devcount, error, freq, i, n, type;
 	device_t *devs;
 
 	devs = NULL;
-	freqs = NULL;
 	sc = oidp->oid_arg1;
 	levels = sc->levels_buf;
 
@@ -961,23 +959,23 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 		goto out;
 
 	/*
-	 * While we only call cpufreq_get() on one device, we call
-	 * cpufreq_set() on all CPUs that offer the same levels.  This is
-	 * needed for some MP systems.  CPUs with other levels, such as the
-	 * other cluster of a big.LITTLE system, have their own clock and
-	 * are left alone.
+	 * While we only call cpufreq_get() on one device (assuming all
+	 * CPUs have equal levels), we call cpufreq_set() on all CPUs.
+	 * This is needed for some MP systems.  A driver that controls a
+	 * clock domain of its own, such as a cluster of a big.LITTLE
+	 * system, only sets its own.
 	 */
-	count = CF_MAX_LEVELS;
-	error = CPUFREQ_LEVELS(sc->dev, levels, &count);
-	if (error)
-		goto out;
-	nfreqs = count;
-	freqs = malloc(nfreqs * sizeof(*freqs), M_TEMP, M_WAITOK);
-	for (i = 0; i < nfreqs; i++)
-		freqs[i] = levels[i].total_set.freq;
-	error = devclass_get_devices(devclass_find("cpufreq"), &devs, &devcount);
-	if (error)
-		goto out;
+	if (CPUFREQ_DRV_TYPE(sc->cf_drv_dev, &type) == 0 &&
+	    (type & CPUFREQ_FLAG_DOMAIN) != 0) {
+		devs = malloc(sizeof(*devs), M_TEMP, M_WAITOK);
+		devs[0] = sc->dev;
+		devcount = 1;
+	} else {
+		error = devclass_get_devices(devclass_find("cpufreq"), &devs,
+		    &devcount);
+		if (error)
+			goto out;
+	}
 	for (n = 0; n < devcount; n++) {
 		count = CF_MAX_LEVELS;
 		error = CPUFREQ_LEVELS(devs[n], levels, &count);
@@ -987,13 +985,6 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 			"cpufreq: need to increase CF_MAX_LEVELS\n");
 			break;
 		}
-		if (count != nfreqs)
-			continue;
-		for (i = 0; i < count; i++)
-			if (levels[i].total_set.freq != freqs[i])
-				break;
-		if (i != count)
-			continue;
 		best = 0;
 		bdiff = 1 << 30;
 		for (i = 0; i < count; i++) {
@@ -1009,7 +1000,6 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 out:
 	if (devs)
 		free(devs, M_TEMP);
-	free(freqs, M_TEMP);
 	return (error);
 }
 

@@ -147,6 +147,12 @@ TAILQ_HEAD(cf_level_lst, cf_level);
 #define CPUFREQ_TYPE_ABSOLUTE	(1 << 1)
 #define CPUFREQ_FLAG_INFO_ONLY	(1 << 16)
 #define CPUFREQ_FLAG_UNCACHED	(1 << 17)
+/*
+ * The "domain" flag tells cpufreq that the driver controls the clock of a
+ * set of CPUs (such as a cluster) of its own: setting its frequency must not
+ * change the other CPUs'.
+ */
+#define CPUFREQ_FLAG_DOMAIN	(1 << 18)
 
 /*
  * When setting a level, the caller indicates the priority of this request.
