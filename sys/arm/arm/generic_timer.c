@@ -117,6 +117,7 @@ struct arm_tmr_softc {
 	struct eventtimer	et;
 	bool			physical_sys;
 	bool			physical_user;
+	bool			always_on;	/* keeps running in deep idle */
 };
 
 static struct arm_tmr_softc *arm_tmr_sc = NULL;
@@ -492,6 +493,7 @@ arm_tmr_fdt_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 	node = ofw_bus_get_node(dev);
+	sc->always_on = OF_hasprop(node, "always-on");
 
 	has_names = OF_hasprop(node, "interrupt-names");
 	for (i = 0; i < nitems(arm_tmr_irq_defs); i++) {
@@ -615,9 +617,18 @@ arm_tmr_acpi_attach(device_t dev)
 {
 	const struct arm_tmr_irq_defs *irq_def;
 	struct arm_tmr_softc *sc;
+	ACPI_TABLE_GTDT *gtdt;
+	vm_paddr_t physaddr;
 	int error;
 
 	sc = device_get_softc(dev);
+	physaddr = acpi_find_table(ACPI_SIG_GTDT);
+	if (physaddr != 0 &&
+	    (gtdt = acpi_map_table(physaddr, ACPI_SIG_GTDT)) != NULL) {
+		sc->always_on = (gtdt->NonSecureEl1Flags &
+		    gtdt->VirtualTimerFlags & ACPI_GTDT_ALWAYS_ON) != 0;
+		acpi_unmap_table(gtdt);
+	}
 	for (int i = 0; i < nitems(arm_tmr_irq_defs); i++) {
 		irq_def = &arm_tmr_irq_defs[i];
 		error = arm_tmr_attach_irq(dev, sc, irq_def, irq_def->idx,
@@ -790,6 +801,9 @@ arm_tmr_attach(device_t dev)
 
 	sc->et.et_name = "ARM MPCore Eventtimer";
 	sc->et.et_flags = ET_FLAGS_ONESHOT | ET_FLAGS_PERCPU;
+	/* Without always-on, the timer stops in states that power down. */
+	if (!sc->always_on)
+		sc->et.et_flags |= ET_FLAGS_C3STOP;
 	sc->et.et_quality = 1000;
 
 	sc->et.et_frequency = sc->clkfreq;
