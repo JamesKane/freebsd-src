@@ -102,9 +102,15 @@ uart_cpu_acpi_init_devinfo(struct uart_devinfo *di, struct uart_class *class,
 		di->bas.regiowidth = 8;
 		break;
 	default:
-		printf("UART unsupported access width: %d!\n",
+		/*
+		 * Some firmware, e.g. on Qualcomm platforms, stores the
+		 * width in bits here instead of the encoded access size.
+		 * Fall back to the class default as Linux does.
+		 */
+		printf("UART invalid access width %d, using default\n",
 		    (int)addr->AccessWidth);
-		return (ENXIO);
+		di->bas.regiowidth = uart_getregiowidth(class);
+		break;
 	}
 	switch (addr->BitWidth) {
 	case 0:
