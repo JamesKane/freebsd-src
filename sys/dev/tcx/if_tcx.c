@@ -67,6 +67,9 @@
 #include <net/if_media.h>
 #include <net/iflib.h>
 
+#include <netinet/in.h>
+#include <netinet/ip.h>
+
 #include <dev/mii/mii.h>
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -80,6 +83,7 @@
 #define	TCX_NDESC_MAX		1024
 #define	TCX_TX_MAXSEGS		32
 #define	TCX_TX_MAXSIZE		16384
+#define	TCX_TSO_SIZE		IP_MAXPACKET	/* iflib adds a VLAN header */
 /*
  * MTL FIFO per queue.  Linux gives each of its four queues 8KB of a 32KB
  * budget; with a single queue an 8KB receive FIFO overflows on 2.5G
@@ -166,6 +170,7 @@ struct tcx_txq {
 	uint64_t		paddr;
 	qidx_t			cidx;	/* oldest descriptor not reclaimed */
 	qidx_t			pidx;	/* next descriptor to fill */
+	uint16_t		tso_mss; /* MSS last given to the DMA */
 };
 
 struct tcx_rxq {
@@ -326,7 +331,7 @@ static struct if_shared_ctx tcx_sctx_init = {
 
 	.isc_tx_maxsize = TCX_TX_MAXSIZE,
 	.isc_tx_maxsegsize = PAGE_SIZE,
-	.isc_tso_maxsize = TCX_TX_MAXSIZE,
+	.isc_tso_maxsize = TCX_TSO_SIZE + sizeof(struct ether_vlan_header),
 	.isc_tso_maxsegsize = PAGE_SIZE,
 	.isc_rx_maxsize = MJUMPAGESIZE,
 	.isc_rx_maxsegsize = MJUMPAGESIZE,
@@ -1027,12 +1032,17 @@ tcx_attach_pre(if_ctx_t ctx)
 	scctx->isc_txd_size[0] = sizeof(struct tcx_desc);
 	scctx->isc_rxd_size[0] = sizeof(struct tcx_desc);
 	scctx->isc_tx_nsegments = TCX_TX_MAXSEGS;
+	scctx->isc_tx_tso_segments_max = TCX_TX_MAXSEGS;
+	scctx->isc_tx_tso_size_max = TCX_TSO_SIZE;
+	scctx->isc_tx_tso_segsize_max = PAGE_SIZE;
+	/* A TSO packet may need an MSS context and a split header buffer. */
+	scctx->isc_tx_pad = 2;
 	scctx->isc_ntxqsets_max = scctx->isc_ntxqsets = 1;
 	scctx->isc_nrxqsets_max = scctx->isc_nrxqsets = 1;
 	scctx->isc_capabilities = scctx->isc_capenable = IFCAP_VLAN_MTU |
-	    IFCAP_HWCSUM | IFCAP_HWCSUM_IPV6;
+	    IFCAP_HWCSUM | IFCAP_HWCSUM_IPV6 | IFCAP_TSO;
 	scctx->isc_tx_csum_flags = CSUM_IP | CSUM_TCP | CSUM_UDP |
-	    CSUM_IP6_TCP | CSUM_IP6_UDP;
+	    CSUM_IP6_TCP | CSUM_IP6_UDP | CSUM_IP_TSO | CSUM_IP6_TSO;
 	scctx->isc_dma_width = TCX_DMA_WIDTH;
 	scctx->isc_max_frame_size = ETHER_MAX_LEN + ETHER_VLAN_ENCAP_LEN;
 	scctx->isc_txrx = &tcx_txrx;
@@ -1315,12 +1325,13 @@ tcx_init(if_ctx_t ctx)
 	bufsz = iflib_get_rx_mbuf_sz(ctx);
 	MAC_WRITE(sc, XGMAC_DMA_CH_CONTROL(0), XGMAC_DMA_CH_PBLX8);
 	MAC_WRITE(sc, XGMAC_DMA_CH_TX_CONTROL(0),
-	    TCX_PBL << XGMAC_DMA_CH_PBL_SHIFT);
+	    (TCX_PBL << XGMAC_DMA_CH_PBL_SHIFT) | XGMAC_DMA_CH_TSE);
 	MAC_WRITE(sc, XGMAC_DMA_CH_RX_CONTROL(0),
 	    (TCX_PBL << XGMAC_DMA_CH_PBL_SHIFT) |
 	    ((bufsz << XGMAC_DMA_CH_RBSZ_SHIFT) & XGMAC_DMA_CH_RBSZ_MASK));
 
 	sc->txq.cidx = sc->txq.pidx = 0;
+	sc->txq.tso_mss = 0;
 	a = tcx_dma_addr(sc->txq.paddr);
 	MAC_WRITE(sc, XGMAC_DMA_CH_TXDESC_HADDR(0), a >> 32);
 	MAC_WRITE(sc, XGMAC_DMA_CH_TXDESC_LADDR(0), (uint32_t)a);
@@ -1453,17 +1464,34 @@ tcx_tx_cic(uint32_t csum_flags)
 	return (0);
 }
 
+static void
+tcx_tx_desc(struct tcx_desc *d, uint64_t a, uint32_t des2, uint32_t des3)
+{
+	d->des0 = htole32((uint32_t)a);
+	d->des1 = htole32((uint32_t)(a >> 32));
+	d->des2 = htole32(des2);
+	d->des3 = htole32(des3);
+}
+
+/*
+ * A plain packet takes one descriptor per segment.  For TSO the first
+ * descriptor must hold exactly the headers, so the first segment is split
+ * if it carries payload too, and a context descriptor goes ahead of it
+ * whenever the MSS changes.  isc_tx_pad reserves those two extra
+ * descriptors.
+ */
 static int
 tcx_txd_encap(void *arg, if_pkt_info_t pi)
 {
 	struct tcx_softc *sc;
 	struct tcx_txq *q;
-	struct tcx_desc *d;
 	bus_dma_segment_t *segs;
 	uint64_t a;
-	uint32_t des2, des3;
+	uint32_t des2, des3, first3, len;
+	u_int hdrlen, ndesc, off;
 	qidx_t pidx;
 	int i, last, n;
+	bool tso;
 
 	sc = arg;
 	q = &sc->txq;
@@ -1471,28 +1499,56 @@ tcx_txd_encap(void *arg, if_pkt_info_t pi)
 	n = sc->scctx->isc_ntxd[0];
 	last = pi->ipi_nsegs - 1;
 	pidx = pi->ipi_pidx;
+	ndesc = 0;
+
+	tso = (pi->ipi_csum_flags & (CSUM_IP_TSO | CSUM_IP6_TSO)) != 0;
+	hdrlen = 0;
+	if (tso) {
+		hdrlen = pi->ipi_ehdrlen + pi->ipi_ip_hlen + pi->ipi_tcp_hlen;
+		if (segs[0].ds_len < hdrlen)
+			return (EFBIG);	/* iflib defragments and retries */
+		if (pi->ipi_tso_segsz != q->tso_mss) {
+			tcx_tx_desc(&q->ring[pidx], 0,
+			    pi->ipi_tso_segsz & TDES2_MSS_MASK,
+			    TDES3_OWN | TDES3_CTXT | TDES3_TCMSSV);
+			q->tso_mss = pi->ipi_tso_segsz;
+			pidx = (pidx + 1) % n;
+			ndesc++;
+		}
+		first3 = TDES3_FD | TDES3_TSE |
+		    ((pi->ipi_tcp_hlen / 4) << TDES3_THL_SHIFT) |
+		    ((pi->ipi_len - hdrlen) & TDES3_TPL_MASK);
+	} else
+		first3 = TDES3_FD | tcx_tx_cic(pi->ipi_csum_flags) |
+		    (pi->ipi_len & TDES3_FL_MASK);
 
 	for (i = 0; i <= last; i++) {
-		d = &q->ring[pidx];
-		a = tcx_dma_addr(segs[i].ds_addr);
-		des2 = segs[i].ds_len & TDES2_B1L_MASK;
-		des3 = TDES3_OWN | (pi->ipi_len & TDES3_FL_MASK);
-		if (i == 0)
-			des3 |= TDES3_FD | tcx_tx_cic(pi->ipi_csum_flags);
-		if (i == last) {
-			des3 |= TDES3_LD;
-			sc->tx_since_ioc += pi->ipi_nsegs;
-			if ((pi->ipi_flags & IPI_TX_INTR) != 0 &&
-			    sc->tx_since_ioc >= sc->tx_coal_frames) {
-				des2 |= TDES2_IOC;
-				sc->tx_since_ioc = 0;
+		off = 0;
+		do {
+			a = tcx_dma_addr(segs[i].ds_addr + off);
+			len = segs[i].ds_len - off;
+			if (i == 0 && off == 0) {
+				if (tso)
+					len = hdrlen;
+				des3 = TDES3_OWN | first3;
+			} else
+				des3 = TDES3_OWN | (tso ? 0 :
+				    (pi->ipi_len & TDES3_FL_MASK));
+			off += len;
+			des2 = len & TDES2_B1L_MASK;
+			if (i == last && off == segs[i].ds_len) {
+				des3 |= TDES3_LD;
+				sc->tx_since_ioc += ndesc + 1;
+				if ((pi->ipi_flags & IPI_TX_INTR) != 0 &&
+				    sc->tx_since_ioc >= sc->tx_coal_frames) {
+					des2 |= TDES2_IOC;
+					sc->tx_since_ioc = 0;
+				}
 			}
-		}
-		d->des0 = htole32((uint32_t)a);
-		d->des1 = htole32((uint32_t)(a >> 32));
-		d->des2 = htole32(des2);
-		d->des3 = htole32(des3);
-		pidx = (pidx + 1) % n;
+			tcx_tx_desc(&q->ring[pidx], a, des2, des3);
+			pidx = (pidx + 1) % n;
+			ndesc++;
+		} while (off < segs[i].ds_len);
 	}
 
 	pi->ipi_new_pidx = pidx;

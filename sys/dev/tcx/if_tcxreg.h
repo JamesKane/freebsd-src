@@ -266,6 +266,7 @@
 #define	 XGMAC_DMA_CH_PBLX8		(1u << 16)
 #define	XGMAC_DMA_CH_TX_CONTROL(c)	(0x3104 + (c) * 0x80)
 #define	 XGMAC_DMA_CH_TXST		(1u << 0)
+#define	 XGMAC_DMA_CH_TSE		(1u << 12)	/* allow TSO */
 #define	XGMAC_DMA_CH_RX_CONTROL(c)	(0x3108 + (c) * 0x80)
 #define	 XGMAC_DMA_CH_RXST		(1u << 0)
 #define	 XGMAC_DMA_CH_RBSZ_SHIFT	1
@@ -309,8 +310,14 @@ struct tcx_desc {
 };
 
 #define	TDES2_B1L_MASK			0x3fffu
+#define	TDES2_MSS_MASK			0x3fffu		/* context */
 #define	TDES2_IOC			(1u << 31)
 #define	TDES3_FL_MASK			0x7fffu
+#define	TDES3_TPL_MASK			0x3ffffu	/* TSO payload */
+#define	TDES3_TSE			(1u << 18)
+#define	TDES3_THL_SHIFT			19		/* TCP header, words */
+#define	TDES3_TCMSSV			(1u << 26)	/* context: MSS valid */
+#define	TDES3_CTXT			(1u << 30)	/* context descriptor */
 #define	TDES3_LD			(1u << 28)
 #define	TDES3_CIC_SHIFT			16	/* checksum insertion */
 #define	 TDES3_CIC_IP			(1u << 16)	/* IPv4 header */
