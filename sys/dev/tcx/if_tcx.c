@@ -440,26 +440,31 @@ tcx_mdio_write_c22(struct tcx_softc *sc, int phy, int reg, uint16_t val)
 }
 
 /*
- * Make the PHY advertise symmetric and asymmetric pause.  Firmware may
- * not have, and changing it means renegotiating, which drops the link
- * for a few seconds.
+ * Make the PHY advertise what the MAC can do: symmetric and asymmetric
+ * pause, and no half duplex, which the XGMAC does not support.  Firmware
+ * or the PHY's defaults may differ, and changing the advertisement means
+ * renegotiating, which drops the link for a few seconds.
  */
 static void
-tcx_phy_advertise_pause(struct tcx_softc *sc)
+tcx_phy_fix_advert(struct tcx_softc *sc)
 {
-	int anar, bmcr;
+	int anar, bmcr, gtcr, nanar, ngtcr;
 
 	anar = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_ANAR);
-	if (anar < 0 || (anar & (ANAR_PAUSE_SYM | ANAR_PAUSE_ASYM)) ==
-	    (ANAR_PAUSE_SYM | ANAR_PAUSE_ASYM))
+	gtcr = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_100T2CR);
+	bmcr = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_BMCR);
+	if (anar < 0 || gtcr < 0 || bmcr < 0)
+		return;
+	nanar = (anar & ~(ANAR_10 | ANAR_TX)) | ANAR_PAUSE_SYM |
+	    ANAR_PAUSE_ASYM;
+	ngtcr = gtcr & ~GTCR_ADV_1000THDX;
+	if (nanar == anar && ngtcr == gtcr)
 		return;
 
-	bmcr = tcx_mdio_read_c22(sc, TC956X_PHY_ADDR, MII_BMCR);
-	if (bmcr < 0)
-		return;
-	device_printf(sc->dev, "advertising flow control, renegotiating\n");
-	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_ANAR,
-	    anar | ANAR_PAUSE_SYM | ANAR_PAUSE_ASYM);
+	device_printf(sc->dev, "updating PHY advertisement, "
+	    "renegotiating\n");
+	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_ANAR, nanar);
+	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_100T2CR, ngtcr);
 	tcx_mdio_write_c22(sc, TC956X_PHY_ADDR, MII_BMCR,
 	    bmcr | BMCR_AUTOEN | BMCR_STARTNEG);
 }
@@ -485,7 +490,7 @@ tcx_phy_mmd_write(struct tcx_softc *sc, int mmd, int reg, uint16_t val)
 }
 
 /*
- * Advertise one speed (full duplex), or all of them for IFM_AUTO, and
+ * Advertise one speed, or all of them for IFM_AUTO, full duplex only, and
  * renegotiate.
  */
 static int
@@ -504,7 +509,7 @@ tcx_phy_set_media(struct tcx_softc *sc, int subtype)
 
 	switch (subtype) {
 	case IFM_AUTO:
-		anar |= ANAR_10 | ANAR_10_FD | ANAR_TX | ANAR_TX_FD;
+		anar |= ANAR_10_FD | ANAR_TX_FD;
 		gtcr |= GTCR_ADV_1000TFDX;
 		adv25 |= MMD_AN_10GBT_ADV2_5G;
 		break;
@@ -1074,7 +1079,7 @@ tcx_attach_post(if_ctx_t ctx)
 		    TC956X_PHY_ADDR);
 		return (0);
 	}
-	tcx_phy_advertise_pause(sc);
+	tcx_phy_fix_advert(sc);
 	return (0);
 }
 
