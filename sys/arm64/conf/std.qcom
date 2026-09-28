@@ -8,6 +8,7 @@ device		qcom_mdio		# MDIO support
 
 # Serial (COM) ports
 device		uart_msm		# Qualcomm MSM UART driver
+device		uart_qcom_geni		# Qualcomm GENI UART
 
 # TLMM driver
 device		qcom_tlmm

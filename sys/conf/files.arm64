@@ -516,6 +516,7 @@ dev/spibus/controller/rockchip/rk_spi.c		optional fdt rk_spi
 dev/uart/uart_cpu_arm64.c			optional uart
 dev/uart/uart_dev_mu.c				optional uart uart_mu fdt
 dev/uart/uart_dev_pl011.c			optional uart pl011
+dev/uart/uart_dev_qcom_geni.c			optional uart uart_qcom_geni
 
 dev/usb/controller/dwc_otg_hisi.c		optional dwcotg fdt soc_hisi_hi6220
 dev/usb/controller/ehci_mv.c			optional ehci_mv fdt
