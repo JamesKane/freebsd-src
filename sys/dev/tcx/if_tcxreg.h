@@ -280,6 +280,12 @@
 #define	XGMAC_DMA_CH_RXDESC_RING_LEN(c)	(0x3134 + (c) * 0x80)
 #define	 XGMAC_DMA_CH_OWRQ_SHIFT	24	/* XGMAC 3.01a erratum */
 #define	XGMAC_DMA_CH_INT_EN(c)		(0x3138 + (c) * 0x80)
+/*
+ * RX interrupt watchdog: after a frame whose descriptor did not ask for an
+ * interrupt, RI is raised RWT * 256 DMA clock cycles later.
+ */
+#define	XGMAC_DMA_CH_RX_WATCHDOG(c)	(0x313c + (c) * 0x80)
+#define	 XGMAC_DMA_CH_RWT_MASK		0xffu
 #define	XGMAC_DMA_CH_STATUS(c)		(0x3160 + (c) * 0x80)
 #define	 XGMAC_DMA_CH_TI		(1u << 0)
 #define	 XGMAC_DMA_CH_TPS		(1u << 1)

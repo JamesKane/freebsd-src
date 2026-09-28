@@ -74,6 +74,16 @@ and
 in the media status reported by
 .Xr ifconfig 8 .
 .Pp
+Interrupts are moderated.
+Received frames raise an interrupt through a watchdog timer that runs
+from the first frame not yet reported,
+rather than one interrupt per frame,
+and transmit completions are reported at most once per
+.Va tx_coal_frames
+descriptors;
+see
+.Sx SYSCTL VARIABLES .
+.Pp
 The
 .Nm
 driver supports the following media types:
@@ -112,6 +122,15 @@ Tunables can be set at the
 .Xr loader 8
 prompt before booting the kernel or stored in
 .Xr loader.conf 5 .
+The
+.Va rx_riwt ,
+.Va rx_coal_frames
+and
+.Va tx_coal_frames
+variables described in
+.Sx SYSCTL VARIABLES
+can also be set as tunables, for example
+.Va dev.tcx.1.rx_riwt .
 .Bl -tag -width indent
 .It Va hw.tcx.cold_init
 When set to 1, the default, each controller, SerDes and XPCS is
@@ -124,6 +143,25 @@ from the network.
 The following variables are available for each interface as
 .Va dev.tcx.\& Ns Ar N :
 .Bl -tag -width indent
+.It Va rx_riwt
+The receive interrupt watchdog, in units of 256 DMA clock cycles,
+about 2 microseconds.
+An interrupt is raised this long after the first received frame that
+has not been reported yet.
+Larger values mean fewer interrupts and more latency.
+The default is 64, about 130 microseconds;
+0 raises an interrupt for every frame.
+.It Va rx_coal_frames
+When
+.Va rx_riwt
+is set, also raise an interrupt for every this many received frames.
+The default, 0, relies on the watchdog alone.
+.It Va tx_coal_frames
+Report transmit completions at most once per this many descriptors.
+The default is 128.
+.It Va intr , intr_rx , intr_tx
+The number of interrupts taken, and of those that reported received
+frames or transmit completions.
 .It Va mmc_rx_frames
 Frames received by the MAC, good and bad.
 .It Va mmc_rx_crc_errors
@@ -196,6 +234,5 @@ if there is none, it generates one with
 .Xr ether_gen_addr 9 .
 .Sh BUGS
 Checksum offload, TCP segmentation offload, jumbo frames, multiple queues,
-multicast filtering, interrupt moderation and Wake on LAN are not
-supported.
+multicast filtering and Wake on LAN are not supported.
 All multicast frames are received.

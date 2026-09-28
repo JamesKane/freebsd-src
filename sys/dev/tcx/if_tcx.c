@@ -96,6 +96,26 @@
 #define	TCX_RFA			14	/* full - 8KB */
 #define	TCX_RFD			22	/* full - 12KB */
 #define	TCX_PAUSE_TIME		0xffff
+
+/*
+ * Receive interrupt moderation.  Descriptors are refilled without asking
+ * for an interrupt, except one in every rx_coal_frames if that is set, and
+ * the RX watchdog raises one rx_riwt units after the first such frame.
+ * A unit is 256 cycles of the 125MHz DMA clock, about 2us, so the default
+ * holds a frame back by up to about 130us, near 8000 interrupts a second
+ * while streaming.  An rx_riwt of 0 turns moderation off.
+ */
+#define	TCX_RX_RIWT_DEFAULT	64
+#define	TCX_RX_COAL_FRAMES_DEFAULT 0
+
+/*
+ * Transmit interrupt moderation.  iflib asks for a completion interrupt
+ * as often as every other packet when the ring is nearly empty; honour
+ * the request only once tx_coal_frames descriptors have been queued since
+ * the last one.  iflib also reclaims descriptors when it transmits and
+ * from its timer, so completions are never stranded.
+ */
+#define	TCX_TX_COAL_FRAMES_DEFAULT 128
 #define	TCX_PBL			32
 #define	TCX_DMA_WIDTH		36	/* the translation window is 64GB */
 
@@ -174,6 +194,14 @@ struct tcx_softc {
 	u_int			speed_reported;
 	bool			txpause_reported;
 	bool			rxpause_reported;
+	u_int			rx_riwt;	/* RX watchdog, 256 cycles */
+	u_int			rx_coal_frames;	/* IOC every n; 0 never */
+	u_int			rx_ioc_count;
+	u_int			tx_coal_frames;	/* descriptors between IOCs */
+	u_int			tx_since_ioc;
+	u_long			stat_intr;	/* interrupts taken */
+	u_long			stat_intr_rx;	/* ... with RI set */
+	u_long			stat_intr_tx;	/* ... with TI set */
 	u_long			stat_rbu;	/* RX buffer unavailable */
 	u_long			stat_fbe;	/* fatal bus error */
 };
@@ -859,6 +887,31 @@ tcx_sysctl_serdes(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
+static int
+tcx_sysctl_rx_riwt(SYSCTL_HANDLER_ARGS)
+{
+	struct tcx_softc *sc;
+	int error, v;
+
+	sc = arg1;
+	v = sc->rx_riwt;
+	error = sysctl_handle_int(oidp, &v, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (v < 0 || v > XGMAC_DMA_CH_RWT_MASK)
+		return (EINVAL);
+	/*
+	 * Descriptors already on the ring keep their setting, so when
+	 * moderation is turned off the watchdog is left running for them;
+	 * it does no harm once every frame interrupts.  The next init
+	 * clears it.
+	 */
+	if (v != 0)
+		MAC_WRITE(sc, XGMAC_DMA_CH_RX_WATCHDOG(0), v);
+	sc->rx_riwt = v;
+	return (0);
+}
+
 /* Writing 1 makes the next link check redo the SerDes and PCS setup. */
 static int
 tcx_sysctl_serdes_reset(SYSCTL_HANDLER_ARGS)
@@ -899,6 +952,9 @@ tcx_attach_pre(if_ctx_t ctx)
 	sc->mac = pci_get_function(dev);
 	if (sc->mac > 1)
 		return (ENXIO);
+	sc->rx_riwt = TCX_RX_RIWT_DEFAULT;
+	sc->rx_coal_frames = TCX_RX_COAL_FRAMES_DEFAULT;
+	sc->tx_coal_frames = TCX_TX_COAL_FRAMES_DEFAULT;
 
 	pci_enable_busmaster(dev);
 
@@ -1050,6 +1106,22 @@ tcx_add_sysctls(struct tcx_softc *sc)
 	    &sc->stat_rbu, "RX DMA ran out of descriptors");
 	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "dma_bus_errors", CTLFLAG_RD,
 	    &sc->stat_fbe, "Fatal DMA bus errors");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "rx_riwt",
+	    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, sc, 0,
+	    tcx_sysctl_rx_riwt, "I", "RX interrupt watchdog, in units of 256 "
+	    "DMA clock cycles; 0 interrupts on every frame");
+	SYSCTL_ADD_UINT(ctx, list, OID_AUTO, "rx_coal_frames", CTLFLAG_RWTUN,
+	    &sc->rx_coal_frames, 0, "With rx_riwt set, also interrupt every "
+	    "this many frames; 0 relies on the watchdog alone");
+	SYSCTL_ADD_UINT(ctx, list, OID_AUTO, "tx_coal_frames", CTLFLAG_RWTUN,
+	    &sc->tx_coal_frames, 0, "Ask for a TX completion interrupt at "
+	    "most once per this many descriptors");
+	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "intr", CTLFLAG_RD,
+	    &sc->stat_intr, "Interrupts taken");
+	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "intr_rx", CTLFLAG_RD,
+	    &sc->stat_intr_rx, "Interrupts with receive completions");
+	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "intr_tx", CTLFLAG_RD,
+	    &sc->stat_intr_tx, "Interrupts with transmit completions");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "serdes",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    tcx_sysctl_serdes, "A", "SerDes and PCS state");
@@ -1252,6 +1324,8 @@ tcx_init(if_ctx_t ctx)
 	    (sc->scctx->isc_nrxd[0] - 1) | (3u << XGMAC_DMA_CH_OWRQ_SHIFT));
 	MAC_WRITE(sc, XGMAC_DMA_CH_RXDESC_TAIL(0), (uint32_t)a);
 
+	MAC_WRITE(sc, XGMAC_DMA_CH_RX_WATCHDOG(0),
+	    sc->rx_riwt & XGMAC_DMA_CH_RWT_MASK);
 	MAC_WRITE(sc, XGMAC_DMA_CH_STATUS(0), 0xffffffff);
 	MAC_WRITE(sc, XGMAC_DMA_CH_INT_EN(0), XGMAC_DMA_CH_NIS |
 	    XGMAC_DMA_CH_AIS | XGMAC_DMA_CH_FBE | XGMAC_DMA_CH_RI |
@@ -1335,6 +1409,11 @@ tcx_intr(void *arg)
 	MSI_WRITE(sc, TC956X_MSI_OUT_EN, 0);
 	st = MAC_READ(sc, XGMAC_DMA_CH_STATUS(0));
 	MAC_WRITE(sc, XGMAC_DMA_CH_STATUS(0), st);
+	sc->stat_intr++;
+	if ((st & XGMAC_DMA_CH_RI) != 0)
+		sc->stat_intr_rx++;
+	if ((st & XGMAC_DMA_CH_TI) != 0)
+		sc->stat_intr_tx++;
 	if ((st & XGMAC_DMA_CH_RBU) != 0)
 		sc->stat_rbu++;
 	if ((st & XGMAC_DMA_CH_FBE) != 0) {
@@ -1378,8 +1457,12 @@ tcx_txd_encap(void *arg, if_pkt_info_t pi)
 			des3 |= TDES3_FD;
 		if (i == last) {
 			des3 |= TDES3_LD;
-			if ((pi->ipi_flags & IPI_TX_INTR) != 0)
+			sc->tx_since_ioc += pi->ipi_nsegs;
+			if ((pi->ipi_flags & IPI_TX_INTR) != 0 &&
+			    sc->tx_since_ioc >= sc->tx_coal_frames) {
 				des2 |= TDES2_IOC;
+				sc->tx_since_ioc = 0;
+			}
 		}
 		d->des0 = htole32((uint32_t)a);
 		d->des1 = htole32((uint32_t)(a >> 32));
@@ -1497,6 +1580,20 @@ tcx_rxd_pkt_get(void *arg, if_rxd_info_t ri)
 	return (EBADMSG);
 }
 
+/* Does the next refilled receive descriptor ask for an interrupt? */
+static bool
+tcx_rx_want_ioc(struct tcx_softc *sc)
+{
+	if (sc->rx_riwt == 0)
+		return (true);
+	if (sc->rx_coal_frames == 0)
+		return (false);
+	if (++sc->rx_ioc_count < sc->rx_coal_frames)
+		return (false);
+	sc->rx_ioc_count = 0;
+	return (true);
+}
+
 static void
 tcx_rxd_refill(void *arg, if_rxd_update_t iru)
 {
@@ -1515,7 +1612,8 @@ tcx_rxd_refill(void *arg, if_rxd_update_t iru)
 		d->des0 = htole32((uint32_t)a);
 		d->des1 = htole32((uint32_t)(a >> 32));
 		d->des2 = 0;
-		d->des3 = htole32(RDES3_OWN | RDES3_IOC);
+		d->des3 = htole32(RDES3_OWN |
+		    (tcx_rx_want_ioc(sc) ? RDES3_IOC : 0));
 		idx = (idx + 1) % n;
 	}
 }
