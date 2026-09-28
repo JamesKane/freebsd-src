@@ -74,6 +74,17 @@ and
 in the media status reported by
 .Xr ifconfig 8 .
 .Pp
+The driver supports transmit and receive checksum offload for TCP and UDP
+over IPv4 and IPv6, and for the IPv4 header,
+controlled with the
+.Cm txcsum ,
+.Cm rxcsum ,
+.Cm txcsum6
+and
+.Cm rxcsum6
+options of
+.Xr ifconfig 8 .
+.Pp
 Interrupts are moderated.
 Received frames raise an interrupt through a watchdog timer that runs
 from the first frame not yet reported,
@@ -159,6 +170,12 @@ The default, 0, relies on the watchdog alone.
 .It Va tx_coal_frames
 Report transmit completions at most once per this many descriptors.
 The default is 128.
+.It Va rx_errors
+Frames received with an error, such as a bad checksum.
+They are passed up without checksum offload flags,
+so the network stack checks them itself.
+.It Va rx_error_status
+The receive descriptor status of the last such frame.
 .It Va intr , intr_rx , intr_tx
 The number of interrupts taken, and of those that reported received
 frames or transmit completions.
@@ -233,6 +250,6 @@ The driver keeps the address firmware programmed into the controller;
 if there is none, it generates one with
 .Xr ether_gen_addr 9 .
 .Sh BUGS
-Checksum offload, TCP segmentation offload, jumbo frames, multiple queues,
+TCP segmentation offload, jumbo frames, multiple queues,
 multicast filtering and Wake on LAN are not supported.
 All multicast frames are received.

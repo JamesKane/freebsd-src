@@ -211,6 +211,7 @@
 #define	 XGMAC_RX_CONFIG_ACS		(1u << 1)	/* strip pad/FCS */
 #define	 XGMAC_RX_CONFIG_CST		(1u << 2)	/* strip FCS */
 #define	 XGMAC_RX_CONFIG_GPSLCE		(1u << 6)
+#define	 XGMAC_RX_CONFIG_IPC		(1u << 9)	/* checksum offload */
 #define	 XGMAC_RX_CONFIG_WD		(1u << 7)
 #define	 XGMAC_RX_CONFIG_GPSL_SHIFT	16
 #define	 XGMAC_RX_CONFIG_GPSL_MAX	16368
@@ -311,11 +312,20 @@ struct tcx_desc {
 #define	TDES2_IOC			(1u << 31)
 #define	TDES3_FL_MASK			0x7fffu
 #define	TDES3_LD			(1u << 28)
+#define	TDES3_CIC_SHIFT			16	/* checksum insertion */
+#define	 TDES3_CIC_IP			(1u << 16)	/* IPv4 header */
+#define	 TDES3_CIC_FULL			(3u << 16)	/* and TCP/UDP */
 #define	TDES3_FD			(1u << 29)
 #define	TDES3_OWN			(1u << 31)
 
 #define	RDES3_PL_MASK			0x3fffu
 #define	RDES3_ES			(1u << 15)
+#define	RDES3_L34T_SHIFT		20		/* packet type */
+#define	RDES3_L34T_MASK			(0xfu << 20)
+#define	 RDES3_L34T_IP4TCP		0x1
+#define	 RDES3_L34T_IP4UDP		0x2
+#define	 RDES3_L34T_IP6TCP		0x9
+#define	 RDES3_L34T_IP6UDP		0xa
 #define	RDES3_LD			(1u << 28)
 #define	RDES3_IOC			(1u << 30)	/* read format */
 #define	RDES3_CTXT			(1u << 30)	/* write-back format */

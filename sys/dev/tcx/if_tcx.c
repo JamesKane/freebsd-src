@@ -50,6 +50,7 @@
 #include <sys/bus.h>
 #include <sys/endian.h>
 #include <sys/kernel.h>
+#include <sys/mbuf.h>
 #include <sys/module.h>
 #include <sys/rman.h>
 #include <sys/socket.h>
@@ -199,6 +200,8 @@ struct tcx_softc {
 	u_int			rx_ioc_count;
 	u_int			tx_coal_frames;	/* descriptors between IOCs */
 	u_int			tx_since_ioc;
+	u_long			stat_rx_err;	/* frames with ES set */
+	uint32_t		rx_err_des3;	/* status of the last */
 	u_long			stat_intr;	/* interrupts taken */
 	u_long			stat_intr_rx;	/* ... with RI set */
 	u_long			stat_intr_tx;	/* ... with TI set */
@@ -1026,8 +1029,10 @@ tcx_attach_pre(if_ctx_t ctx)
 	scctx->isc_tx_nsegments = TCX_TX_MAXSEGS;
 	scctx->isc_ntxqsets_max = scctx->isc_ntxqsets = 1;
 	scctx->isc_nrxqsets_max = scctx->isc_nrxqsets = 1;
-	scctx->isc_capabilities = scctx->isc_capenable = IFCAP_VLAN_MTU;
-	scctx->isc_tx_csum_flags = 0;
+	scctx->isc_capabilities = scctx->isc_capenable = IFCAP_VLAN_MTU |
+	    IFCAP_HWCSUM | IFCAP_HWCSUM_IPV6;
+	scctx->isc_tx_csum_flags = CSUM_IP | CSUM_TCP | CSUM_UDP |
+	    CSUM_IP6_TCP | CSUM_IP6_UDP;
 	scctx->isc_dma_width = TCX_DMA_WIDTH;
 	scctx->isc_max_frame_size = ETHER_MAX_LEN + ETHER_VLAN_ENCAP_LEN;
 	scctx->isc_txrx = &tcx_txrx;
@@ -1116,6 +1121,10 @@ tcx_add_sysctls(struct tcx_softc *sc)
 	SYSCTL_ADD_UINT(ctx, list, OID_AUTO, "tx_coal_frames", CTLFLAG_RWTUN,
 	    &sc->tx_coal_frames, 0, "Ask for a TX completion interrupt at "
 	    "most once per this many descriptors");
+	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "rx_errors", CTLFLAG_RD,
+	    &sc->stat_rx_err, "Frames received with the error summary set");
+	SYSCTL_ADD_U32(ctx, list, OID_AUTO, "rx_error_status", CTLFLAG_RD,
+	    &sc->rx_err_des3, 0, "Descriptor status of the last such frame");
 	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "intr", CTLFLAG_RD,
 	    &sc->stat_intr, "Interrupts taken");
 	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "intr_rx", CTLFLAG_RD,
@@ -1290,9 +1299,12 @@ tcx_init(if_ctx_t ctx)
 	MAC_WRITE(sc, XGMAC_ADDR_LOW(0), ((uint32_t)ea[3] << 24) |
 	    (ea[2] << 16) | (ea[1] << 8) | ea[0]);
 	tcx_set_filter(sc, if_getflags(ifp));
-	MAC_WRITE(sc, XGMAC_RX_CONFIG, XGMAC_RX_CONFIG_ACS |
-	    XGMAC_RX_CONFIG_CST | XGMAC_RX_CONFIG_GPSLCE | XGMAC_RX_CONFIG_WD |
-	    (XGMAC_RX_CONFIG_GPSL_MAX << XGMAC_RX_CONFIG_GPSL_SHIFT));
+	v = XGMAC_RX_CONFIG_ACS | XGMAC_RX_CONFIG_CST |
+	    XGMAC_RX_CONFIG_GPSLCE | XGMAC_RX_CONFIG_WD |
+	    (XGMAC_RX_CONFIG_GPSL_MAX << XGMAC_RX_CONFIG_GPSL_SHIFT);
+	if ((if_getcapenable(ifp) & (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6)) != 0)
+		v |= XGMAC_RX_CONFIG_IPC;
+	MAC_WRITE(sc, XGMAC_RX_CONFIG, v);
 	MAC_WRITE(sc, XGMAC_TX_CONFIG, XGMAC_TX_CONFIG_JD);
 	tcx_phy_poll(sc);
 	tcx_mac_set_speed(sc);
@@ -1429,6 +1441,18 @@ tcx_intr(void *arg)
  * Transmit
  */
 
+/* Checksum insertion for the first descriptor of a packet. */
+static uint32_t
+tcx_tx_cic(uint32_t csum_flags)
+{
+	if ((csum_flags & (CSUM_TCP | CSUM_UDP | CSUM_IP6_TCP |
+	    CSUM_IP6_UDP)) != 0)
+		return (TDES3_CIC_FULL);
+	if ((csum_flags & CSUM_IP) != 0)
+		return (TDES3_CIC_IP);
+	return (0);
+}
+
 static int
 tcx_txd_encap(void *arg, if_pkt_info_t pi)
 {
@@ -1454,7 +1478,7 @@ tcx_txd_encap(void *arg, if_pkt_info_t pi)
 		des2 = segs[i].ds_len & TDES2_B1L_MASK;
 		des3 = TDES3_OWN | (pi->ipi_len & TDES3_FL_MASK);
 		if (i == 0)
-			des3 |= TDES3_FD;
+			des3 |= TDES3_FD | tcx_tx_cic(pi->ipi_csum_flags);
 		if (i == last) {
 			des3 |= TDES3_LD;
 			sc->tx_since_ioc += pi->ipi_nsegs;
@@ -1542,6 +1566,43 @@ tcx_rxd_available(void *arg, uint16_t qid, qidx_t idx, qidx_t budget)
 	return (count);
 }
 
+/*
+ * Report what the MAC checked.  With checksum offload on, a bad IPv4
+ * header or TCP/UDP checksum sets the error summary, as for other receive
+ * errors.  Such frames are passed up unchecked, for the stack to judge,
+ * rather than failing the whole receive as an error return would.
+ */
+static void
+tcx_rx_csum(struct tcx_softc *sc, if_rxd_info_t ri, uint32_t des3)
+{
+	if ((des3 & RDES3_ES) != 0) {
+		sc->stat_rx_err++;
+		sc->rx_err_des3 = des3;
+		return;
+	}
+	if ((if_getcapenable(ri->iri_ifp) &
+	    (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6)) == 0)
+		return;
+
+	switch ((des3 & RDES3_L34T_MASK) >> RDES3_L34T_SHIFT) {
+	case RDES3_L34T_IP4TCP:
+	case RDES3_L34T_IP4UDP:
+		if ((if_getcapenable(ri->iri_ifp) & IFCAP_RXCSUM) == 0)
+			return;
+		ri->iri_csum_flags = CSUM_IP_CHECKED | CSUM_IP_VALID;
+		break;
+	case RDES3_L34T_IP6TCP:
+	case RDES3_L34T_IP6UDP:
+		if ((if_getcapenable(ri->iri_ifp) & IFCAP_RXCSUM_IPV6) == 0)
+			return;
+		break;
+	default:
+		return;
+	}
+	ri->iri_csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
+	ri->iri_csum_data = 0xffff;
+}
+
 static int
 tcx_rxd_pkt_get(void *arg, if_rxd_info_t ri)
 {
@@ -1570,8 +1631,7 @@ tcx_rxd_pkt_get(void *arg, if_rxd_info_t ri)
 			ri->iri_frags[i].irf_len = pktlen - len;
 			ri->iri_nfrags = i + 1;
 			ri->iri_len = pktlen;
-			if ((des3 & RDES3_ES) != 0)
-				return (EBADMSG);
+			tcx_rx_csum(sc, ri, des3);
 			return (0);
 		}
 		ri->iri_frags[i].irf_len = bufsz;
