@@ -40,6 +40,7 @@ extern bool psci_present;
 
 int	psci_cpu_on(unsigned long, unsigned long, unsigned long);
 int	psci_cpu_off(void);	/* Operates on caller. */
+int	psci_cpu_suspend(uint32_t, unsigned long, unsigned long);
 void	psci_reset(void);
 int32_t	psci_features(uint32_t);
 int	psci_get_version(void);

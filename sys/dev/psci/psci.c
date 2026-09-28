@@ -478,6 +478,20 @@ psci_cpu_on(unsigned long cpu, unsigned long entry, unsigned long context_id)
 }
 
 int
+psci_cpu_suspend(uint32_t power_state, unsigned long entry,
+    unsigned long context_id)
+{
+	uint32_t fnid;
+
+	fnid = PSCI_FNID_CPU_SUSPEND;
+	if (psci_softc != NULL)
+		fnid = psci_softc->psci_fnids[PSCI_FN_CPU_SUSPEND];
+
+	/* PSCI v0.1 and v0.2 both support cpu_suspend. */
+	return (psci_call(fnid, power_state, entry, context_id));
+}
+
+int
 psci_cpu_off(void)
 {
 	uint32_t fnid;
