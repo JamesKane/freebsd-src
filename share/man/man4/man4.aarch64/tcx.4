@@ -91,6 +91,8 @@ and
 .Cm tso6
 options.
 .Pp
+Jumbo frames are supported, up to an MTU of 9000 bytes.
+.Pp
 Interrupts are moderated.
 Received frames raise an interrupt through a watchdog timer that runs
 from the first frame not yet reported,
@@ -256,4 +258,6 @@ The driver keeps the address firmware programmed into the controller;
 if there is none, it generates one with
 .Xr ether_gen_addr 9 .
 .Sh BUGS
-Jumbo frames, multiple queues and Wake on LAN are not supported.
+Multiple queues and Wake on LAN are not supported.
+The MAC has no receive-side scaling hash, so more receive queues would
+not spread traffic.

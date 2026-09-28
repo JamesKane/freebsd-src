@@ -85,22 +85,26 @@
 #define	TCX_TX_MAXSEGS		32
 #define	TCX_TX_MAXSIZE		16384
 #define	TCX_TSO_SIZE		IP_MAXPACKET	/* iflib adds a VLAN header */
+#define	TCX_MAX_MTU		9000
+
 /*
  * MTL FIFO per queue.  Linux gives each of its four queues 8KB of a 32KB
  * budget; with a single queue an 8KB receive FIFO overflows on 2.5G
- * bursts, so give it the whole budget.
+ * bursts, so give it the whole budget.  In store-and-forward mode a frame
+ * must fit in the transmit FIFO, so that holds a jumbo frame.
  */
-#define	TCX_TX_FIFO_BYTES	8192
+#define	TCX_TX_FIFO_BYTES	16384
 #define	TCX_RX_FIFO_BYTES	32768
 
 /*
- * Flow control: ask for a pause once 8KB of the receive FIFO is left, which
- * still holds the frames already on their way, and release it at 12KB.
- * The pause itself is as long as the MAC allows; it is cancelled early by
- * a zero-quanta PAUSE when the FIFO drains.
+ * Flow control: ask for a pause while the receive FIFO still has room for
+ * the frames already on their way, two of the largest or 8KB, whichever is
+ * more, and release it 4KB lower.  The pause itself is as long as the MAC
+ * allows; it is cancelled early by a zero-quanta PAUSE when the FIFO
+ * drains.
  */
-#define	TCX_RFA			14	/* full - 8KB */
-#define	TCX_RFD			22	/* full - 12KB */
+#define	TCX_FC_HEADROOM_MIN	8192
+#define	TCX_FC_HYSTERESIS	4096
 #define	TCX_PAUSE_TIME		0xffff
 
 /*
@@ -1041,7 +1045,7 @@ tcx_attach_pre(if_ctx_t ctx)
 	scctx->isc_ntxqsets_max = scctx->isc_ntxqsets = 1;
 	scctx->isc_nrxqsets_max = scctx->isc_nrxqsets = 1;
 	scctx->isc_capabilities = scctx->isc_capenable = IFCAP_VLAN_MTU |
-	    IFCAP_HWCSUM | IFCAP_HWCSUM_IPV6 | IFCAP_TSO;
+	    IFCAP_HWCSUM | IFCAP_HWCSUM_IPV6 | IFCAP_TSO | IFCAP_JUMBO_MTU;
 	scctx->isc_tx_csum_flags = CSUM_IP | CSUM_TCP | CSUM_UDP |
 	    CSUM_IP6_TCP | CSUM_IP6_UDP | CSUM_IP_TSO | CSUM_IP6_TSO;
 	scctx->isc_dma_width = TCX_DMA_WIDTH;
@@ -1281,6 +1285,32 @@ tcx_set_filter(struct tcx_softc *sc, int flags)
 	MAC_WRITE(sc, XGMAC_PACKET_FILTER, v);
 }
 
+/*
+ * The receive buffer size given to the DMA.  A frame larger than this,
+ * such as a jumbo frame in 4KB clusters, spans several descriptors.
+ */
+static u_int
+tcx_rx_bufsz(struct tcx_softc *sc)
+{
+	return (iflib_get_rx_mbuf_sz(sc->ctx));
+}
+
+/*
+ * The MTL flow control thresholds, which count down from a full FIFO in
+ * steps of 512 bytes after the first 1KB.
+ */
+static uint32_t
+tcx_flow_thresholds(struct tcx_softc *sc)
+{
+	u_int headroom, rfa, rfd;
+
+	headroom = MAX(TCX_FC_HEADROOM_MIN,
+	    2 * sc->scctx->isc_max_frame_size);
+	rfa = howmany(headroom - 1024, 512);
+	rfd = rfa + TCX_FC_HYSTERESIS / 512;
+	return ((rfa << XGMAC_MTL_RFA_SHIFT) | (rfd << XGMAC_MTL_RFD_SHIFT));
+}
+
 static void
 tcx_init(if_ctx_t ctx)
 {
@@ -1322,9 +1352,7 @@ tcx_init(if_ctx_t ctx)
 	MAC_WRITE(sc, XGMAC_MTL_TXQ_OPMODE(0), XGMAC_MTL_TSF |
 	    XGMAC_MTL_TXQEN_ENABLED | XGMAC_MTL_QS(TCX_TX_FIFO_BYTES));
 	MAC_WRITE(sc, XGMAC_MTL_TC_ETS_CONTROL(0), 0);
-	MAC_WRITE(sc, XGMAC_MTL_RXQ_FLOW_CONTROL(0),
-	    (TCX_RFA << XGMAC_MTL_RFA_SHIFT) |
-	    (TCX_RFD << XGMAC_MTL_RFD_SHIFT));
+	MAC_WRITE(sc, XGMAC_MTL_RXQ_FLOW_CONTROL(0), tcx_flow_thresholds(sc));
 	MAC_WRITE(sc, XGMAC_MTL_RXQ_OPMODE(0), XGMAC_MTL_RSF |
 	    XGMAC_MTL_EHFC | XGMAC_MTL_QS(TCX_RX_FIFO_BYTES));
 
@@ -1348,7 +1376,7 @@ tcx_init(if_ctx_t ctx)
 	MAC_WRITE(sc, XGMAC_INT_EN, 0);
 
 	/* DMA channel 0 */
-	bufsz = iflib_get_rx_mbuf_sz(ctx);
+	bufsz = tcx_rx_bufsz(sc);
 	MAC_WRITE(sc, XGMAC_DMA_CH_CONTROL(0), XGMAC_DMA_CH_PBLX8);
 	MAC_WRITE(sc, XGMAC_DMA_CH_TX_CONTROL(0),
 	    (TCX_PBL << XGMAC_DMA_CH_PBL_SHIFT) | XGMAC_DMA_CH_TSE);
@@ -1698,7 +1726,7 @@ tcx_rxd_pkt_get(void *arg, if_rxd_info_t ri)
 	sc = arg;
 	q = &sc->rxq;
 	n = sc->scctx->isc_nrxd[0];
-	bufsz = iflib_get_rx_mbuf_sz(sc->ctx);
+	bufsz = tcx_rx_bufsz(sc);
 	idx = ri->iri_cidx;
 	len = 0;
 
@@ -1801,8 +1829,7 @@ tcx_mtu_set(if_ctx_t ctx, uint32_t mtu)
 {
 	struct tcx_softc *sc;
 
-	/* Jumbo frames need multi-buffer receive testing first. */
-	if (mtu > ETHERMTU)
+	if (mtu > TCX_MAX_MTU)
 		return (EINVAL);
 	sc = iflib_get_softc(ctx);
 	sc->scctx->isc_max_frame_size = mtu + ETHER_HDR_LEN + ETHER_CRC_LEN +
