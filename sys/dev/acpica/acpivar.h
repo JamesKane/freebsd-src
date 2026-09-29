@@ -640,6 +640,8 @@ int	acpi_iort_map_named_msi(const char *devname, u_int rid, u_int *xref,
 	    u_int *devid);
 int	acpi_iort_map_named_smmuv3(const char *devname, u_int rid,
 	    uint64_t *xref, u_int *devid);
+int	acpi_iort_named_smmu(ACPI_HANDLE dev, u_int index, uint64_t *base,
+	    bool *shared, u_int *sids, u_int *nsids);
 int	acpi_iort_lookup_its_from_iwb(device_t dev, int *its_id);
 device_t	acpi_iort_get_iwb_dev(int iwb_id);
 int	acpi_iort_lookup_pci_id(device_t bus, device_t child, uintptr_t *devid);

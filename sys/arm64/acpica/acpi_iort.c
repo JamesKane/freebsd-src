@@ -741,6 +741,82 @@ acpi_iort_map_named_smmuv3(const char *devname, u_int rid, uint64_t *xref,
 	return (0);
 }
 
+/*
+ * The named component node for an ACPI device.  Names are compared as
+ * handles: IORT paths are not padded like ACPICA's full names.
+ */
+static struct iort_node *
+iort_named_comp_lookup(ACPI_HANDLE dev)
+{
+	struct iort_node *node;
+	ACPI_HANDLE h;
+
+	TAILQ_FOREACH(node, &named_nodes, next) {
+		if (ACPI_SUCCESS(AcpiGetHandle(NULL,
+		    node->data.named_comp.DeviceName, &h)) && h == dev)
+			return (node);
+	}
+	return (NULL);
+}
+
+/*
+ * Report the index'th SMMUv1/v2 that a named component's IDs are mapped to:
+ * its base address, whether other nodes also map IDs to it, and the stream
+ * IDs this component uses on it.  On entry *nsids is the size of sids; on
+ * return it is the number of stream IDs, which may be larger (E2BIG).
+ */
+int
+acpi_iort_named_smmu(ACPI_HANDLE dev, u_int index, uint64_t *base,
+    bool *shared, u_int *sids, u_int *nsids)
+{
+	struct iort_node *node, *smmu, *seen[8];
+	struct iort_map_entry *e;
+	u_int i, id, n, nseen, own;
+	bool single;
+
+	node = iort_named_comp_lookup(dev);
+	if (node == NULL)
+		return (ENOENT);
+
+	/* The distinct SMMUv1/v2 nodes, in mapping order. */
+	nseen = 0;
+	for (i = 0; i < node->nentries; i++) {
+		smmu = node->entries.mappings[i].out_node;
+		if (smmu == NULL || smmu->type != ACPI_IORT_NODE_SMMU)
+			continue;
+		for (n = 0; n < nseen && seen[n] != smmu; n++)
+			;
+		if (n == nseen && nseen < nitems(seen))
+			seen[nseen++] = smmu;
+	}
+	if (index >= nseen)
+		return (ENOENT);
+	smmu = seen[index];
+
+	own = n = 0;
+	for (i = 0; i < node->nentries; i++) {
+		e = &node->entries.mappings[i];
+		if (e->out_node != smmu)
+			continue;
+		own++;
+		single = (e->flags & ACPI_IORT_ID_SINGLE_MAPPING) != 0;
+		for (id = e->base; id <= e->end; id++) {
+			if (n < *nsids)
+				sids[n] = e->outbase +
+				    (single ? 0 : id - e->base);
+			n++;
+			if (single)
+				break;
+		}
+	}
+	*base = smmu->data.smmu.BaseAddress;
+	/* usecount counts every mapping entry that resolved to the node. */
+	*shared = smmu->usecount > own;
+	i = *nsids;
+	*nsids = n;
+	return (n > i ? E2BIG : 0);
+}
+
 static struct iort_node *
 acpi_iort_lookup_iwb_node(device_t bus, device_t child)
 {
