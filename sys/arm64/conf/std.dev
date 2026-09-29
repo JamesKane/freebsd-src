@@ -77,6 +77,7 @@ device		uinput			# install /dev/uinput cdev
 device		iflib
 device		em			# Intel PRO/1000 Gigabit Ethernet Family
 device		ix			# Intel 10Gb Ethernet Family
+device		tcx			# Toshiba TC956x 2.5Gb Ethernet
 
 # Ethernet NICs
 device		mdio
