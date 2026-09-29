@@ -101,10 +101,8 @@ linux_hrtimer_cancel(struct hrtimer *hrtimer)
 	ret = linux_hrtimer_try_to_cancel(hrtimer);
 	if (ret == 0)
 		return (0);
-	if (callout_drain(&hrtimer->callout) > 0)
-		ret = 1;
 	/* A callback that ran, and did not arm the timer again, left it idle. */
-	return (ret > 0);
+	return (callout_drain(&hrtimer->callout) > 0 || ret > 0);
 }
 
 void

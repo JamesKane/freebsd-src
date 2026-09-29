@@ -450,23 +450,19 @@ memcpy_fromio(void *to, const volatile void *from, size_t count)
 {
 	uint8_t *dst = to;
 	uint64_t v;
+	size_t n;
 
-	while (count > 0 && ((uintptr_t)from & 7) != 0) {
-		*dst++ = __raw_readb(from);
-		from = (const volatile uint8_t *)from + 1;
-		count--;
-	}
-	while (count >= 8) {
-		v = __raw_readq(from);
-		memcpy(dst, &v, 8);
-		from = (const volatile uint8_t *)from + 8;
-		dst += 8;
-		count -= 8;
-	}
-	while (count > 0) {
-		*dst++ = __raw_readb(from);
-		from = (const volatile uint8_t *)from + 1;
-		count--;
+	for (; count > 0; count -= n) {
+		if (((uintptr_t)from & 7) == 0 && count >= 8) {
+			v = __raw_readq(from);
+			memcpy(dst, &v, 8);
+			n = 8;
+		} else {
+			*dst = __raw_readb(from);
+			n = 1;
+		}
+		from = (const volatile uint8_t *)from + n;
+		dst += n;
 	}
 }
 
@@ -475,23 +471,19 @@ memcpy_toio(volatile void *to, const void *from, size_t count)
 {
 	const uint8_t *src = from;
 	uint64_t v;
+	size_t n;
 
-	while (count > 0 && ((uintptr_t)to & 7) != 0) {
-		__raw_writeb(*src++, to);
-		to = (volatile uint8_t *)to + 1;
-		count--;
-	}
-	while (count >= 8) {
-		memcpy(&v, src, 8);
-		__raw_writeq(v, to);
-		to = (volatile uint8_t *)to + 8;
-		src += 8;
-		count -= 8;
-	}
-	while (count > 0) {
-		__raw_writeb(*src++, to);
-		to = (volatile uint8_t *)to + 1;
-		count--;
+	for (; count > 0; count -= n) {
+		if (((uintptr_t)to & 7) == 0 && count >= 8) {
+			memcpy(&v, src, 8);
+			__raw_writeq(v, to);
+			n = 8;
+		} else {
+			__raw_writeb(*src, to);
+			n = 1;
+		}
+		to = (volatile uint8_t *)to + n;
+		src += n;
 	}
 }
 
@@ -499,25 +491,21 @@ static inline void
 memset_io(volatile void *to, int c, size_t count)
 {
 	uint64_t v;
+	size_t n;
 
 	v = (uint8_t)c;
 	v |= v << 8;
 	v |= v << 16;
 	v |= v << 32;
-	while (count > 0 && ((uintptr_t)to & 7) != 0) {
-		__raw_writeb(c, to);
-		to = (volatile uint8_t *)to + 1;
-		count--;
-	}
-	while (count >= 8) {
-		__raw_writeq(v, to);
-		to = (volatile uint8_t *)to + 8;
-		count -= 8;
-	}
-	while (count > 0) {
-		__raw_writeb(c, to);
-		to = (volatile uint8_t *)to + 1;
-		count--;
+	for (; count > 0; count -= n) {
+		if (((uintptr_t)to & 7) == 0 && count >= 8) {
+			__raw_writeq(v, to);
+			n = 8;
+		} else {
+			__raw_writeb(c, to);
+			n = 1;
+		}
+		to = (volatile uint8_t *)to + n;
 	}
 }
 #else

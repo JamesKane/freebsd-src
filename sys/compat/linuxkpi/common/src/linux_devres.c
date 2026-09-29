@@ -220,6 +220,12 @@ struct devres_group {
 	void	*id;
 };
 
+static void *
+lkpi_devres_group_id(struct devres *dr)
+{
+	return (((struct devres_group *)(dr + 1))->id);
+}
+
 static void
 lkpi_devres_group_open(struct device *dev __unused, void *p __unused)
 {
@@ -242,7 +248,7 @@ lkpi_devres_find_group(struct device *dev,
 		if (dr == stop)
 			break;
 		if (dr->release == release && (id == NULL ||
-		    ((struct devres_group *)(dr + 1))->id == id))
+		    lkpi_devres_group_id(dr) == id))
 			return (dr);
 	}
 	return (NULL);
@@ -271,7 +277,7 @@ lkpi_devres_close_group(struct device *dev, void *id)
 	spin_lock(&dev->devres_lock);
 	open = lkpi_devres_find_group(dev, lkpi_devres_group_open, id, NULL);
 	if (open != NULL && g != NULL) {
-		g->id = ((struct devres_group *)(open + 1))->id;
+		g->id = lkpi_devres_group_id(open);
 		list_add(&container_of((void *)g, struct devres,
 		    __drdata)->entry, &dev->devres_head);
 		g = NULL;
@@ -296,7 +302,7 @@ lkpi_devres_unlink_group(struct device *dev, void *id,
 		spin_unlock(&dev->devres_lock);
 		return (NULL);
 	}
-	id = ((struct devres_group *)(open + 1))->id;
+	id = lkpi_devres_group_id(open);
 	close = lkpi_devres_find_group(dev, lkpi_devres_group_close, id, open);
 	if (resources != NULL) {
 		dr = list_first_entry(close != NULL ? &close->entry :
