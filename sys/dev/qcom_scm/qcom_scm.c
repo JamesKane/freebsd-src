@@ -90,7 +90,6 @@
 /* Status returned in x0. */
 #define	SCM_SUCCESS		0
 #define	SCM_INTERRUPTED		1
-#define	SCM_ERROR		(-1)
 #define	SCM_EINVAL_ARG		(-2)
 #define	SCM_EINVAL_ADDR		(-3)
 #define	SCM_EOPNOTSUPP		(-4)
@@ -111,6 +110,8 @@ struct qcom_scm_softc {
 	device_t	dev;
 	struct sx	lock;
 	uint64_t	*ext_args;	/* one page for arguments 4-10 */
+	bool		aperture_checked;
+	bool		aperture;	/* the GPU aperture call exists */
 };
 
 static MALLOC_DEFINE(M_QCOM_SCM, "qcom_scm", "Qualcomm SCM buffers");
@@ -233,21 +234,17 @@ qcom_scm_is_call_available(uint32_t svc, uint32_t cmd)
 	return (qcom_scm_call_available(qcom_scm_sc, svc, cmd));
 }
 
-bool
-qcom_scm_pas_supported(uint32_t pas_id)
+/* Make a call that returns a status in x1, which fails unless it is 0. */
+static int
+qcom_scm_call_res0(const struct qcom_scm_desc *desc)
 {
-	struct qcom_scm_desc desc = {
-		.svc = QCOM_SCM_SVC_PIL,
-		.cmd = QCOM_SCM_PIL_PAS_IS_SUPPORTED,
-		.arginfo = SCM_ARGINFO(1),
-		.args[0] = pas_id,
-	};
 	uint64_t res[3];
+	int error;
 
-	if (!qcom_scm_is_call_available(QCOM_SCM_SVC_PIL,
-	    QCOM_SCM_PIL_PAS_IS_SUPPORTED))
-		return (false);
-	return (qcom_scm_call(qcom_scm_sc, &desc, res) == 0 && res[0] != 0);
+	if (qcom_scm_sc == NULL)
+		return (ENXIO);
+	error = qcom_scm_call(qcom_scm_sc, desc, res);
+	return (error == 0 && res[0] != 0 ? EIO : error);
 }
 
 /*
@@ -264,7 +261,6 @@ qcom_scm_pas_init_image(uint32_t pas_id, const void *metadata, size_t len)
 		.arginfo = SCM_ARGINFO(2) | SCM_ARGINFO_TYPE(1, SCM_ARG_RW),
 		.args[0] = pas_id,
 	};
-	uint64_t res[3];
 	void *buf;
 	int error;
 
@@ -276,9 +272,7 @@ qcom_scm_pas_init_image(uint32_t pas_id, const void *metadata, size_t len)
 	memcpy(buf, metadata, len);
 	cpu_dcache_wb_range(buf, len);
 	desc.args[1] = pmap_kextract((vm_offset_t)buf);
-	error = qcom_scm_call(qcom_scm_sc, &desc, res);
-	if (error == 0 && res[0] != 0)
-		error = EIO;
+	error = qcom_scm_call_res0(&desc);
 	qcom_scm_buf_free(buf);
 	return (error);
 }
@@ -293,13 +287,8 @@ qcom_scm_pas_mem_setup(uint32_t pas_id, vm_paddr_t addr, vm_size_t size)
 		.arginfo = SCM_ARGINFO(3),
 		.args = { pas_id, addr, size },
 	};
-	uint64_t res[3];
-	int error;
 
-	if (qcom_scm_sc == NULL)
-		return (ENXIO);
-	error = qcom_scm_call(qcom_scm_sc, &desc, res);
-	return (error == 0 && res[0] != 0 ? EIO : error);
+	return (qcom_scm_call_res0(&desc));
 }
 
 /* Authenticate the loaded image and start the peripheral. */
@@ -312,13 +301,8 @@ qcom_scm_pas_auth_and_reset(uint32_t pas_id)
 		.arginfo = SCM_ARGINFO(1),
 		.args[0] = pas_id,
 	};
-	uint64_t res[3];
-	int error;
 
-	if (qcom_scm_sc == NULL)
-		return (ENXIO);
-	error = qcom_scm_call(qcom_scm_sc, &desc, res);
-	return (error == 0 && res[0] != 0 ? EIO : error);
+	return (qcom_scm_call_res0(&desc));
 }
 
 int
@@ -330,13 +314,8 @@ qcom_scm_pas_shutdown(uint32_t pas_id)
 		.arginfo = SCM_ARGINFO(1),
 		.args[0] = pas_id,
 	};
-	uint64_t res[3];
-	int error;
 
-	if (qcom_scm_sc == NULL)
-		return (ENXIO);
-	error = qcom_scm_call(qcom_scm_sc, &desc, res);
-	return (error == 0 && res[0] != 0 ? EIO : error);
+	return (qcom_scm_call_res0(&desc));
 }
 
 /* E.g. resume a zap shader loaded earlier: state 0, id 0. */
@@ -349,20 +328,24 @@ qcom_scm_set_remote_state(uint32_t state, uint32_t id)
 		.arginfo = SCM_ARGINFO(2),
 		.args = { state, id },
 	};
-	uint64_t res[3];
-	int error;
 
-	if (qcom_scm_sc == NULL)
-		return (ENXIO);
-	error = qcom_scm_call(qcom_scm_sc, &desc, res);
-	return (error == 0 && res[0] != 0 ? EIO : error);
+	return (qcom_scm_call_res0(&desc));
 }
 
+/* Asked each time the GPU powers up; the answer does not change. */
 bool
 qcom_scm_set_gpu_smmu_aperture_is_available(void)
 {
-	return (qcom_scm_is_call_available(QCOM_SCM_SVC_MP,
-	    QCOM_SCM_MP_CP_SMMU_APERTURE_ID));
+	struct qcom_scm_softc *sc = qcom_scm_sc;
+
+	if (sc == NULL)
+		return (false);
+	if (!sc->aperture_checked) {
+		sc->aperture = qcom_scm_call_available(sc, QCOM_SCM_SVC_MP,
+		    QCOM_SCM_MP_CP_SMMU_APERTURE_ID);
+		sc->aperture_checked = true;
+	}
+	return (sc->aperture);
 }
 
 /*

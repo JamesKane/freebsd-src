@@ -45,7 +45,6 @@
 #define	QCOM_SCM_PIL_PAS_MEM_SETUP	0x02
 #define	QCOM_SCM_PIL_PAS_AUTH_AND_RESET	0x05
 #define	QCOM_SCM_PIL_PAS_SHUTDOWN	0x06
-#define	QCOM_SCM_PIL_PAS_IS_SUPPORTED	0x07
 #define	QCOM_SCM_SVC_INFO		0x06
 #define	QCOM_SCM_INFO_IS_CALL_AVAIL	0x01
 #define	QCOM_SCM_SVC_MP			0x0c
@@ -54,7 +53,6 @@
 bool	qcom_scm_available(void);
 bool	qcom_scm_is_call_available(uint32_t svc, uint32_t cmd);
 
-bool	qcom_scm_pas_supported(uint32_t pas_id);
 int	qcom_scm_pas_init_image(uint32_t pas_id, const void *metadata,
 	    size_t len);
 int	qcom_scm_pas_mem_setup(uint32_t pas_id, vm_paddr_t addr,
