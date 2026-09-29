@@ -367,7 +367,8 @@ pt_range_ok(struct qcom_smmu_pt *pt, uint64_t va, size_t size)
 	uint64_t base;
 
 	base = pt->upper ? PT_UPPER_BASE : 0;
-	return (size != 0 && va >= base && size - 1 <= PT_SPAN - 1 - (va - base));
+	return (size != 0 && va >= base && va - base < PT_SPAN &&
+	    size - 1 <= PT_SPAN - 1 - (va - base));
 }
 
 int
@@ -416,6 +417,12 @@ qcom_smmu_unmap(struct qcom_smmu_pt *pt, uint64_t va,
 	uint64_t *e;
 	size_t done;
 
+	/* Out of range, lookups would clear the entries of other addresses. */
+	if (((va | size) & PAGE_MASK) != 0 || !pt_range_ok(pt, va, size)) {
+		KASSERT(false, ("%s: bad range %#jx+%#zx", __func__,
+		    (uintmax_t)va, size));
+		return;
+	}
 	sx_xlock(&pt->lock);
 	for (done = 0; done < size; done += PAGE_SIZE) {
 		e = pt_lookup(pt, va + done, false);
