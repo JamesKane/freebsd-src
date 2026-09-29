@@ -35,7 +35,9 @@
 
 enum hrtimer_mode {
 	HRTIMER_MODE_REL,
+	HRTIMER_MODE_ABS,
 	HRTIMER_MODE_REL_PINNED = HRTIMER_MODE_REL,
+	HRTIMER_MODE_ABS_PINNED = HRTIMER_MODE_ABS,
 };
 
 enum hrtimer_restart {
@@ -58,30 +60,31 @@ struct hrtimer {
 /* hrtimer_init() is replaced by hrtimer_setup() in Linux 6.15. */
 #if defined(LINUXKPI_VERSION) && LINUXKPI_VERSION < 61500
 #define	hrtimer_init(hrtimer, clock, mode) do {			\
-	CTASSERT((clock) == CLOCK_MONOTONIC);			\
-	CTASSERT((mode) == HRTIMER_MODE_REL);			\
+	KASSERT((clock) == CLOCK_MONOTONIC,			\
+	    ("hrtimer_init: clock %d", (int)(clock)));		\
 	linux_hrtimer_init(hrtimer);				\
 } while (0)
 #endif
 
 #define	hrtimer_setup(hrtimer, restart, clock, mode) do {	\
-	CTASSERT((clock) == CLOCK_MONOTONIC);			\
-	CTASSERT((mode) == HRTIMER_MODE_REL);			\
+	KASSERT((clock) == CLOCK_MONOTONIC,			\
+	    ("hrtimer_setup: clock %d", (int)(clock)));		\
 	linuxkpi_hrtimer_setup(hrtimer, restart);		\
 } while (0)
+
+/* Timers run on the monotonic clock, so an absolute time is converted. */
+#define	linux_hrtimer_rel(time, mode)				\
+	((mode) == HRTIMER_MODE_ABS ? ktime_sub((time), ktime_get()) : (time))
 
 #define	hrtimer_set_expires(hrtimer, time)			\
 	linux_hrtimer_set_expires(hrtimer, time)
 
-#define	hrtimer_start(hrtimer, time, mode) do {			\
-	CTASSERT((mode) == HRTIMER_MODE_REL);			\
-	linux_hrtimer_start(hrtimer, time);			\
-} while (0)
+#define	hrtimer_start(hrtimer, time, mode)			\
+	linux_hrtimer_start(hrtimer, linux_hrtimer_rel(time, mode))
 
-#define	hrtimer_start_range_ns(hrtimer, time, prec, mode) do {	\
-	CTASSERT((mode) == HRTIMER_MODE_REL);			\
-	linux_hrtimer_start_range_ns(hrtimer, time, prec);	\
-} while (0)
+#define	hrtimer_start_range_ns(hrtimer, time, prec, mode)	\
+	linux_hrtimer_start_range_ns(hrtimer,			\
+	    linux_hrtimer_rel(time, mode), prec)
 
 #define	hrtimer_forward_now(hrtimer, interval) do {		\
 	linux_hrtimer_forward_now(hrtimer, interval);		\
