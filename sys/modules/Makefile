@@ -344,6 +344,7 @@ SUBDIR=	\
 	${_qat_c2xxxfw} \
 	${_qcom_epss} \
 	${_qcom_gpucc} \
+	${_qcom_scm} \
 	${_qcom_tsens} \
 	${_qlxge} \
 	${_qlxgb} \
@@ -748,6 +749,7 @@ _sff=		sff
 _em=		em
 _qcom_epss=	qcom_epss
 _qcom_gpucc=	qcom_gpucc
+_qcom_scm=	qcom_scm
 _qcom_tsens=	qcom_tsens
 _tcx=		tcx
 _hyperv=  hyperv
