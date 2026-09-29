@@ -101,7 +101,7 @@ vm_paddr_t qcom_smmu_pt_root(struct qcom_smmu_pt *pt);
 int	qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	    struct qcom_smmu_pt *pt, struct qcom_smmu_cb **cbp);
 void	qcom_smmu_cb_free(struct qcom_smmu_cb *cb);
-void	qcom_smmu_cb_set_pt(struct qcom_smmu_cb *cb,
+int	qcom_smmu_cb_set_pt(struct qcom_smmu_cb *cb,
 	    struct qcom_smmu_pt *pt);
 int	qcom_smmu_cb_set_ttbr0(struct qcom_smmu_cb *cb, vm_paddr_t root);
 u_int	qcom_smmu_cb_index(struct qcom_smmu_cb *cb);

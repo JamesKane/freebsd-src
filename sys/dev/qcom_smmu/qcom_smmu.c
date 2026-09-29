@@ -535,12 +535,15 @@ qcom_smmu_cb_free(struct qcom_smmu_cb *cb)
 	bit_clear(sc->cb_used, cb->idx);
 }
 
-void
+int
 qcom_smmu_cb_set_pt(struct qcom_smmu_cb *cb,
     struct qcom_smmu_pt *pt)
 {
+	/* Only a split bank translates through TTBR1. */
+	if (pt->upper && !cb->split)
+		return (EINVAL);
 	cb_program_pt(cb, pt);
-	(void)qcom_smmu_cb_tlb_inv(cb);
+	return (qcom_smmu_cb_tlb_inv(cb));
 }
 
 /*
