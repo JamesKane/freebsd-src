@@ -306,6 +306,14 @@ int lkpi_devres_destroy(struct device *, void(*release)(struct device *, void *)
 					lkpi_devres_find(_d, _rfn, _mfn, _mp)
 #define	devres_destroy(_d, _rfn, _mfn, _mp) \
 					lkpi_devres_destroy(_d, _rfn, _mfn, _mp)
+void *lkpi_devres_open_group(struct device *, void *, gfp_t);
+void lkpi_devres_close_group(struct device *, void *);
+void lkpi_devres_remove_group(struct device *, void *);
+int lkpi_devres_release_group(struct device *, void *);
+#define	devres_open_group(_d, _id, _g)	lkpi_devres_open_group(_d, _id, _g)
+#define	devres_close_group(_d, _id)	lkpi_devres_close_group(_d, _id)
+#define	devres_remove_group(_d, _id)	lkpi_devres_remove_group(_d, _id)
+#define	devres_release_group(_d, _id)	lkpi_devres_release_group(_d, _id)
 void lkpi_devres_release_free_list(struct device *);
 void lkpi_devres_unlink(struct device *, void *);
 void lkpi_devm_kmalloc_release(struct device *, void *);

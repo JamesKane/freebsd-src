@@ -211,6 +211,143 @@ lkpi_devres_destroy(struct device *dev, void(*release)(struct device *, void *),
 }
 
 /*
+ * Groups.  A group is delimited by marker entries: one where it was opened
+ * and, once it is closed, one where it was closed.  As the list is newest
+ * first, the group's resources lie between the two, or between the head of
+ * the list and the opening marker while it is still open.
+ */
+struct devres_group {
+	void	*id;
+};
+
+static void
+lkpi_devres_group_open(struct device *dev __unused, void *p __unused)
+{
+}
+
+static void
+lkpi_devres_group_close(struct device *dev __unused, void *p __unused)
+{
+}
+
+/* The newest marker of group id (any group if NULL), before stop. */
+static struct devres *
+lkpi_devres_find_group(struct device *dev,
+    void (*release)(struct device *, void *), void *id, struct devres *stop)
+{
+	struct devres *dr;
+
+	assert_spin_locked(&dev->devres_lock);
+	list_for_each_entry(dr, &dev->devres_head, entry) {
+		if (dr == stop)
+			break;
+		if (dr->release == release && (id == NULL ||
+		    ((struct devres_group *)(dr + 1))->id == id))
+			return (dr);
+	}
+	return (NULL);
+}
+
+void *
+lkpi_devres_open_group(struct device *dev, void *id, gfp_t gfp)
+{
+	struct devres_group *g;
+
+	g = lkpi_devres_alloc(lkpi_devres_group_open, sizeof(*g), gfp);
+	if (g == NULL)
+		return (NULL);
+	g->id = id != NULL ? id : g;
+	lkpi_devres_add(dev, g);
+	return (g->id);
+}
+
+void
+lkpi_devres_close_group(struct device *dev, void *id)
+{
+	struct devres_group *g;
+	struct devres *open;
+
+	g = lkpi_devres_alloc(lkpi_devres_group_close, sizeof(*g), GFP_KERNEL);
+	spin_lock(&dev->devres_lock);
+	open = lkpi_devres_find_group(dev, lkpi_devres_group_open, id, NULL);
+	if (open != NULL && g != NULL) {
+		g->id = ((struct devres_group *)(open + 1))->id;
+		list_add(&container_of((void *)g, struct devres,
+		    __drdata)->entry, &dev->devres_head);
+		g = NULL;
+	}
+	spin_unlock(&dev->devres_lock);
+	lkpi_devres_free(g);
+}
+
+/*
+ * Take group id's markers off the list; if resources is not NULL, move the
+ * group's resources to it too, newest first.
+ */
+static struct devres *
+lkpi_devres_unlink_group(struct device *dev, void *id,
+    struct list_head *resources)
+{
+	struct devres *open, *close, *dr, *next;
+
+	spin_lock(&dev->devres_lock);
+	open = lkpi_devres_find_group(dev, lkpi_devres_group_open, id, NULL);
+	if (open == NULL) {
+		spin_unlock(&dev->devres_lock);
+		return (NULL);
+	}
+	id = ((struct devres_group *)(open + 1))->id;
+	close = lkpi_devres_find_group(dev, lkpi_devres_group_close, id, open);
+	if (resources != NULL) {
+		dr = list_first_entry(close != NULL ? &close->entry :
+		    &dev->devres_head, struct devres, entry);
+		for (; dr != open; dr = next) {
+			next = list_next_entry(dr, entry);
+			list_move_tail(&dr->entry, resources);
+		}
+	}
+	list_del_init(&open->entry);
+	if (close != NULL) {
+		list_del_init(&close->entry);
+		lkpi_devres_free_dr(close);
+	}
+	spin_unlock(&dev->devres_lock);
+	return (open);
+}
+
+void
+lkpi_devres_remove_group(struct device *dev, void *id)
+{
+	struct devres *open;
+
+	open = lkpi_devres_unlink_group(dev, id, NULL);
+	if (open != NULL)
+		lkpi_devres_free_dr(open);
+}
+
+int
+lkpi_devres_release_group(struct device *dev, void *id)
+{
+	struct devres *open, *dr, *next;
+	LIST_HEAD(resources);
+	int n;
+
+	open = lkpi_devres_unlink_group(dev, id, &resources);
+	if (open == NULL)
+		return (0);
+	lkpi_devres_free_dr(open);
+	n = 0;
+	list_for_each_entry_safe(dr, next, &resources, entry) {
+		if (dr->release != NULL)
+			dr->release(dev, dr + 1);
+		list_del_init(&dr->entry);
+		lkpi_devres_free_dr(dr);
+		n++;
+	}
+	return (n);
+}
+
+/*
  * Devres release function for k*malloc().
  * While there is nothing to do here adding, e.g., tracing would be
  * possible so we leave the empty function here.
