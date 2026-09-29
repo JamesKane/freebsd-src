@@ -149,6 +149,7 @@
 #define	CB_TLBSTATUS		0x7f4
 
 #define	SMMU_POLL_US		10000
+#define	QCOM_SMMU_FAULTS_PER_INTR	16
 
 /* Page tables: 4 KB granule, four levels, 48-bit input addresses. */
 #define	PT_VA_BITS		48
@@ -612,12 +613,22 @@ cb_intr(void *arg)
 {
 	struct qcom_smmu_cb *cb = arg;
 	struct qcom_smmu_fault f;
+	int n;
 
-	if (!cb_read_fault(cb, &f))
-		return;
-	cb->fault_fn(cb->fault_arg, &f);
-	/* Faults terminate, so nothing is left to resume. */
-	cb_write(cb->sc, cb->idx, CB_FSR, f.fsr);
+	/*
+	 * The interrupt is edge-triggered and stays asserted while FSR has
+	 * any fault bit set, so handle faults until it reads clear, or a
+	 * fault taken in the meantime would silence the interrupt for good.
+	 * A master that keeps faulting only gets a few reported per
+	 * interrupt.  Faults terminate, so nothing is left to resume.
+	 */
+	for (n = 0; n < QCOM_SMMU_FAULTS_PER_INTR && cb_read_fault(cb, &f);
+	    n++) {
+		cb->fault_fn(cb->fault_arg, &f);
+		cb_write(cb->sc, cb->idx, CB_FSR, f.fsr);
+	}
+	if (n == QCOM_SMMU_FAULTS_PER_INTR)
+		cb_write(cb->sc, cb->idx, CB_FSR, CB_FSR_FAULT);
 }
 
 /*
@@ -816,8 +827,15 @@ qcom_smmu_claim(device_t consumer, struct qcom_smmu **scp, u_int *sids,
 void
 qcom_smmu_release(struct qcom_smmu *sc)
 {
+	u_int i;
+
 	if (sc == NULL || !sc->claimed)
 		return;
+	/* The banks' interrupts would outlive them. */
+	for (i = 0; i < sc->ncb; i++)
+		if (bit_test(sc->cb_used, i))
+			(void)qcom_smmu_cb_set_fault_handler(&sc->cbs[i],
+			    NULL, NULL);
 	(void)qcom_smmu_reset(sc);
 	sc->claimed = false;
 }
