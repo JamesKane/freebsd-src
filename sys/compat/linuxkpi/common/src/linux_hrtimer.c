@@ -87,8 +87,11 @@ linux_hrtimer_try_to_cancel(struct hrtimer *hrtimer)
 /*
  * Cancel active hrtimer.
  * Return 1 if timer was active and cancellation succeeded, or 0 otherwise.
- * As on Linux, only wait when the callback is running: callers may hold
- * spin locks.
+ *
+ * Callers may hold spin locks, as Linux allows, and usually cancel timers
+ * that are not armed, so return at once when the timer is idle.  Otherwise
+ * drain it: even when callout_stop() cancels it, softclock may already
+ * have taken it and still lock its mutex, which the caller may then free.
  */
 int
 linux_hrtimer_cancel(struct hrtimer *hrtimer)
@@ -96,10 +99,12 @@ linux_hrtimer_cancel(struct hrtimer *hrtimer)
 	int ret;
 
 	ret = linux_hrtimer_try_to_cancel(hrtimer);
-	if (ret >= 0)
-		return (ret);
-	callout_drain(&hrtimer->callout);
-	return (1);
+	if (ret == 0)
+		return (0);
+	if (callout_drain(&hrtimer->callout) > 0)
+		ret = 1;
+	/* A callback that ran, and did not arm the timer again, left it idle. */
+	return (ret > 0);
 }
 
 void
