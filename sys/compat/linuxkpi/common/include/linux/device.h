@@ -87,9 +87,13 @@ struct dev_pm_ops {
 	int (*runtime_idle)(struct device *dev);
 };
 
+struct device_node;
+struct of_device_id;
+
 struct device_driver {
 	const char	*name;
 	const struct dev_pm_ops *pm;
+	const struct of_device_id *of_match_table;
 
 	void (*shutdown) (struct device *);
 	void (*coredump) (struct device *);
@@ -125,6 +129,8 @@ struct device {
 	unsigned int	irq_end;
 	const struct attribute_group **groups;
 	struct fwnode_handle *fwnode;
+	struct device_node *of_node;	/* for drivers with their own tree */
+	void		*platform_data;
 	struct cdev	*backlight_dev;
 	struct backlight_device	*bd;
 
@@ -134,9 +140,36 @@ struct device {
 	struct dev_pm_info	power;
 };
 
+static inline struct device_node *
+dev_of_node(struct device *dev)
+{
+	return (dev != NULL ? dev->of_node : NULL);
+}
+
+static inline void *
+dev_get_platdata(const struct device *dev)
+{
+	return (dev->platform_data);
+}
+
 extern struct device linux_root_device;
 extern struct kobject linux_class_root;
 extern const struct kobj_type linux_dev_ktype;
+
+/*
+ * Set up dev to stand for the existing FreeBSD device bsddev, under parent,
+ * or the root device if it is NULL.  Unlike device_initialize(), no device
+ * is created; the caller names the kobject and sets up DMA as needed.
+ */
+static inline void
+lkpi_device_init(struct device *dev, struct device *parent, device_t bsddev)
+{
+	dev->parent = parent != NULL ? parent : &linux_root_device;
+	dev->bsddev = bsddev;
+	spin_lock_init(&dev->devres_lock);
+	INIT_LIST_HEAD(&dev->devres_head);
+	INIT_LIST_HEAD(&dev->irqents);
+}
 extern const struct kobj_type linux_class_ktype;
 
 struct class_attribute {

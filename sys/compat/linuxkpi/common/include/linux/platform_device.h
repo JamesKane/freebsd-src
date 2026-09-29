@@ -54,14 +54,6 @@ platform_driver_register(struct platform_driver *pdrv)
 	return (-ENXIO);
 }
 
-static __inline void *
-dev_get_platdata(struct device *dev)
-{
-
-	pr_debug("%s: TODO\n", __func__);
-	return (NULL);
-}
-
 static __inline int
 platform_driver_probe(struct platform_driver *pdrv,
     int(*pd_probe_f)(struct platform_device *))

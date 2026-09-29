@@ -473,8 +473,7 @@ lkpifill_pci_dev(device_t dev, struct pci_dev *pdev)
 		 */
 		pdev->bus->self = pdev;
 	}
-	pdev->dev.bsddev = dev;
-	pdev->dev.parent = &linux_root_device;
+	lkpi_device_init(&pdev->dev, NULL, dev);
 	pdev->dev.release = lkpi_pci_dev_release;
 
 	if (pci_msi_count(dev) > 0)
@@ -483,9 +482,6 @@ lkpifill_pci_dev(device_t dev, struct pci_dev *pdev)
 
 	TAILQ_INIT(&pdev->mmio);
 	spin_lock_init(&pdev->pcie_cap_lock);
-	spin_lock_init(&pdev->dev.devres_lock);
-	INIT_LIST_HEAD(&pdev->dev.devres_head);
-	INIT_LIST_HEAD(&pdev->dev.irqents);
 	INIT_LIST_HEAD(&pdev->links);
 
 	return (0);
