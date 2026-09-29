@@ -482,12 +482,27 @@ vmap(struct page **pages, unsigned int count, unsigned long flags, int prot)
 {
 	void *off;
 	size_t size;
+#if defined(__aarch64__) || defined(__riscv)
+	vm_memattr_t attr;
+	unsigned int i;
+#endif
 
 	size = count * PAGE_SIZE;
 	off = kva_alloc(size);
 	if (off == NULL)
 		return (NULL);
 	vmmap_add(off, size);
+#if defined(__aarch64__) || defined(__riscv)
+	/*
+	 * DMA is not always cache coherent here, and drivers write buffers
+	 * for such devices through write-combining or uncached mappings, so
+	 * honour the caching mode, as linuxkpi_vmap_pfn() does.
+	 */
+	attr = pgprot2cachemode(prot);
+	if (attr != VM_MEMATTR_DEFAULT)
+		for (i = 0; i < count; i++)
+			pmap_page_set_memattr(pages[i], attr);
+#endif
 	pmap_qenter(off, pages, count);
 
 	return (off);
@@ -553,10 +568,24 @@ void
 vunmap(void *addr)
 {
 	struct vmmap *vmmap;
+#if defined(__aarch64__) || defined(__riscv)
+	vm_offset_t va;
+	vm_page_t m;
+#endif
 
 	vmmap = vmmap_remove(addr);
 	if (vmmap == NULL)
 		return;
+#if defined(__aarch64__) || defined(__riscv)
+	/* Pages must not go back to the allocator uncached; see vmap(). */
+	for (va = (vm_offset_t)addr; va < (vm_offset_t)addr + vmmap->vm_size;
+	    va += PAGE_SIZE) {
+		m = PHYS_TO_VM_PAGE(pmap_kextract(va));
+		if (m != NULL && (m->flags & PG_FICTITIOUS) == 0 &&
+		    pmap_page_get_memattr(m) != VM_MEMATTR_DEFAULT)
+			pmap_page_set_memattr(m, VM_MEMATTR_DEFAULT);
+	}
+#endif
 	pmap_qremove(addr, vmmap->vm_size / PAGE_SIZE);
 	kva_free(addr, vmmap->vm_size);
 	kfree(vmmap);
