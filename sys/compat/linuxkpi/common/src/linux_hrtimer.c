@@ -87,12 +87,19 @@ linux_hrtimer_try_to_cancel(struct hrtimer *hrtimer)
 /*
  * Cancel active hrtimer.
  * Return 1 if timer was active and cancellation succeeded, or 0 otherwise.
+ * As on Linux, only wait when the callback is running: callers may hold
+ * spin locks.
  */
 int
 linux_hrtimer_cancel(struct hrtimer *hrtimer)
 {
+	int ret;
 
-	return (callout_drain(&hrtimer->callout) > 0);
+	ret = linux_hrtimer_try_to_cancel(hrtimer);
+	if (ret >= 0)
+		return (ret);
+	callout_drain(&hrtimer->callout);
+	return (1);
 }
 
 void
