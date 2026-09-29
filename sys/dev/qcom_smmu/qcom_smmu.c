@@ -341,11 +341,14 @@ qcom_smmu_map(struct qcom_smmu_pt *pt, uint64_t va,
 	    va + size > (1ul << PT_VA_BITS) || va + size < va)
 		return (EINVAL);
 	/*
-	 * Non-global (ASID-tagged), accessible unprivileged, shareable.
-	 * Execution is allowed: the GPU fetches shader code through here.
+	 * Non-global (ASID-tagged), shareable, executable: the GPU fetches
+	 * shader code and the GMU its firmware through here.  Pages writable
+	 * by unprivileged accesses are never executable by privileged ones,
+	 * so privileged masters that run code from memory need QCOM_SMMU_PRIV.
 	 */
-	attr = ATTR_AF | ATTR_S1_nG | ATTR_SH(ATTR_SH_IS) |
-	    ATTR_S1_AP(ATTR_S1_AP_USER) | PT_DESC;
+	attr = ATTR_AF | ATTR_S1_nG | ATTR_SH(ATTR_SH_IS) | PT_DESC;
+	if ((flags & QCOM_SMMU_PRIV) == 0)
+		attr |= ATTR_S1_AP(ATTR_S1_AP_USER);
 	if ((flags & QCOM_SMMU_READONLY) != 0)
 		attr |= ATTR_S1_AP(ATTR_S1_AP_RO);
 	attr |= ATTR_S1_IDX((flags & QCOM_SMMU_UNCACHED) != 0 ?

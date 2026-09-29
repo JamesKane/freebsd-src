@@ -57,6 +57,7 @@ struct qcom_smmu_pt;
 /* Mapping flags. */
 #define	QCOM_SMMU_READONLY	0x01
 #define	QCOM_SMMU_UNCACHED	0x02
+#define	QCOM_SMMU_PRIV		0x04	/* privileged accesses only */
 
 int	qcom_smmu_claim(device_t consumer, struct qcom_smmu **scp,
 	    u_int *sids, u_int *nsids);
