@@ -100,6 +100,8 @@ struct dma_map_ops {
 
 #define	DMA_BIT_MASK(n)	((2ULL << ((n) - 1)) - 1ULL)
 
+int linux_dma_dev_init(struct device *);
+int linux_dma_dev_uninit(struct device *);
 int linux_dma_tag_init(struct device *, u64);
 int linux_dma_tag_init_coherent(struct device *, u64);
 void *linux_dma_alloc_coherent(struct device *dev, size_t size,

@@ -176,12 +176,12 @@ lkpi_pci_bar_id_valid(int bar)
 	return (true);
 }
 
-static int
-linux_pdev_dma_uninit(struct pci_dev *pdev)
+int
+linux_dma_dev_uninit(struct device *dev)
 {
 	struct linux_dma_priv *priv;
 
-	priv = pdev->dev.dma_priv;
+	priv = dev->dma_priv;
 	if (priv == NULL)
 		return (0);
 	if (priv->dmat)
@@ -189,13 +189,17 @@ linux_pdev_dma_uninit(struct pci_dev *pdev)
 	if (priv->dmat_coherent)
 		bus_dma_tag_destroy(priv->dmat_coherent);
 	mtx_destroy(&priv->lock);
-	pdev->dev.dma_priv = NULL;
+	dev->dma_priv = NULL;
 	free(priv, M_DEVBUF);
 	return (0);
 }
 
-static int
-linux_pdev_dma_init(struct pci_dev *pdev)
+/*
+ * Set up the DMA state of a device whose bsddev is attached; the PCI code
+ * does this for every pci_dev, and drivers for other buses call it themselves.
+ */
+int
+linux_dma_dev_init(struct device *dev)
 {
 	struct linux_dma_priv *priv;
 	int error;
@@ -205,21 +209,21 @@ linux_pdev_dma_init(struct pci_dev *pdev)
 	mtx_init(&priv->lock, "lkpi-priv-dma", NULL, MTX_DEF);
 	pctrie_init(&priv->ptree);
 
-	pdev->dev.dma_priv = priv;
+	dev->dma_priv = priv;
 
 	/* Create a default DMA tags. */
-	error = linux_dma_tag_init(&pdev->dev, DMA_BIT_MASK(64));
+	error = linux_dma_tag_init(dev, DMA_BIT_MASK(64));
 	if (error != 0)
 		goto err;
 	/* Coherent is lower 32bit only by default in Linux. */
-	error = linux_dma_tag_init_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	error = linux_dma_tag_init_coherent(dev, DMA_BIT_MASK(32));
 	if (error != 0)
 		goto err;
 
 	return (error);
 
 err:
-	linux_pdev_dma_uninit(pdev);
+	linux_dma_dev_uninit(dev);
 	return (error);
 }
 
@@ -386,7 +390,7 @@ lkpi_pci_dev_release(struct device *dev)
 	list_del(&pdev->links);
 	spin_unlock(&pci_lock);
 
-	linux_pdev_dma_uninit(pdev);
+	linux_dma_dev_uninit(&pdev->dev);
 
 	/* irq? */
 
@@ -699,7 +703,7 @@ linux_pci_attach_device(device_t dev, struct pci_driver *pdrv,
 	else
 		pdev->dev.irq = LINUX_IRQ_INVALID;
 	pdev->irq = pdev->dev.irq;
-	error = linux_pdev_dma_init(pdev);
+	error = linux_dma_dev_init(&pdev->dev);
 	if (error)
 		goto out_err;
 
