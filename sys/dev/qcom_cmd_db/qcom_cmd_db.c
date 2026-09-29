@@ -66,6 +66,7 @@
 #ifdef FDT
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#include <dev/ofw/ofw_subr.h>
 #endif
 
 #include <dev/qcom_cmd_db/qcom_cmd_db.h>
@@ -134,49 +135,51 @@ cmd_db_find_acpi(vm_paddr_t *pa, size_t *size)
 static int
 cmd_db_find_fdt(vm_paddr_t *pa, size_t *size)
 {
-	pcell_t acells, scells, reg[4];
 	phandle_t node, child;
+	bus_addr_t addr;
+	bus_size_t len;
 
 	node = OF_finddevice("/reserved-memory");
 	if (node == -1)
 		return (ENOENT);
-	if (OF_getencprop(node, "#address-cells", &acells,
-	    sizeof(acells)) <= 0)
-		acells = 2;
-	if (OF_getencprop(node, "#size-cells", &scells, sizeof(scells)) <= 0)
-		scells = 2;
-	if (acells < 1 || acells > 2 || scells < 1 || scells > 2)
-		return (ENXIO);
 	for (child = OF_child(node); child != 0; child = OF_peer(child)) {
 		if (!ofw_bus_node_is_compatible(child, "qcom,cmd-db"))
 			continue;
-		if (OF_getencprop(child, "reg", reg,
-		    (acells + scells) * sizeof(pcell_t)) <= 0)
+		if (ofw_reg_to_paddr(child, 0, &addr, &len, NULL) != 0)
 			return (ENXIO);
-		*pa = acells == 2 ? (uint64_t)reg[0] << 32 | reg[1] : reg[0];
-		*size = scells == 2 ? (uint64_t)reg[acells] << 32 |
-		    reg[acells + 1] : reg[acells];
+		*pa = addr;
+		*size = len;
 		return (0);
 	}
 	return (ENOENT);
 }
 #endif
 
+/* Resource i's header, its first entry and its number of entries. */
+static const uint8_t *
+cmd_db_rsc(const uint8_t *db, u_int i, const uint8_t **ent, u_int *cnt)
+{
+	const uint8_t *rsc;
+
+	rsc = db + CMD_DB_RSC_OFF + i * CMD_DB_RSC_SIZE;
+	*ent = db + CMD_DB_DATA_OFF + le16dec(rsc + RSC_HEADER_OFFSET);
+	*cnt = le16dec(rsc + RSC_COUNT);
+	return (rsc);
+}
+
 /* Check that every resource's entries lie within the database. */
 static bool
 cmd_db_valid(const uint8_t *db, size_t size)
 {
-	const uint8_t *rsc;
-	u_int i, cnt, hoff;
+	const uint8_t *ent;
+	u_int i, cnt;
 
 	if (size < CMD_DB_DATA_OFF ||
 	    le32dec(db + CMD_DB_MAGIC_OFF) != CMD_DB_MAGIC)
 		return (false);
 	for (i = 0; i < CMD_DB_NRSC; i++) {
-		rsc = db + CMD_DB_RSC_OFF + i * CMD_DB_RSC_SIZE;
-		cnt = le16dec(rsc + RSC_COUNT);
-		hoff = le16dec(rsc + RSC_HEADER_OFFSET);
-		if (CMD_DB_DATA_OFF + hoff + (size_t)cnt * ENT_SIZE > size)
+		(void)cmd_db_rsc(db, i, &ent, &cnt);
+		if ((size_t)(ent - db) + (size_t)cnt * ENT_SIZE > size)
 			return (false);
 	}
 	return (true);
@@ -229,7 +232,7 @@ qcom_cmd_db_ready(void)
 	return (error);
 }
 
-/* Find an entry by name; also returns its resource header. */
+/* Find an entry by name; if rscp is not NULL, also its resource header. */
 static const uint8_t *
 cmd_db_find(const char *id, const uint8_t **rscp)
 {
@@ -243,13 +246,11 @@ cmd_db_find(const char *id, const uint8_t **rscp)
 	memset(key, 0, sizeof(key));
 	strncpy(key, id, sizeof(key));
 	for (i = 0; i < CMD_DB_NRSC; i++) {
-		rsc = cmd_db + CMD_DB_RSC_OFF + i * CMD_DB_RSC_SIZE;
-		cnt = le16dec(rsc + RSC_COUNT);
-		ent = cmd_db + CMD_DB_DATA_OFF +
-		    le16dec(rsc + RSC_HEADER_OFFSET);
+		rsc = cmd_db_rsc(cmd_db, i, &ent, &cnt);
 		for (j = 0; j < cnt; j++, ent += ENT_SIZE) {
 			if (memcmp(ent, key, ENT_ID_LEN) == 0) {
-				*rscp = rsc;
+				if (rscp != NULL)
+					*rscp = rsc;
 				return (ent);
 			}
 		}
@@ -260,9 +261,9 @@ cmd_db_find(const char *id, const uint8_t **rscp)
 uint32_t
 qcom_cmd_db_read_addr(const char *id)
 {
-	const uint8_t *ent, *rsc;
+	const uint8_t *ent;
 
-	ent = cmd_db_find(id, &rsc);
+	ent = cmd_db_find(id, NULL);
 	return (ent != NULL ? le32dec(ent + ENT_ADDR) : 0);
 }
 
@@ -286,9 +287,9 @@ qcom_cmd_db_read_aux_data(const char *id, size_t *len)
 int
 qcom_cmd_db_read_slave_id(const char *id)
 {
-	const uint8_t *ent, *rsc;
+	const uint8_t *ent;
 
-	ent = cmd_db_find(id, &rsc);
+	ent = cmd_db_find(id, NULL);
 	return (ent != NULL ? CMD_DB_SLAVE_ID(le32dec(ent + ENT_ADDR)) : -1);
 }
 
@@ -296,7 +297,7 @@ qcom_cmd_db_read_slave_id(const char *id)
 static int
 cmd_db_sysctl_entries(SYSCTL_HANDLER_ARGS)
 {
-	const uint8_t *rsc, *ent;
+	const uint8_t *ent;
 	struct sbuf sb;
 	u_int i, j, cnt;
 	int error;
@@ -305,10 +306,7 @@ cmd_db_sysctl_entries(SYSCTL_HANDLER_ARGS)
 		return (error);
 	sbuf_new_for_sysctl(&sb, NULL, 1024, req);
 	for (i = 0; i < CMD_DB_NRSC; i++) {
-		rsc = cmd_db + CMD_DB_RSC_OFF + i * CMD_DB_RSC_SIZE;
-		cnt = le16dec(rsc + RSC_COUNT);
-		ent = cmd_db + CMD_DB_DATA_OFF +
-		    le16dec(rsc + RSC_HEADER_OFFSET);
+		(void)cmd_db_rsc(cmd_db, i, &ent, &cnt);
 		for (j = 0; j < cnt; j++, ent += ENT_SIZE)
 			sbuf_printf(&sb, "\n%-8.8s addr %#07x type %u len %u",
 			    (const char *)ent, le32dec(ent + ENT_ADDR),
