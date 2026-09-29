@@ -166,4 +166,18 @@ ida_is_empty(struct ida *ida)
 	return (idr_is_empty(&ida->idr));
 }
 
+/* Allocate an id from *nextid to max, both inclusive, into *nextid. */
+static inline int
+idr_alloc_u32(struct idr *idr, void *ptr, u32 *nextid, unsigned long max,
+    gfp_t gfp)
+{
+	int id;
+
+	id = idr_alloc(idr, ptr, *nextid, max == UINT_MAX ? 0 : max + 1, gfp);
+	if (id < 0)
+		return (id);
+	*nextid = id;
+	return (0);
+}
+
 #endif	/* _LINUXKPI_LINUX_IDR_H_ */

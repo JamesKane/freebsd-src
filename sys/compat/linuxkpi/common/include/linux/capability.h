@@ -41,6 +41,7 @@
 
 #define	CAP_SYS_ADMIN		PRIV_DRIVER
 #define	CAP_SYS_NICE		PRIV_SCHED_SETPRIORITY
+#define	CAP_SYS_RAWIO		PRIV_IO
 
 static inline bool
 capable(const int tryme)

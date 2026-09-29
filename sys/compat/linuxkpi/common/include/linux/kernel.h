@@ -398,4 +398,31 @@ extern enum system_states {
 	SYSTEM_SUSPEND,
 } system_state;
 
+#define	in_range(val, start, len)					\
+	((val) >= (start) && (val) - (start) < (len))
+
+/* A number with an optional K, M or G suffix, as on the command line. */
+static inline unsigned long long
+memparse(const char *s, char **end)
+{
+	unsigned long long v;
+	char *e;
+
+	v = strtouq(s, &e, 0);
+	switch (*e) {
+	case 'g': case 'G':
+		v <<= 10;
+		/* FALLTHROUGH */
+	case 'm': case 'M':
+		v <<= 10;
+		/* FALLTHROUGH */
+	case 'k': case 'K':
+		v <<= 10;
+		e++;
+	}
+	if (end != NULL)
+		*end = e;
+	return (v);
+}
+
 #endif	/* _LINUXKPI_LINUX_KERNEL_H_ */

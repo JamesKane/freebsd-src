@@ -79,7 +79,10 @@ const struct dev_pm_ops _name = {				\
 
 #define	SET_SYSTEM_SLEEP_PM_OPS(_suspendfunc, _resumefunc)	\
 	__SET_PM_OPS(_suspendfunc, _resumefunc)
+#define	SYSTEM_SLEEP_PM_OPS(_suspendfunc, _resumefunc)		\
+	__SET_PM_OPS(_suspendfunc, _resumefunc)
 #else
+#define	SYSTEM_SLEEP_PM_OPS(_suspendfunc, _resumefunc)
 #define	SIMPLE_DEV_PM_OPS(_name, _suspendfunc, _resumefunc)	\
 const struct dev_pm_ops _name = {				\
 }
@@ -87,6 +90,11 @@ const struct dev_pm_ops _name = {				\
 const struct dev_pm_ops _name = {				\
 }
 #endif
+
+#define	RUNTIME_PM_OPS(_suspendfunc, _resumefunc, _idlefunc)	\
+	.runtime_suspend = (_suspendfunc),			\
+	.runtime_resume = (_resumefunc),			\
+	.runtime_idle = (_idlefunc),
 
 bool linuxkpi_device_can_wakeup(struct device *);
 #define	device_can_wakeup(_dev)		linuxkpi_device_can_wakeup(_dev)

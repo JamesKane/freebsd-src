@@ -117,4 +117,10 @@ lockdep_is_held(void *__m __diagused)
 #define	lockdep_repin_lock(l,c) do { (void)(l); (void)(c); } while (0)
 #define	lockdep_unpin_lock(l,c) do { (void)(l); (void)(c); } while (0)
 
+enum {
+	LOCK_STATE_UNKNOWN = -1,
+	LOCK_STATE_NOT_HELD,
+	LOCK_STATE_HELD,
+};
+
 #endif /* _LINUXKPI_LINUX_LOCKDEP_H_ */

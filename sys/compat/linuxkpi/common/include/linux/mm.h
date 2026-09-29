@@ -233,6 +233,12 @@ vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr,
 
 	return (ret);
 }
+static inline vm_fault_t
+vmf_error(int err)
+{
+	return (err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS);
+}
+
 #define	vmf_insert_pfn_prot(...)	\
 	_Static_assert(false,		\
 "This function is always called in a loop. Consider using the locked version")

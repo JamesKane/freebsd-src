@@ -58,6 +58,7 @@
 #define	__GFP_KSWAPD_RECLAIM	0
 #define	__GFP_ACCOUNT	0
 #define	__GFP_WAIT	M_WAITOK
+#define	__GFP_DIRECT_RECLAIM	__GFP_WAIT
 #define	__GFP_DMA32	(1U << 24) /* LinuxKPI only */
 #define	__GFP_NORETRY	(1U << 25) /* LinuxKPI only */
 #define	__GFP_THISNODE	(1U << 26)
