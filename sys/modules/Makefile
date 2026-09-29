@@ -342,6 +342,7 @@ SUBDIR=	\
 	${_qatfw} \
 	${_qat_c2xxx} \
 	${_qat_c2xxxfw} \
+	${_qcom_cmd_db} \
 	${_qcom_epss} \
 	${_qcom_gpucc} \
 	${_qcom_scm} \
@@ -747,6 +748,7 @@ _armv8_rng=	armv8_rng
 _dpaa2=		dpaa2
 _sff=		sff
 _em=		em
+_qcom_cmd_db=	qcom_cmd_db
 _qcom_epss=	qcom_epss
 _qcom_gpucc=	qcom_gpucc
 _qcom_scm=	qcom_scm
