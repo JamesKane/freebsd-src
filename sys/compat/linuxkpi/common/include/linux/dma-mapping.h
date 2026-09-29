@@ -131,7 +131,8 @@ void linux_dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sg,
     int nents __unused, enum dma_data_direction direction,
     unsigned long attrs);
 void linuxkpi_dma_sync(struct device *, dma_addr_t, size_t, bus_dmasync_op_t);
-void lkpi_dma_sync_sg(struct device *, struct scatterlist *, bus_dmasync_op_t);
+void lkpi_dma_sync_sg(struct device *, struct scatterlist *, int,
+    bus_dmasync_op_t);
 
 static inline int
 dma_supported(struct device *dev, u64 dma_mask)
@@ -366,7 +367,7 @@ dma_sync_sg_for_cpu(struct device *dev, struct scatterlist *sg, int nelems,
 		return;
 	}
 
-	lkpi_dma_sync_sg(dev, sg, op);
+	lkpi_dma_sync_sg(dev, sg, nelems, op);
 }
 
 static inline void dma_sync_sgtable_for_cpu(struct device *dev,
@@ -395,7 +396,7 @@ dma_sync_sg_for_device(struct device *dev, struct scatterlist *sg, int nelems,
 		return;
 	}
 
-	lkpi_dma_sync_sg(dev, sg, op);
+	lkpi_dma_sync_sg(dev, sg, nelems, op);
 }
 
 static inline void dma_sync_sgtable_for_device(struct device *dev,

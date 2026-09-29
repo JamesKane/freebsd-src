@@ -2092,80 +2092,111 @@ linuxkpi_dma_sync(struct device *dev, dma_addr_t dma_addr, size_t size,
 }
 
 void
-lkpi_dma_sync_sg(struct device *dev, struct scatterlist *sgl, bus_dmasync_op_t op)
+lkpi_dma_sync_sg(struct device *dev, struct scatterlist *sgl, int nents,
+    bus_dmasync_op_t op)
 {
 	struct linux_dma_priv *priv;
+	struct scatterlist *sg;
+	int i;
 
 	priv = dev->dma_priv;
 	DMA_PRIV_LOCK(priv);
-	bus_dmamap_sync(priv->dmat, sgl->dma_map, op);
+	for_each_sg(sgl, sg, nents, i)
+		if (sg->dma_map != NULL)
+			bus_dmamap_sync(priv->dmat, sg->dma_map, op);
 	DMA_PRIV_UNLOCK(priv);
 }
 
+/* The sync before (pre) or after (!pre) a transfer; 0 if there is none. */
+static bus_dmasync_op_t
+lkpi_dma_dir_op(enum dma_data_direction direction, bool pre)
+{
+	switch (direction) {
+	case DMA_BIDIRECTIONAL:
+		return (pre ? BUS_DMASYNC_PREWRITE | BUS_DMASYNC_PREREAD :
+		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+	case DMA_TO_DEVICE:
+		return (pre ? BUS_DMASYNC_PREWRITE : BUS_DMASYNC_POSTWRITE);
+	case DMA_FROM_DEVICE:
+		return (pre ? BUS_DMASYNC_PREREAD : BUS_DMASYNC_POSTREAD);
+	default:
+		return (0);
+	}
+}
+
+/* Unload and destroy the maps of the list's first nents entries. */
+static void
+lkpi_dma_unload_sg(struct linux_dma_priv *priv, struct scatterlist *sgl,
+    int nents, bus_dmasync_op_t op)
+{
+	struct scatterlist *sg;
+	int i;
+
+	for_each_sg(sgl, sg, nents, i) {
+		if (sg->dma_map == NULL)
+			continue;
+		if (op != 0)
+			bus_dmamap_sync(priv->dmat, sg->dma_map, op);
+		bus_dmamap_unload(priv->dmat, sg->dma_map);
+		bus_dmamap_destroy(priv->dmat, sg->dma_map);
+		sg->dma_map = NULL;
+	}
+}
+
+/*
+ * Each entry gets a map of its own: an entry is physically contiguous, so it
+ * fits the device's single-segment tag, and busdma implementations that
+ * keep a list of the ranges to sync per map (arm64, riscv) have room for it.
+ */
 int
 linux_dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
     enum dma_data_direction direction, unsigned long attrs)
 {
 	struct linux_dma_priv *priv;
 	struct scatterlist *sg;
-	int i, nseg;
+	bus_dmasync_op_t op;
 	bus_dma_segment_t seg;
+	int i, nseg;
 
 	priv = dev->dma_priv;
+	op = (attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0 ? 0 :
+	    lkpi_dma_dir_op(direction, true);
 
 	DMA_PRIV_LOCK(priv);
-
-	/* create common DMA map in the first S/G entry */
-	if (bus_dmamap_create(priv->dmat, 0, &sgl->dma_map) != 0) {
-		DMA_PRIV_UNLOCK(priv);
-		return (0);
-	}
-
-	/* load all S/G list entries */
 	for_each_sg(sgl, sg, nents, i) {
+		if (bus_dmamap_create(priv->dmat, 0, &sg->dma_map) != 0) {
+			sg->dma_map = NULL;
+			goto fail;
+		}
 		nseg = -1;
-		if (_bus_dmamap_load_phys(priv->dmat, sgl->dma_map,
+		if (_bus_dmamap_load_phys(priv->dmat, sg->dma_map,
 		    sg_phys(sg), sg->length, BUS_DMA_NOWAIT,
 		    &seg, &nseg) != 0) {
-			bus_dmamap_unload(priv->dmat, sgl->dma_map);
-			bus_dmamap_destroy(priv->dmat, sgl->dma_map);
-			DMA_PRIV_UNLOCK(priv);
-			return (0);
+			bus_dmamap_destroy(priv->dmat, sg->dma_map);
+			sg->dma_map = NULL;
+			goto fail;
 		}
 		KASSERT(nseg == 0,
 		    ("More than one segment (nseg=%d)", nseg + 1));
 
 		sg_dma_address(sg) = seg.ds_addr;
 		sg->dma_length = sg->length;
+		if (op != 0)
+			bus_dmamap_sync(priv->dmat, sg->dma_map, op);
 	}
-
-	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0)
-		goto skip_sync;
-
-	switch (direction) {
-	case DMA_BIDIRECTIONAL:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map,
-		    BUS_DMASYNC_PREWRITE | BUS_DMASYNC_PREREAD);
-		break;
-	case DMA_TO_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREWRITE);
-		break;
-	case DMA_FROM_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREREAD);
-		break;
-	default:
-		break;
-	}
-skip_sync:
-
 	DMA_PRIV_UNLOCK(priv);
 
 	return (nents);
+
+fail:
+	lkpi_dma_unload_sg(priv, sgl, i, 0);
+	DMA_PRIV_UNLOCK(priv);
+	return (0);
 }
 
 void
 linux_dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sgl,
-    int nents __unused, enum dma_data_direction direction,
+    int nents, enum dma_data_direction direction,
     unsigned long attrs)
 {
 	struct linux_dma_priv *priv;
@@ -2173,28 +2204,9 @@ linux_dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sgl,
 	priv = dev->dma_priv;
 
 	DMA_PRIV_LOCK(priv);
-
-	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0)
-		goto skip_sync;
-
-	switch (direction) {
-	case DMA_BIDIRECTIONAL:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map,
-		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-		break;
-	case DMA_TO_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTWRITE);
-		break;
-	case DMA_FROM_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTREAD);
-		break;
-	default:
-		break;
-	}
-skip_sync:
-
-	bus_dmamap_unload(priv->dmat, sgl->dma_map);
-	bus_dmamap_destroy(priv->dmat, sgl->dma_map);
+	lkpi_dma_unload_sg(priv, sgl, nents,
+	    (attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0 ? 0 :
+	    lkpi_dma_dir_op(direction, false));
 	DMA_PRIV_UNLOCK(priv);
 }
 
