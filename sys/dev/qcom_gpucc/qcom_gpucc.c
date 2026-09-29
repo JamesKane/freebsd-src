@@ -199,10 +199,15 @@ static int
 qcom_gpucc_branch_enable(struct qcom_gpucc *sc,
     const struct qcom_gpucc_branch *b)
 {
+	int error;
+
 	qcom_gpucc_set(sc, b->gcc, b->reg, 0, CBCR_CLK_ENABLE);
 	if (!b->halt_check)
 		return (0);
-	return (qcom_gpucc_poll(sc, b->gcc, b->reg, CBCR_CLK_OFF, 0, b->name));
+	error = qcom_gpucc_poll(sc, b->gcc, b->reg, CBCR_CLK_OFF, 0, b->name);
+	if (error != 0)		/* don't leave it enabled */
+		qcom_gpucc_set(sc, b->gcc, b->reg, CBCR_CLK_ENABLE, 0);
+	return (error);
 }
 
 static void
@@ -234,8 +239,11 @@ qcom_gpucc_gdsc_enable(struct qcom_gpucc *sc)
 	DELAY(1);
 	error = qcom_gpucc_poll(sc, false, d->cx_gds_hw_ctrl, GDSC_PWR_ON,
 	    GDSC_PWR_ON, "cx_gdsc");
-	if (error != 0)
+	if (error != 0) {
+		/* Drop our vote rather than leave it for a domain that is off. */
+		qcom_gpucc_set(sc, false, d->cx_gdscr, 0, GDSC_SW_COLLAPSE);
 		return (error);
+	}
 	/* Clocks must not be enabled within 400 ns of powering the memories. */
 	DELAY(1);
 	qcom_gpucc_set(sc, false, d->cx_gdscr, 0, GDSC_RETAIN_FF);
