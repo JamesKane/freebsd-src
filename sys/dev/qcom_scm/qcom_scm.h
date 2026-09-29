@@ -48,6 +48,8 @@
 #define	QCOM_SCM_PIL_PAS_IS_SUPPORTED	0x07
 #define	QCOM_SCM_SVC_INFO		0x06
 #define	QCOM_SCM_INFO_IS_CALL_AVAIL	0x01
+#define	QCOM_SCM_SVC_MP			0x0c
+#define	QCOM_SCM_MP_CP_SMMU_APERTURE_ID	0x1b
 
 bool	qcom_scm_available(void);
 bool	qcom_scm_is_call_available(uint32_t svc, uint32_t cmd);
@@ -60,5 +62,7 @@ int	qcom_scm_pas_mem_setup(uint32_t pas_id, vm_paddr_t addr,
 int	qcom_scm_pas_auth_and_reset(uint32_t pas_id);
 int	qcom_scm_pas_shutdown(uint32_t pas_id);
 int	qcom_scm_set_remote_state(uint32_t state, uint32_t id);
+bool	qcom_scm_set_gpu_smmu_aperture_is_available(void);
+int	qcom_scm_set_gpu_smmu_aperture(u_int context_bank);
 
 #endif /* _DEV_QCOM_SCM_QCOM_SCM_H_ */

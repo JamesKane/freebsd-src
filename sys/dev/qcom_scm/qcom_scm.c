@@ -356,6 +356,33 @@ qcom_scm_set_remote_state(uint32_t state, uint32_t id)
 	return (error == 0 && res[0] != 0 ? EIO : error);
 }
 
+bool
+qcom_scm_set_gpu_smmu_aperture_is_available(void)
+{
+	return (qcom_scm_is_call_available(QCOM_SCM_SVC_MP,
+	    QCOM_SCM_MP_CP_SMMU_APERTURE_ID));
+}
+
+/*
+ * Let the GPU's command processor switch the page tables of an SMMU context
+ * bank, for per-process GPU address spaces.
+ */
+int
+qcom_scm_set_gpu_smmu_aperture(u_int context_bank)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_CP_SMMU_APERTURE_ID,
+		.arginfo = SCM_ARGINFO(4),
+		.args = { 0xffff0000 | (context_bank & 0xff), 0xffffffff,
+		    0xffffffff, 0xffffffff },
+	};
+
+	if (qcom_scm_sc == NULL)
+		return (ENXIO);
+	return (qcom_scm_call(qcom_scm_sc, &desc, NULL));
+}
+
 #ifdef DEV_ACPI
 static char *qcom_scm_acpi_ids[] = { "QCOM04DD", NULL };
 #endif
