@@ -410,11 +410,9 @@ _ioremap_attr(vm_paddr_t _phys_addr, unsigned long _size, int _attr)
 #endif
 
 struct device;
-static inline void *
-devm_ioremap(struct device *dev, resource_size_t offset, resource_size_t size)
-{
-	return (NULL);
-}
+#define	devm_ioremap(...)	linuxkpi_devm_ioremap(__VA_ARGS__)
+void *linuxkpi_devm_ioremap(struct device *dev, resource_size_t offset,
+    resource_size_t size);
 
 #ifdef VM_MEMATTR_DEVICE
 #define	ioremap_nocache(addr, size)					\

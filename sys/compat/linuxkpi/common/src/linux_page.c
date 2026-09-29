@@ -422,6 +422,33 @@ iounmap(void *addr)
 }
 
 static void
+lkpi_devm_ioremap_unmap(struct device *dev, void *p)
+{
+	void **dr = p;
+
+	iounmap(*dr);
+}
+
+void *
+linuxkpi_devm_ioremap(struct device *dev, resource_size_t offset,
+    resource_size_t size)
+{
+	void **dr, *addr;
+
+	dr = devres_alloc(lkpi_devm_ioremap_unmap, sizeof(*dr), GFP_KERNEL);
+	if (dr == NULL)
+		return (NULL);
+	addr = ioremap(offset, size);
+	if (addr != NULL) {
+		*dr = addr;
+		devres_add(dev, dr);
+	} else
+		devres_free(dr);
+
+	return (addr);
+}
+
+static void
 lkpi_devm_memremap_unmap(struct device *dev, void *p)
 {
 	void **dr = p;
