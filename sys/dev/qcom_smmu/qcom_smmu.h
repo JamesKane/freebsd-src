@@ -80,9 +80,6 @@ struct qcom_smmu_fault {
 	uint32_t	cbfrsynra;
 };
 
-#define	QCOM_SMMU_FSR_TF	(1u << 1)	/* translation fault */
-#define	QCOM_SMMU_FSR_PF	(1u << 3)	/* permission fault */
-#define	QCOM_SMMU_FSR_EF	(1u << 4)	/* external fault */
 #define	QCOM_SMMU_FSYNR0_WNR	(1u << 4)	/* the access was a write */
 
 typedef void qcom_smmu_fault_fn(void *arg, const struct qcom_smmu_fault *f);
@@ -101,14 +98,9 @@ vm_paddr_t qcom_smmu_pt_root(struct qcom_smmu_pt *pt);
 int	qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	    struct qcom_smmu_pt *pt, struct qcom_smmu_cb **cbp);
 void	qcom_smmu_cb_free(struct qcom_smmu_cb *cb);
-int	qcom_smmu_cb_set_pt(struct qcom_smmu_cb *cb,
-	    struct qcom_smmu_pt *pt);
 int	qcom_smmu_cb_set_ttbr0(struct qcom_smmu_cb *cb, vm_paddr_t root);
 u_int	qcom_smmu_cb_index(struct qcom_smmu_cb *cb);
-u_int	qcom_smmu_cb_asid(struct qcom_smmu_cb *cb);
 int	qcom_smmu_cb_tlb_inv(struct qcom_smmu_cb *cb);
-bool	qcom_smmu_cb_fault(struct qcom_smmu_cb *cb,
-	    struct qcom_smmu_fault *f);
 int	qcom_smmu_cb_set_fault_handler(struct qcom_smmu_cb *cb,
 	    qcom_smmu_fault_fn *fn, void *arg);
 

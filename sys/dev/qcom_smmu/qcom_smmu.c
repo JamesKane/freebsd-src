@@ -166,7 +166,6 @@ CTASSERT(PAGE_SIZE == 4096);
 struct qcom_smmu {
 	device_t		dev;
 	struct resource		*res;
-	int			rid;
 	bool			claimed;
 	bus_size_t		pgsize;
 	u_int			ncb;
@@ -181,7 +180,6 @@ struct qcom_smmu {
 struct qcom_smmu_cb {
 	struct qcom_smmu	*sc;
 	u_int			idx;
-	u_int			asid;
 	bool			split;		/* TTBR1 holds an upper table */
 	uint32_t		tcr;
 	qcom_smmu_fault_fn	*fault_fn;
@@ -447,20 +445,11 @@ cb_program_ttbr0(struct qcom_smmu_cb *cb, vm_paddr_t root)
 		cb->tcr |= CB_TCR_EPD0;
 		cb_write(cb->sc, cb->idx, CB_TCR, cb->tcr);
 	}
-	cb_write8(cb->sc, cb->idx, CB_TTBR0, root | CB_TTBR_ASID(cb->asid));
+	cb_write8(cb->sc, cb->idx, CB_TTBR0, root | CB_TTBR_ASID(cb->idx));
 	if (cb->split && root != 0) {
 		cb->tcr &= ~CB_TCR_EPD0;
 		cb_write(cb->sc, cb->idx, CB_TCR, cb->tcr);
 	}
-}
-
-static void
-cb_program_pt(struct qcom_smmu_cb *cb, struct qcom_smmu_pt *pt)
-{
-	if (pt->upper)
-		cb_write8(cb->sc, cb->idx, CB_TTBR1, qcom_smmu_pt_root(pt));
-	else
-		cb_program_ttbr0(cb, qcom_smmu_pt_root(pt));
 }
 
 int
@@ -478,7 +467,6 @@ qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	cb = &sc->cbs[idx];
 	cb->sc = sc;
 	cb->idx = idx;
-	cb->asid = idx;
 	/*
 	 * A bank given an upper table is split: TTBR1 translates the top of
 	 * the address space with it, and TTBR0, off until a table is set with
@@ -501,10 +489,13 @@ qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	cb_write(sc, idx, CB_TCR2, CB_TCR2_PASIZE(sc->pasize) |
 	    CB_TCR2_SEP_UPSTREAM);
 	cb_write(sc, idx, CB_TCR, cb->tcr);
-	cb_write(sc, idx, CB_CONTEXTIDR, cb->asid);
-	if (cb->split)
-		cb_program_ttbr0(cb, 0);
-	cb_program_pt(cb, pt);
+	cb_write(sc, idx, CB_CONTEXTIDR, idx);
+	/* The ASID is the bank's index; a split bank's TTBR0 starts off. */
+	if (cb->split) {
+		cb_write8(sc, idx, CB_TTBR0, CB_TTBR_ASID(idx));
+		cb_write8(sc, idx, CB_TTBR1, qcom_smmu_pt_root(pt));
+	} else
+		cb_program_ttbr0(cb, qcom_smmu_pt_root(pt));
 	mair = READ_SPECIALREG(mair_el1);
 	cb_write(sc, idx, CB_MAIR0, (uint32_t)mair);
 	cb_write(sc, idx, CB_MAIR1, (uint32_t)(mair >> 32));
@@ -535,17 +526,6 @@ qcom_smmu_cb_free(struct qcom_smmu_cb *cb)
 	bit_clear(sc->cb_used, cb->idx);
 }
 
-int
-qcom_smmu_cb_set_pt(struct qcom_smmu_cb *cb,
-    struct qcom_smmu_pt *pt)
-{
-	/* Only a split bank translates through TTBR1. */
-	if (pt->upper && !cb->split)
-		return (EINVAL);
-	cb_program_pt(cb, pt);
-	return (qcom_smmu_cb_tlb_inv(cb));
-}
-
 /*
  * Set a split bank's TTBR0 to the table with this root, which may belong to
  * another driver's page table code, or with root 0, turn TTBR0 off.
@@ -565,19 +545,13 @@ qcom_smmu_cb_index(struct qcom_smmu_cb *cb)
 	return (cb->idx);
 }
 
-u_int
-qcom_smmu_cb_asid(struct qcom_smmu_cb *cb)
-{
-	return (cb->asid);
-}
-
 int
 qcom_smmu_cb_tlb_inv(struct qcom_smmu_cb *cb)
 {
 	struct qcom_smmu *sc = cb->sc;
 
 	dsb(ishst);
-	cb_write(sc, cb->idx, CB_TLBIASID, cb->asid);
+	cb_write(sc, cb->idx, CB_TLBIASID, cb->idx);
 	cb_write(sc, cb->idx, CB_TLBSYNC, 0);
 	return (smmu_poll(sc, cb_reg(sc, cb->idx, CB_TLBSTATUS),
 	    "context TLB sync"));
@@ -598,16 +572,6 @@ cb_read_fault(struct qcom_smmu_cb *cb, struct qcom_smmu_fault *f)
 	f->fsynr1 = cb_read(sc, cb->idx, CB_FSYNR1);
 	f->contextidr = cb_read(sc, cb->idx, CB_CONTEXTIDR);
 	f->cbfrsynra = gr1_read(sc, SMMU_CBFRSYNRA(cb->idx));
-	return (true);
-}
-
-/* Report and clear a pending fault on the bank. */
-bool
-qcom_smmu_cb_fault(struct qcom_smmu_cb *cb, struct qcom_smmu_fault *f)
-{
-	if (!cb_read_fault(cb, f))
-		return (false);
-	cb_write(cb->sc, cb->idx, CB_FSR, f->fsr);
 	return (true);
 }
 
@@ -870,11 +834,11 @@ static int
 qcom_smmu_attach(device_t dev)
 {
 	struct qcom_smmu *sc = device_get_softc(dev);
+	int rid;
 
 	sc->dev = dev;
-	sc->rid = 0;
-	sc->res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->rid,
-	    RF_ACTIVE);
+	rid = 0;
+	sc->res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
 	if (sc->res == NULL) {
 		device_printf(dev, "cannot map registers\n");
 		return (ENXIO);
@@ -892,7 +856,7 @@ qcom_smmu_detach(device_t dev)
 	free(sc->cbs, M_QCOM_SMMU);
 	free(sc->cb_used, M_QCOM_SMMU);
 	free(sc->smr_used, M_QCOM_SMMU);
-	bus_release_resource(dev, SYS_RES_MEMORY, sc->rid, sc->res);
+	bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->res);
 	return (0);
 }
 
