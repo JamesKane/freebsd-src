@@ -170,13 +170,15 @@ qcom_scm_call(struct qcom_scm_softc *sc, const struct qcom_scm_desc *desc,
 	in.a5 = desc->args[3];
 
 	sx_xlock(&sc->lock);
-	if (nargs > SCM_REG_ARGS) {
-		for (i = SCM_FIRST_EXT_ARG; i < nargs; i++)
-			sc->ext_args[i - SCM_FIRST_EXT_ARG] = desc->args[i];
-		cpu_dcache_wb_range(sc->ext_args, PAGE_SIZE);
-		in.a5 = pmap_kextract((vm_offset_t)sc->ext_args);
-	}
 	for (retries = 0;; retries++) {
+		/* Another call may have used the page while we slept. */
+		if (nargs > SCM_REG_ARGS) {
+			for (i = SCM_FIRST_EXT_ARG; i < nargs; i++)
+				sc->ext_args[i - SCM_FIRST_EXT_ARG] =
+				    desc->args[i];
+			cpu_dcache_wb_range(sc->ext_args, PAGE_SIZE);
+			in.a5 = pmap_kextract((vm_offset_t)sc->ext_args);
+		}
 		in.a0 = SCM_CALL_ID(desc->svc, desc->cmd);
 		in.a6 = 0;
 		for (;;) {
