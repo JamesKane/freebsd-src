@@ -265,6 +265,24 @@ qcom_gpucc_gdsc_disable(struct qcom_gpucc *sc)
 	DELAY(500);
 }
 
+/*
+ * Turn off, in reverse order, the first nclks clocks, the CX domain if gdsc,
+ * and the first npre pre-clocks, then drop the GPLL0 vote.
+ */
+static void
+qcom_gpucc_cx_off(struct qcom_gpucc *sc, u_int nclks, bool gdsc, u_int npre)
+{
+	const struct qcom_gpucc_desc *d = sc->desc;
+
+	while (nclks-- > 0)
+		qcom_gpucc_branch_disable(sc, &d->clks[nclks]);
+	if (gdsc)
+		qcom_gpucc_gdsc_disable(sc);
+	while (npre-- > 0)
+		qcom_gpucc_branch_disable(sc, &d->pre[npre]);
+	qcom_gpucc_set(sc, true, d->gcc_gpll0_vote, d->gcc_gpll0_mask, 0);
+}
+
 int
 qcom_gpucc_cx_enable(struct qcom_gpucc *sc)
 {
@@ -275,47 +293,38 @@ qcom_gpucc_cx_enable(struct qcom_gpucc *sc)
 	if (sc->cx_on)
 		return (0);
 	qcom_gpucc_set(sc, true, d->gcc_gpll0_vote, 0, d->gcc_gpll0_mask);
-	for (i = 0; i < d->npre; i++)
-		if ((error = qcom_gpucc_branch_enable(sc, &d->pre[i])) != 0)
-			goto fail_pre;
-	if ((error = qcom_gpucc_gdsc_enable(sc)) != 0)
-		goto fail_pre;
-	for (i = 0; i < d->nrcgs; i++)
-		if ((error = qcom_gpucc_rcg_set(sc, &d->rcgs[i])) != 0)
-			goto fail_gdsc;
-	for (i = 0; i < d->nclks; i++)
-		if ((error = qcom_gpucc_branch_enable(sc, &d->clks[i])) != 0)
-			goto fail_clks;
+	for (i = 0; i < d->npre; i++) {
+		if ((error = qcom_gpucc_branch_enable(sc, &d->pre[i])) != 0) {
+			qcom_gpucc_cx_off(sc, 0, false, i);
+			return (error);
+		}
+	}
+	if ((error = qcom_gpucc_gdsc_enable(sc)) != 0) {
+		qcom_gpucc_cx_off(sc, 0, false, d->npre);
+		return (error);
+	}
+	for (i = 0; i < d->nrcgs; i++) {
+		if ((error = qcom_gpucc_rcg_set(sc, &d->rcgs[i])) != 0) {
+			qcom_gpucc_cx_off(sc, 0, true, d->npre);
+			return (error);
+		}
+	}
+	for (i = 0; i < d->nclks; i++) {
+		if ((error = qcom_gpucc_branch_enable(sc, &d->clks[i])) != 0) {
+			qcom_gpucc_cx_off(sc, i, true, d->npre);
+			return (error);
+		}
+	}
 	sc->cx_on = true;
 	return (0);
-
-fail_clks:
-	while (i-- > 0)
-		qcom_gpucc_branch_disable(sc, &d->clks[i]);
-fail_gdsc:
-	qcom_gpucc_gdsc_disable(sc);
-	i = d->npre;
-fail_pre:
-	while (i-- > 0)
-		qcom_gpucc_branch_disable(sc, &d->pre[i]);
-	qcom_gpucc_set(sc, true, d->gcc_gpll0_vote, d->gcc_gpll0_mask, 0);
-	return (error);
 }
 
 void
 qcom_gpucc_cx_disable(struct qcom_gpucc *sc)
 {
-	const struct qcom_gpucc_desc *d = sc->desc;
-	u_int i;
-
 	if (!sc->cx_on)
 		return;
-	for (i = d->nclks; i-- > 0;)
-		qcom_gpucc_branch_disable(sc, &d->clks[i]);
-	qcom_gpucc_gdsc_disable(sc);
-	for (i = d->npre; i-- > 0;)
-		qcom_gpucc_branch_disable(sc, &d->pre[i]);
-	qcom_gpucc_set(sc, true, d->gcc_gpll0_vote, d->gcc_gpll0_mask, 0);
+	qcom_gpucc_cx_off(sc, sc->desc->nclks, true, sc->desc->npre);
 	sc->cx_on = false;
 }
 
