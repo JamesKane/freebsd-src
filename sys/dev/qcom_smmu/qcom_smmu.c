@@ -104,6 +104,7 @@
 #define	SMMU_CBAR(n)		((n) * 4)
 /* Stage 1 translation, stage 2 bypass; bypass NSH; write-back attributes. */
 #define	 SMMU_CBAR_S1		(1u << 16 | 0xfu << 12 | 3u << 8)
+#define	SMMU_CBFRSYNRA(n)	(0x400 + (n) * 4)
 #define	SMMU_CBA2R(n)		(0x800 + (n) * 4)
 #define	 SMMU_CBA2R_VA64	(1u << 0)
 
@@ -113,6 +114,7 @@
 #define	 CB_SCTLR_TRE		(1u << 1)
 #define	 CB_SCTLR_AFE		(1u << 2)
 #define	 CB_SCTLR_CFRE		(1u << 5)
+#define	 CB_SCTLR_CFIE		(1u << 6)
 #define	 CB_SCTLR_ASIDPNE	(1u << 12)
 #define	CB_TCR2			0x010
 #define	 CB_TCR2_PASIZE(x)	(x)
@@ -141,6 +143,7 @@
 #define	 CB_FSR_FAULT		0xc00001fe
 #define	CB_FAR			0x060
 #define	CB_FSYNR0		0x068
+#define	CB_FSYNR1		0x06c
 #define	CB_TLBIASID		0x610
 #define	CB_TLBSYNC		0x7f0
 #define	CB_TLBSTATUS		0x7f4
@@ -180,6 +183,11 @@ struct qcom_smmu_cb {
 	u_int			asid;
 	bool			split;		/* TTBR1 holds an upper table */
 	uint32_t		tcr;
+	qcom_smmu_fault_fn	*fault_fn;
+	void			*fault_arg;
+	struct resource		*irq;
+	int			irq_rid;
+	void			*irq_cookie;
 };
 
 struct qcom_smmu_pt {
@@ -203,6 +211,12 @@ static void
 gr0_write(struct qcom_smmu *sc, bus_size_t reg, uint32_t v)
 {
 	bus_write_4(sc->res, reg, v);
+}
+
+static uint32_t
+gr1_read(struct qcom_smmu *sc, bus_size_t reg)
+{
+	return (bus_read_4(sc->res, sc->pgsize + reg));
 }
 
 static void
@@ -483,7 +497,7 @@ qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	cb_write(sc, idx, CB_MAIR0, (uint32_t)mair);
 	cb_write(sc, idx, CB_MAIR1, (uint32_t)(mair >> 32));
 	cb_write(sc, idx, CB_FSR, CB_FSR_FAULT);
-	/* Faults are reported through cb_fault(); no interrupt yet. */
+	/* Faulting transactions are terminated, not stalled. */
 	cb_write(sc, idx, CB_SCTLR, CB_SCTLR_M | CB_SCTLR_TRE | CB_SCTLR_AFE |
 	    CB_SCTLR_CFRE | CB_SCTLR_ASIDPNE);
 	error = qcom_smmu_cb_tlb_inv(cb);
@@ -503,6 +517,7 @@ qcom_smmu_cb_free(struct qcom_smmu_cb *cb)
 	if (cb == NULL)
 		return;
 	sc = cb->sc;
+	(void)qcom_smmu_cb_set_fault_handler(cb, NULL, NULL);
 	cb_write(sc, cb->idx, CB_SCTLR, 0);
 	(void)qcom_smmu_cb_tlb_inv(cb);
 	bit_clear(sc->cb_used, cb->idx);
@@ -553,20 +568,89 @@ qcom_smmu_cb_tlb_inv(struct qcom_smmu_cb *cb)
 	    "context TLB sync"));
 }
 
-/* Report and clear a pending fault on the bank. */
-bool
-qcom_smmu_cb_fault(struct qcom_smmu_cb *cb, uint32_t *fsr,
-    uint64_t *far, uint32_t *fsynr0)
+/* Read the bank's fault syndrome, if it has a fault recorded. */
+static bool
+cb_read_fault(struct qcom_smmu_cb *cb, struct qcom_smmu_fault *f)
 {
 	struct qcom_smmu *sc = cb->sc;
 
-	*fsr = cb_read(sc, cb->idx, CB_FSR) & CB_FSR_FAULT;
-	if (*fsr == 0)
+	f->fsr = cb_read(sc, cb->idx, CB_FSR) & CB_FSR_FAULT;
+	if (f->fsr == 0)
 		return (false);
-	*far = bus_read_8(sc->res, cb_reg(sc, cb->idx, CB_FAR));
-	*fsynr0 = cb_read(sc, cb->idx, CB_FSYNR0);
-	cb_write(sc, cb->idx, CB_FSR, *fsr);
+	f->far = bus_read_8(sc->res, cb_reg(sc, cb->idx, CB_FAR));
+	f->ttbr0 = bus_read_8(sc->res, cb_reg(sc, cb->idx, CB_TTBR0));
+	f->fsynr0 = cb_read(sc, cb->idx, CB_FSYNR0);
+	f->fsynr1 = cb_read(sc, cb->idx, CB_FSYNR1);
+	f->contextidr = cb_read(sc, cb->idx, CB_CONTEXTIDR);
+	f->cbfrsynra = gr1_read(sc, SMMU_CBFRSYNRA(cb->idx));
 	return (true);
+}
+
+/* Report and clear a pending fault on the bank. */
+bool
+qcom_smmu_cb_fault(struct qcom_smmu_cb *cb, struct qcom_smmu_fault *f)
+{
+	if (!cb_read_fault(cb, f))
+		return (false);
+	cb_write(cb->sc, cb->idx, CB_FSR, f->fsr);
+	return (true);
+}
+
+static void
+cb_intr(void *arg)
+{
+	struct qcom_smmu_cb *cb = arg;
+	struct qcom_smmu_fault f;
+
+	if (!cb_read_fault(cb, &f))
+		return;
+	cb->fault_fn(cb->fault_arg, &f);
+	/* Faults terminate, so nothing is left to resume. */
+	cb_write(cb->sc, cb->idx, CB_FSR, f.fsr);
+}
+
+/*
+ * Call fn from an interrupt thread with each fault the bank takes, or with
+ * fn NULL, stop.  On ACPI systems, IORT lists the SMMU's context interrupts
+ * in bank order, and so do the SMMU device's interrupt resources.
+ */
+int
+qcom_smmu_cb_set_fault_handler(struct qcom_smmu_cb *cb,
+    qcom_smmu_fault_fn *fn, void *arg)
+{
+	struct qcom_smmu *sc = cb->sc;
+	uint32_t sctlr;
+	int error;
+
+	sctlr = cb_read(sc, cb->idx, CB_SCTLR);
+	if (cb->irq != NULL) {
+		cb_write(sc, cb->idx, CB_SCTLR, sctlr & ~CB_SCTLR_CFIE);
+		bus_teardown_intr(sc->dev, cb->irq, cb->irq_cookie);
+		bus_release_resource(sc->dev, SYS_RES_IRQ, cb->irq_rid,
+		    cb->irq);
+		cb->irq = NULL;
+	}
+	cb->fault_fn = fn;
+	cb->fault_arg = arg;
+	if (fn == NULL)
+		return (0);
+
+	cb->irq_rid = cb->idx;
+	cb->irq = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &cb->irq_rid,
+	    RF_ACTIVE);
+	if (cb->irq == NULL)
+		return (ENXIO);
+	error = bus_setup_intr(sc->dev, cb->irq, INTR_TYPE_MISC | INTR_MPSAFE,
+	    NULL, cb_intr, cb, &cb->irq_cookie);
+	if (error != 0) {
+		bus_release_resource(sc->dev, SYS_RES_IRQ, cb->irq_rid,
+		    cb->irq);
+		cb->irq = NULL;
+		return (error);
+	}
+	cb_write(sc, cb->idx, CB_FSR, CB_FSR_FAULT);
+	cb_write(sc, cb->idx, CB_SCTLR, sctlr | CB_SCTLR_CFIE);
+	return (0);
 }
 
 /* Streams. */

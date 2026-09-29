@@ -69,6 +69,24 @@ int	qcom_smmu_claim(device_t consumer, struct qcom_smmu **scp,
 	    u_int *sids, u_int *nsids);
 void	qcom_smmu_release(struct qcom_smmu *sc);
 
+/* A context bank's fault syndrome: the SMMUv2 registers of the same names. */
+struct qcom_smmu_fault {
+	uint64_t	far;
+	uint64_t	ttbr0;
+	uint32_t	fsr;
+	uint32_t	fsynr0;
+	uint32_t	fsynr1;
+	uint32_t	contextidr;
+	uint32_t	cbfrsynra;
+};
+
+#define	QCOM_SMMU_FSR_TF	(1u << 1)	/* translation fault */
+#define	QCOM_SMMU_FSR_PF	(1u << 3)	/* permission fault */
+#define	QCOM_SMMU_FSR_EF	(1u << 4)	/* external fault */
+#define	QCOM_SMMU_FSYNR0_WNR	(1u << 4)	/* the access was a write */
+
+typedef void qcom_smmu_fault_fn(void *arg, const struct qcom_smmu_fault *f);
+
 /* Page table flags. */
 #define	QCOM_SMMU_PT_UPPER	0x01	/* the top of the address space */
 
@@ -90,7 +108,9 @@ u_int	qcom_smmu_cb_index(struct qcom_smmu_cb *cb);
 u_int	qcom_smmu_cb_asid(struct qcom_smmu_cb *cb);
 int	qcom_smmu_cb_tlb_inv(struct qcom_smmu_cb *cb);
 bool	qcom_smmu_cb_fault(struct qcom_smmu_cb *cb,
-	    uint32_t *fsr, uint64_t *far, uint32_t *fsynr0);
+	    struct qcom_smmu_fault *f);
+int	qcom_smmu_cb_set_fault_handler(struct qcom_smmu_cb *cb,
+	    qcom_smmu_fault_fn *fn, void *arg);
 
 int	qcom_smmu_attach_stream(struct qcom_smmu_cb *cb,
 	    uint16_t sid, uint16_t mask);
