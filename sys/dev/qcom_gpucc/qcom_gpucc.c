@@ -116,6 +116,8 @@ static const struct qcom_gpucc_rcg sc8280xp_rcgs[] = {
 
 static const struct qcom_gpucc_branch sc8280xp_clks[] = {
 	{ "gcc_gpu_memnoc_gfx",	true,	0x71010 - 0x52000, true },
+	/* For the GPU's SMMU. */
+	{ "gcc_gpu_snoc_dvm_gfx", true,	0x71020 - 0x52000, true },
 	{ "gpu_cc_cb",		false,	0x1170, false },
 	{ "gpu_cc_cxo",		false,	0x109c, true },
 	{ "gpu_cc_ahb",		false,	0x1078, true },
