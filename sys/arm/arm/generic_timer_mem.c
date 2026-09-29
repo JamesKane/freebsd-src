@@ -66,7 +66,7 @@
 /* CNTBaseN registers */
 #define	CNTBASE_CNTFRQ		0x10
 #define	CNTBASE_CNTP_TVAL	0x28
-#define	CNTBASE_CNTP_CTL	0x2c		/* CNTP_CTL_* bits of armreg.h */
+#define	CNTBASE_CNTP_CTL	0x2c		/* armreg.h CNTP_CTL_* */
 
 #define	GT_MEM_SIZE		0x1000
 
@@ -222,8 +222,8 @@ gt_mem_acpi_attach(device_t dev)
 	    acr | CNTACR_RPCT | CNTACR_RFRQ | CNTACR_RWPT);
 	acr = bus_read_4(sc->ctl, CNTCTL_CNTACR(frame));
 	if ((acr & CNTACR_RWPT) == 0) {
-		device_printf(dev, "frame %d physical timer is not accessible\n",
-		    frame);
+		device_printf(dev,
+		    "frame %d physical timer is not accessible\n", frame);
 		goto fail;
 	}
 	bus_write_4(sc->frame, CNTBASE_CNTP_CTL, 0);

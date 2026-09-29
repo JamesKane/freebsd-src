@@ -115,7 +115,8 @@ qcom_tsens_read(struct qcom_tsens_softc *sc, int n, int *decic)
 	for (i = 0; i < TSENS_READ_TRIES; i++) {
 		v = bus_read_4(sc->tm, TSENS_TM_STATUS(n));
 		if ((v & TSENS_STATUS_VALID) != 0) {
-			*decic = (int32_t)(v << (32 - TSENS_STATUS_TEMP_BITS)) >>
+			*decic = (int32_t)(v <<
+			    (32 - TSENS_STATUS_TEMP_BITS)) >>
 			    (32 - TSENS_STATUS_TEMP_BITS);
 			return (0);
 		}

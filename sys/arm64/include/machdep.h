@@ -44,6 +44,7 @@ enum arm64_bus {
 };
 
 extern enum arm64_bus arm64_bus_method;
+extern int has_pan;
 
 void dbg_init(void);
 bool has_hyp(void);

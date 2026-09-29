@@ -443,7 +443,8 @@ qcom_epss_attach(device_t dev)
 	if (bootverbose)
 		device_printf(dev, "%d levels, %d-%d MHz, %d cores%s\n",
 		    sc->nlevels, sc->levels[0].khz / 1000,
-		    sc->levels[sc->nlevels - 1].khz / 1000, CPU_COUNT(&sc->cpus),
+		    sc->levels[sc->nlevels - 1].khz / 1000,
+		    CPU_COUNT(&sc->cpus),
 		    sc->per_core ? ", per-core requests" : "");
 
 	qcom_epss_get(dev, &cur);

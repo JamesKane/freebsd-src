@@ -1521,7 +1521,7 @@ acpi_cpu_idle_lpi(sbintime_t sbt)
 
     sc = cpu_softc[PCPU_GET(cpuid)];
     if (sc == NULL || is_idle_disabled(sc) || sc->cpu_cx_count == 0) {
-	__asm __volatile("dsb sy; wfi" ::: "memory");
+	__asm __volatile("dsb sy; wfi" : : : "memory");
 	return;
     }
 
@@ -1549,7 +1549,7 @@ acpi_cpu_idle_lpi(sbintime_t sbt)
 
     start_ticks = cpu_ticks();
     if (cx->type == ACPI_STATE_C1) {
-	__asm __volatile("dsb sy; wfi" ::: "memory");
+	__asm __volatile("dsb sy; wfi" : : : "memory");
     } else if (cx->type == ACPI_STATE_C2 ?
 	psci_cpu_suspend(cx->psci_state, 0, 0) != PSCI_RETVAL_SUCCESS :
 	cpu_suspend_psci(cx->psci_state) != 0) {

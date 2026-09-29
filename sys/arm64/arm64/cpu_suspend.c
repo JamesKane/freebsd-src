@@ -70,8 +70,6 @@ CS_PAIR(cs_apia_lo, cs_apia_hi);
 
 DPCPU_DEFINE_STATIC(struct cpu_suspend_ctx, cpu_suspend_ctx);
 
-extern int has_pan;
-
 /* Fixed once the boot CPU is identified; set by cpu_suspend_supported(). */
 static bool cpu_suspend_ok;
 static bool cpu_suspend_gicv3;
@@ -145,9 +143,9 @@ cpu_suspend_psci(uint32_t power_state)
 	/* Resumed from a power-down, with the MMU, stack and pcpu back. */
 	if (has_pan)
 		__asm __volatile(
-		    ".arch_extension pan	\n"
-		    "msr pan, #1		\n"
-		    ".arch_extension nopan	\n");
+		    ".arch_extension pan\n"
+		    "msr pan, #1\n"
+		    ".arch_extension nopan\n");
 	WRITE_SPECIALREG(cpacr_el1, ctx->cs_cpacr);
 	WRITE_SPECIALREG(cntkctl_el1, ctx->cs_cntkctl);
 	WRITE_SPECIALREG(oslar_el1, 0);

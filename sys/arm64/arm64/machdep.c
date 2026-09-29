@@ -335,8 +335,8 @@ cpu_idle(int busy)
 			cpu_idle_hook(sbt);
 		else
 			__asm __volatile(
-			    "dsb sy \n"
-			    "wfi    \n");
+			    "dsb sy\n"
+			    "wfi\n");
 	}
 	if (!busy)
 		cpu_activeclock();
