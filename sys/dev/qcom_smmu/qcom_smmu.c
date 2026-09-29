@@ -119,13 +119,20 @@
 #define	 CB_TCR2_SEP_UPSTREAM	(7u << 15)
 #define	CB_TTBR0		0x020
 #define	 CB_TTBR_ASID(a)	((uint64_t)(a) << 48)
+#define	CB_TTBR1		0x028
 #define	CB_TCR			0x030
 #define	 CB_TCR_T0SZ(x)		(x)
+#define	 CB_TCR_EPD0		(1u << 7)
 #define	 CB_TCR_IRGN0_WBWA	(1u << 8)
 #define	 CB_TCR_ORGN0_WBWA	(1u << 10)
 #define	 CB_TCR_SH0_IS		(3u << 12)
 #define	 CB_TCR_TG0_4K		(0u << 14)
+#define	 CB_TCR_T1SZ(x)		((x) << 16)
 #define	 CB_TCR_EPD1		(1u << 23)
+#define	 CB_TCR_IRGN1_WBWA	(1u << 24)
+#define	 CB_TCR_ORGN1_WBWA	(1u << 26)
+#define	 CB_TCR_SH1_IS		(3u << 28)
+#define	 CB_TCR_TG1_4K		(2u << 30)
 #define	CB_CONTEXTIDR		0x034
 #define	CB_MAIR0		0x038
 #define	CB_MAIR1		0x03c
@@ -142,6 +149,8 @@
 
 /* Page tables: 4 KB granule, four levels, 48-bit input addresses. */
 #define	PT_VA_BITS		48
+#define	PT_SPAN			(1ul << PT_VA_BITS)
+#define	PT_UPPER_BASE		(~0ul << PT_VA_BITS)	/* upper tables' */
 #define	PT_LEVELS		4
 #define	PT_SHIFT(lvl)		(39 - 9 * (lvl))
 #define	PT_INDEX(va, lvl)	(((va) >> PT_SHIFT(lvl)) & 0x1ff)
@@ -169,11 +178,14 @@ struct qcom_smmu_cb {
 	struct qcom_smmu	*sc;
 	u_int			idx;
 	u_int			asid;
+	bool			split;		/* TTBR1 holds an upper table */
+	uint32_t		tcr;
 };
 
 struct qcom_smmu_pt {
 	struct sx		lock;
 	vm_page_t		root;
+	bool			upper;
 };
 
 static MALLOC_DEFINE(M_QCOM_SMMU, "qcom_smmu",
@@ -279,13 +291,14 @@ pt_free_table(uint64_t *table, int lvl)
 }
 
 struct qcom_smmu_pt *
-qcom_smmu_pt_create(void)
+qcom_smmu_pt_create(u_int flags)
 {
 	struct qcom_smmu_pt *pt;
 
 	pt = malloc(sizeof(*pt), M_QCOM_SMMU, M_WAITOK | M_ZERO);
 	sx_init(&pt->lock, "adreno smmu pt");
 	pt->root = pt_alloc_table();
+	pt->upper = (flags & QCOM_SMMU_PT_UPPER) != 0;
 	return (pt);
 }
 
@@ -330,6 +343,19 @@ pt_lookup(struct qcom_smmu_pt *pt, uint64_t va, bool alloc)
 	return (&table[PT_INDEX(va, PT_LEVELS - 1)]);
 }
 
+/*
+ * Whether [va, va + size) lies in the range the table translates.  Lookups
+ * index with bits 47:12 only, so upper tables need no other conversion.
+ */
+static bool
+pt_range_ok(struct qcom_smmu_pt *pt, uint64_t va, size_t size)
+{
+	uint64_t base;
+
+	base = pt->upper ? PT_UPPER_BASE : 0;
+	return (size != 0 && va >= base && size - 1 <= PT_SPAN - 1 - (va - base));
+}
+
 int
 qcom_smmu_map(struct qcom_smmu_pt *pt, uint64_t va,
     vm_paddr_t pa, size_t size, u_int flags)
@@ -337,8 +363,7 @@ qcom_smmu_map(struct qcom_smmu_pt *pt, uint64_t va,
 	uint64_t attr, *e;
 	size_t done;
 
-	if (((va | pa | size) & PAGE_MASK) != 0 || size == 0 ||
-	    va + size > (1ul << PT_VA_BITS) || va + size < va)
+	if (((va | pa | size) & PAGE_MASK) != 0 || !pt_range_ok(pt, va, size))
 		return (EINVAL);
 	/*
 	 * Non-global (ASID-tagged), shareable, executable: the GPU fetches
@@ -389,11 +414,27 @@ qcom_smmu_unmap(struct qcom_smmu_pt *pt, uint64_t va,
 
 /* Context banks. */
 
+/* Point TTBR0 at a table, or with root 0, turn it off in a split bank. */
+static void
+cb_program_ttbr0(struct qcom_smmu_cb *cb, vm_paddr_t root)
+{
+	if (cb->split) {
+		if (root != 0)
+			cb->tcr &= ~CB_TCR_EPD0;
+		else
+			cb->tcr |= CB_TCR_EPD0;
+		cb_write(cb->sc, cb->idx, CB_TCR, cb->tcr);
+	}
+	cb_write8(cb->sc, cb->idx, CB_TTBR0, root | CB_TTBR_ASID(cb->asid));
+}
+
 static void
 cb_program_pt(struct qcom_smmu_cb *cb, struct qcom_smmu_pt *pt)
 {
-	cb_write8(cb->sc, cb->idx, CB_TTBR0,
-	    qcom_smmu_pt_root(pt) | CB_TTBR_ASID(cb->asid));
+	if (pt->upper)
+		cb_write8(cb->sc, cb->idx, CB_TTBR1, qcom_smmu_pt_root(pt));
+	else
+		cb_program_ttbr0(cb, qcom_smmu_pt_root(pt));
 }
 
 int
@@ -412,6 +453,20 @@ qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	cb->sc = sc;
 	cb->idx = idx;
 	cb->asid = idx;
+	/*
+	 * A bank given an upper table is split: TTBR1 translates the top of
+	 * the address space with it, and TTBR0, off until a table is set with
+	 * qcom_smmu_cb_set_ttbr0(), the bottom.
+	 */
+	cb->split = pt->upper;
+	cb->tcr = CB_TCR_T0SZ(64 - PT_VA_BITS) | CB_TCR_IRGN0_WBWA |
+	    CB_TCR_ORGN0_WBWA | CB_TCR_SH0_IS | CB_TCR_TG0_4K;
+	if (cb->split)
+		cb->tcr |= CB_TCR_EPD0 | CB_TCR_T1SZ(64 - PT_VA_BITS) |
+		    CB_TCR_IRGN1_WBWA | CB_TCR_ORGN1_WBWA | CB_TCR_SH1_IS |
+		    CB_TCR_TG1_4K;
+	else
+		cb->tcr |= CB_TCR_EPD1;
 
 	/* Attributes first, then the bank's registers (as Linux does). */
 	cb_write(sc, idx, CB_SCTLR, 0);
@@ -419,10 +474,10 @@ qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	gr1_write(sc, SMMU_CBAR(idx), SMMU_CBAR_S1);
 	cb_write(sc, idx, CB_TCR2, CB_TCR2_PASIZE(sc->pasize) |
 	    CB_TCR2_SEP_UPSTREAM);
-	cb_write(sc, idx, CB_TCR, CB_TCR_T0SZ(64 - PT_VA_BITS) |
-	    CB_TCR_IRGN0_WBWA | CB_TCR_ORGN0_WBWA | CB_TCR_SH0_IS |
-	    CB_TCR_TG0_4K | CB_TCR_EPD1);
+	cb_write(sc, idx, CB_TCR, cb->tcr);
 	cb_write(sc, idx, CB_CONTEXTIDR, cb->asid);
+	if (cb->split)
+		cb_program_ttbr0(cb, 0);
 	cb_program_pt(cb, pt);
 	mair = READ_SPECIALREG(mair_el1);
 	cb_write(sc, idx, CB_MAIR0, (uint32_t)mair);
@@ -459,6 +514,25 @@ qcom_smmu_cb_set_pt(struct qcom_smmu_cb *cb,
 {
 	cb_program_pt(cb, pt);
 	(void)qcom_smmu_cb_tlb_inv(cb);
+}
+
+/*
+ * Set a split bank's TTBR0 to the table with this root, which may belong to
+ * another driver's page table code, or with root 0, turn TTBR0 off.
+ */
+int
+qcom_smmu_cb_set_ttbr0(struct qcom_smmu_cb *cb, vm_paddr_t root)
+{
+	if (!cb->split || (root & ~PT_ADDR_MASK) != 0)
+		return (EINVAL);
+	cb_program_ttbr0(cb, root);
+	return (qcom_smmu_cb_tlb_inv(cb));
+}
+
+u_int
+qcom_smmu_cb_index(struct qcom_smmu_cb *cb)
+{
+	return (cb->idx);
 }
 
 u_int

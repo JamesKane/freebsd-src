@@ -38,6 +38,12 @@
  * bank between tables (one per process).  Unmapping does not invalidate
  * TLBs; the caller invalidates every bank using the table.
  *
+ * A table translates 48-bit addresses, or with QCOM_SMMU_PT_UPPER, the top
+ * 2^48 bytes of the 64-bit address space.  A bank given an upper table is
+ * split, as Linux sets the Adreno GPU's up: the upper table holds the
+ * kernel's mappings, and TTBR0, set with qcom_smmu_cb_set_ttbr0(), the
+ * current process's, below.  The GPU switches TTBR0 itself.
+ *
  * qcom_smmu_claim() returns every stream ID firmware lists for the device.
  * The hypervisor checks each stream match entry against the ID and mask
  * pairs it expects, and resets the SoC on any other, even one covering only
@@ -63,7 +69,10 @@ int	qcom_smmu_claim(device_t consumer, struct qcom_smmu **scp,
 	    u_int *sids, u_int *nsids);
 void	qcom_smmu_release(struct qcom_smmu *sc);
 
-struct qcom_smmu_pt *qcom_smmu_pt_create(void);
+/* Page table flags. */
+#define	QCOM_SMMU_PT_UPPER	0x01	/* the top of the address space */
+
+struct qcom_smmu_pt *qcom_smmu_pt_create(u_int flags);
 void	qcom_smmu_pt_destroy(struct qcom_smmu_pt *pt);
 int	qcom_smmu_map(struct qcom_smmu_pt *pt, uint64_t va,
 	    vm_paddr_t pa, size_t size, u_int flags);
@@ -76,6 +85,8 @@ int	qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 void	qcom_smmu_cb_free(struct qcom_smmu_cb *cb);
 void	qcom_smmu_cb_set_pt(struct qcom_smmu_cb *cb,
 	    struct qcom_smmu_pt *pt);
+int	qcom_smmu_cb_set_ttbr0(struct qcom_smmu_cb *cb, vm_paddr_t root);
+u_int	qcom_smmu_cb_index(struct qcom_smmu_cb *cb);
 u_int	qcom_smmu_cb_asid(struct qcom_smmu_cb *cb);
 int	qcom_smmu_cb_tlb_inv(struct qcom_smmu_cb *cb);
 bool	qcom_smmu_cb_fault(struct qcom_smmu_cb *cb,
