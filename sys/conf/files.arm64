@@ -810,6 +810,7 @@ dev/qcom_cmd_db/qcom_cmd_db.c			optional qcom_cmd_db acpi | qcom_cmd_db fdt
 dev/qcom_epss/qcom_epss.c			optional qcom_epss acpi | qcom_epss fdt
 dev/qcom_gpucc/qcom_gpucc.c			optional qcom_gpucc
 dev/qcom_scm/qcom_scm.c				optional qcom_scm acpi | qcom_scm fdt
+dev/qcom_smmu/qcom_smmu.c			optional qcom_smmu acpi
 dev/qcom_tsens/qcom_tsens.c			optional qcom_tsens acpi | qcom_tsens fdt
 dev/qcom_tlmm/qcom_tlmm_debug.c			optional qcom_tlmm gpio
 dev/qcom_tlmm/qcom_tlmm_pin.c			optional qcom_tlmm gpio

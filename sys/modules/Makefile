@@ -346,6 +346,7 @@ SUBDIR=	\
 	${_qcom_epss} \
 	${_qcom_gpucc} \
 	${_qcom_scm} \
+	${_qcom_smmu} \
 	${_qcom_tsens} \
 	${_qlxge} \
 	${_qlxgb} \
@@ -752,6 +753,7 @@ _qcom_cmd_db=	qcom_cmd_db
 _qcom_epss=	qcom_epss
 _qcom_gpucc=	qcom_gpucc
 _qcom_scm=	qcom_scm
+_qcom_smmu=	qcom_smmu
 _qcom_tsens=	qcom_tsens
 _tcx=		tcx
 _hyperv=  hyperv
