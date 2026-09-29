@@ -771,8 +771,8 @@ acpi_iort_named_smmu(ACPI_HANDLE dev, u_int index, uint64_t *base,
 {
 	struct iort_node *node, *smmu, *seen[8];
 	struct iort_map_entry *e;
-	u_int i, id, n, nseen, own;
-	bool single;
+	uint64_t cnt, j, n;
+	u_int i, nseen, own;
 
 	node = iort_named_comp_lookup(dev);
 	if (node == NULL)
@@ -799,21 +799,22 @@ acpi_iort_named_smmu(ACPI_HANDLE dev, u_int index, uint64_t *base,
 		if (e->out_node != smmu)
 			continue;
 		own++;
-		single = (e->flags & ACPI_IORT_ID_SINGLE_MAPPING) != 0;
-		for (id = e->base; id <= e->end; id++) {
-			if (n < *nsids)
-				sids[n] = e->outbase +
-				    (single ? 0 : id - e->base);
-			n++;
-			if (single)
-				break;
-		}
+		if ((e->flags & ACPI_IORT_ID_SINGLE_MAPPING) != 0)
+			cnt = 1;
+		else if (e->end >= e->base)
+			cnt = (uint64_t)e->end - e->base + 1;
+		else
+			continue;
+		/* The count is 64-bit: a range may end at UINT_MAX. */
+		for (j = 0; j < cnt && n + j < *nsids; j++)
+			sids[n + j] = e->outbase + (u_int)j;
+		n += cnt;
 	}
 	*base = smmu->data.smmu.BaseAddress;
 	/* usecount counts every mapping entry that resolved to the node. */
 	*shared = smmu->usecount > own;
 	i = *nsids;
-	*nsids = n;
+	*nsids = MIN(n, UINT_MAX);
 	return (n > i ? E2BIG : 0);
 }
 
