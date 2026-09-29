@@ -435,18 +435,22 @@ qcom_smmu_unmap(struct qcom_smmu_pt *pt, uint64_t va,
 
 /* Context banks. */
 
-/* Point TTBR0 at a table, or with root 0, turn it off in a split bank. */
+/*
+ * Point TTBR0 at a table, or with root 0, turn it off in a split bank.
+ * Walks through TTBR0 are only enabled once it holds the table.
+ */
 static void
 cb_program_ttbr0(struct qcom_smmu_cb *cb, vm_paddr_t root)
 {
-	if (cb->split) {
-		if (root != 0)
-			cb->tcr &= ~CB_TCR_EPD0;
-		else
-			cb->tcr |= CB_TCR_EPD0;
+	if (cb->split && root == 0) {
+		cb->tcr |= CB_TCR_EPD0;
 		cb_write(cb->sc, cb->idx, CB_TCR, cb->tcr);
 	}
 	cb_write8(cb->sc, cb->idx, CB_TTBR0, root | CB_TTBR_ASID(cb->asid));
+	if (cb->split && root != 0) {
+		cb->tcr &= ~CB_TCR_EPD0;
+		cb_write(cb->sc, cb->idx, CB_TCR, cb->tcr);
+	}
 }
 
 static void
