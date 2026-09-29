@@ -185,9 +185,16 @@ static int			acpi_tz_cooling_unit = -1;
 static int
 acpi_tz_probe(device_t dev)
 {
+    ACPI_HANDLE	h;
     int		result;
 
-    if (acpi_get_type(dev) == ACPI_TYPE_THERMAL && !acpi_disabled("thermal")) {
+    /*
+     * A zone without _TMP gets its temperature from a sensor driver it
+     * names in _TZD, as some Windows-on-Arm firmware does; there is
+     * nothing for this driver to read.
+     */
+    if (acpi_get_type(dev) == ACPI_TYPE_THERMAL && !acpi_disabled("thermal") &&
+	ACPI_SUCCESS(AcpiGetHandle(acpi_get_handle(dev), acpi_tz_tmp_name, &h))) {
 	device_set_desc(dev, "Thermal Zone");
 	result = -10;
     } else
