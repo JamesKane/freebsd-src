@@ -57,6 +57,8 @@
 
 int			cpu_disable_c2_sleep = 0; /* Timer dies in C2. */
 int			cpu_disable_c3_sleep = 0; /* Timer dies in C3. */
+static bool		timer_named;	/* The user chose the timer. */
+static bool		timer_for_c3;	/* Chosen to keep running in C3. */
 
 static void		setuptimer(void);
 static void		loadtimer(sbintime_t now, int first);
@@ -603,6 +605,7 @@ cpu_initclocks_bsp(void)
 	/* Grab requested timer or the best of present. */
 	if (timername[0])
 		timer = et_find(timername, 0, 0);
+	timer_named = timer != NULL;
 	if (timer == NULL && periodic) {
 		timer = et_find(NULL,
 		    ET_FLAGS_PERIODIC, ET_FLAGS_PERIODIC);
@@ -879,6 +882,71 @@ done:
 }
 
 /*
+ * Switch the active event timers hardware; with ET_LOCK held.
+ */
+static void
+switchtimer(struct eventtimer *et)
+{
+
+	configtimer(0);
+	et_free(timer);
+	if (et->et_flags & ET_FLAGS_C3STOP)
+		cpu_disable_c3_sleep++;
+	if (timer->et_flags & ET_FLAGS_C3STOP)
+		cpu_disable_c3_sleep--;
+	periodic = want_periodic;
+	timer = et;
+	et_init(timer, timercb, NULL, NULL);
+	configtimer(1);
+}
+
+/*
+ * The best present timer of the wanted periodicity, or failing that of the
+ * other, among those with none of the flags in check.
+ */
+static struct eventtimer *
+besttimer(int check)
+{
+	struct eventtimer *et;
+
+	et = NULL;
+	if (want_periodic)
+		et = et_find(NULL, check | ET_FLAGS_PERIODIC,
+		    ET_FLAGS_PERIODIC);
+	if (et == NULL)
+		et = et_find(NULL, check | ET_FLAGS_ONESHOT, ET_FLAGS_ONESHOT);
+	if (et == NULL && !want_periodic)
+		et = et_find(NULL, check | ET_FLAGS_PERIODIC,
+		    ET_FLAGS_PERIODIC);
+	return (et);
+}
+
+/*
+ * Idle code that wants to enter states in which some timers stop (C3)
+ * calls this with want true, and with false when it no longer does.  If
+ * the timer the kernel chose stops there, it switches to the best one that
+ * keeps running, and back again.  A timer the user chose stays.
+ */
+void
+cpu_c3_timer(bool want)
+{
+	struct eventtimer *et;
+
+	ET_LOCK();
+	if (timer == NULL || timer_named || want == timer_for_c3 ||
+	    (want && (timer->et_flags & ET_FLAGS_C3STOP) == 0)) {
+		ET_UNLOCK();
+		return;
+	}
+	et = besttimer(want ? ET_FLAGS_C3STOP : 0);
+	if (et != NULL) {
+		switchtimer(et);
+		timer_for_c3 = want;
+	}
+	ET_UNLOCK();
+}
+
+/*
  * Report or change the active event timers hardware.
  */
 static int
@@ -905,16 +973,9 @@ sysctl_kern_eventtimer_timer(SYSCTL_HANDLER_ARGS)
 		ET_UNLOCK();
 		return (ENOENT);
 	}
-	configtimer(0);
-	et_free(timer);
-	if (et->et_flags & ET_FLAGS_C3STOP)
-		cpu_disable_c3_sleep++;
-	if (timer->et_flags & ET_FLAGS_C3STOP)
-		cpu_disable_c3_sleep--;
-	periodic = want_periodic;
-	timer = et;
-	et_init(timer, timercb, NULL, NULL);
-	configtimer(1);
+	switchtimer(et);
+	timer_named = true;
+	timer_for_c3 = false;
 	ET_UNLOCK();
 	return (error);
 }

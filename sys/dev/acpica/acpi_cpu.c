@@ -1815,6 +1815,26 @@ acpi_cpu_method_sysctl(SYSCTL_HANDLER_ARGS)
 }
 #endif
 
+/*
+ * Keep an event timer that runs in C3 while any CPU may enter it; the one
+ * the kernel chose may stop there.
+ */
+static void
+acpi_cpu_c3_timer(void)
+{
+    struct acpi_cpu_softc *sc;
+    bool want;
+    int i;
+
+    ACPI_SERIAL_ASSERT(cpu);
+    want = false;
+    CPU_FOREACH(i) {
+	if ((sc = cpu_softc[i]) != NULL && sc->cpu_cx_lowest > sc->cpu_non_c3)
+	    want = true;
+    }
+    cpu_c3_timer(want);
+}
+
 static int
 acpi_cpu_set_cx_lowest(struct acpi_cpu_softc *sc)
 {
@@ -1862,6 +1882,7 @@ acpi_cpu_cx_lowest_sysctl(SYSCTL_HANDLER_ARGS)
     ACPI_SERIAL_BEGIN(cpu);
     sc->cpu_cx_lowest_lim = val - 1;
     acpi_cpu_set_cx_lowest(sc);
+    acpi_cpu_c3_timer();
     ACPI_SERIAL_END(cpu);
 
     return (0);
@@ -1897,6 +1918,7 @@ acpi_cpu_global_cx_lowest_sysctl(SYSCTL_HANDLER_ARGS)
 	sc->cpu_cx_lowest_lim = cpu_cx_lowest_lim;
 	acpi_cpu_set_cx_lowest(sc);
     }
+    acpi_cpu_c3_timer();
     ACPI_SERIAL_END(cpu);
 
     return (0);
