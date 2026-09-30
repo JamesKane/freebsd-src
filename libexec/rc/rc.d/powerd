@@ -16,6 +16,21 @@ command="/usr/sbin/${name}"
 
 load_rc_config $name
 
+# Without flags of its own, powerd takes its mode from the power profile.
+if [ -z "${powerd_flags}" ]; then
+	case ${power_profile} in
+	power-saver)
+		powerd_flags="-a adaptive -b adaptive -n adaptive"
+		;;
+	balanced)
+		powerd_flags="-a hiadaptive -b adaptive -n hiadaptive"
+		;;
+	performance)
+		powerd_flags="-a maximum -b hiadaptive -n maximum"
+		;;
+	esac
+fi
+
 # doesn't make sense to run in a svcj: privileged operations
 powerd_svcj="NO"
 

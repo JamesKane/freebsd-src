@@ -1,15 +1,18 @@
 #!/bin/sh
 #
-# Modify the power profile based on AC line state.  This script is
-# usually called from devd(8).
+# Apply the power profile chosen with power_profile in rc.conf(5), at boot
+# and when started again after it changes; or, with no profile chosen, modify
+# the power settings based on AC line state, when called from devd(8).
 #
-# Arguments: 0x00 (AC offline, economy) or 0x01 (AC online, performance)
+# Arguments: start, status, 0x00 (AC offline, economy) or 0x01 (AC online,
+# performance)
 #
 #
 
 # PROVIDE: power_profile
 # REQUIRE: FILESYSTEMS syslogd
-# KEYWORD: nojail nostart
+# BEFORE: powerd
+# KEYWORD: nojail
 
 . /etc/rc.subr
 
@@ -57,10 +60,60 @@ sysctl_set()
 	fi
 }
 
+# Run the hooks in each of power_profile_hooks with the profile's name, for
+# the settings of drivers and applications the base system does not know.
+run_hooks()
+{
+	local dir hook
+
+	for dir in ${power_profile_hooks}; do
+		[ -d "${dir}" ] || continue
+		for hook in "${dir}"/*; do
+			[ -f "${hook}" -a -x "${hook}" ] || continue
+			if ! "${hook}" "${power_profile}"; then
+				warn "${hook} failed for '${power_profile}'"
+			fi
+		done
+	done
+}
+
+# Apply the chosen profile.  powerd(8), unless given flags of its own, takes
+# its mode from the profile when it starts, and is restarted to take it now.
+apply_profile()
+{
+	case ${power_profile} in
+	[Nn][Oo][Nn][Ee] | '')
+		return 0
+		;;
+	power-saver)
+		value="Cmax"
+		;;
+	balanced)
+		value="C3"
+		;;
+	performance)
+		value="C1"
+		;;
+	*)
+		warn "unknown power_profile '${power_profile}'"
+		return 1
+		;;
+	esac
+	node="hw.acpi.cpu.cx_lowest"
+	sysctl_set
+	if [ -z "${powerd_flags}" ] && checkyesno powerd_enable &&
+	    service powerd status > /dev/null 2>&1; then
+		service powerd restart > /dev/null
+	fi
+	run_hooks
+	${LOGGER} "profile '${power_profile}'"
+}
+
 if [ $# -ne 1 ]; then
-	err 1 "Usage: $0 [0x00|0x01]"
+	err 1 "Usage: $0 [start|status|0x00|0x01]"
 fi
 load_rc_config $name
+: ${power_profile_hooks:="/etc/power_profile.d /usr/local/etc/power_profile.d"}
 
 # doesn't make sense to run in a svcj: privileged operations
 power_profile_svcj="NO"
@@ -68,7 +121,30 @@ power_profile_svcj="NO"
 # Find the next state (performance or economy).
 state=$1
 case ${state} in
-0x01 | '')
+*start)
+	apply_profile
+	exit $?
+	;;
+*status)
+	echo "power profile: ${power_profile:-NONE}"
+	exit 0
+	;;
+*stop)
+	exit 0
+	;;
+esac
+
+# A chosen profile stays whatever the AC line does.
+case ${power_profile} in
+[Nn][Oo][Nn][Ee] | '')
+	;;
+*)
+	exit 0
+	;;
+esac
+
+case ${state} in
+0x01)
 	${LOGGER} "changed to 'performance'"
 	profile="performance"
 	;;
@@ -77,7 +153,7 @@ case ${state} in
 	profile="economy"
 	;;
 *)
-	echo "Usage: $0 [0x00|0x01]"
+	echo "Usage: $0 [start|status|0x00|0x01]"
 	exit 1
 esac
 

@@ -25,7 +25,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd September 11, 2026
+.Dd September 30, 2026
 .Dt RC.CONF 5
 .Os
 .Sh NAME
@@ -3955,6 +3955,52 @@ For example: /mount/dev=ruleset_name
 .Pq Vt bool
 If set, always load the default rulesets listed in
 .Va devfs_rulesets .
+.It Va power_profile
+.Pq Vt str
+The power profile, trading power for performance, applied at boot and by
+.Nm service Cm power_profile start :
+.Bl -tag -width "performance"
+.It Li power-saver
+the deepest CPU idle states, and
+.Xr powerd 8
+in
+.Cm adaptive
+mode;
+.It Li balanced
+CPU idle state C3, and
+.Xr powerd 8
+in
+.Cm hiadaptive
+mode, or
+.Cm adaptive
+on battery;
+.It Li performance
+the lowest latency CPU idle state, and
+.Xr powerd 8
+in
+.Cm maximum
+mode, or
+.Cm hiadaptive
+on battery.
+.El
+.Pp
+.Xr powerd 8
+takes its mode from the profile only when
+.Va powerd_flags
+is empty.
+While a profile is set, the
+.Va performance_*
+and
+.Va economy_*
+settings below are not used.
+Set to
+.Dq Li NONE
+to use them instead.
+.It Va power_profile_hooks
+.Pq Vt str
+Directories of hooks run when a power profile is applied, each with the
+profile's name as its argument, for settings of drivers and applications
+the base system does not know.
 .It Va performance_cx_lowest
 .Pq Vt str
 CPU idle state to use while on AC power.
