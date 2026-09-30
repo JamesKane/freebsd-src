@@ -51,11 +51,28 @@
 
 #define	SDHCI_AMD_RESET_DLL_REG	0x908
 
+/*
+ * Qualcomm SDHCI-MSM v5 power control: the controller asks for bus power
+ * and I/O voltage changes, which follow power control, reset and host
+ * control 2 writes, and waits until they are acknowledged.
+ */
+#define	SDHCI_QCOM_PWRCTL_STATUS	0x240
+#define	SDHCI_QCOM_PWRCTL_MASK		0x244
+#define	SDHCI_QCOM_PWRCTL_CLEAR		0x248
+#define	SDHCI_QCOM_PWRCTL_CTL		0x24c
+#define	 SDHCI_QCOM_REQ_BUS		0x3	/* off, on */
+#define	 SDHCI_QCOM_REQ_IO		0xc	/* low, high */
+#define	 SDHCI_QCOM_BUS_SUCCESS		0x1
+#define	 SDHCI_QCOM_IO_SUCCESS		0x4
+
+#define	SDHCI_ACPI_QCOM		0x1	/* Qualcomm power control */
+
 static const struct sdhci_acpi_device {
 	const char*	hid;
 	int		uid;
 	const char	*desc;
 	u_int		quirks;
+	u_int		flags;
 } sdhci_acpi_devices[] = {
 	{ "80860F14",	1, "Intel Bay Trail/Braswell eMMC 4.5/4.5.1 Controller",
 	    SDHCI_QUIRK_INTEL_POWER_UP_RESET |
@@ -82,6 +99,16 @@ static const struct sdhci_acpi_device {
 	{ "AMDI0040",	0, "AMD eMMC 5.0 Controller",
 	    SDHCI_QUIRK_32BIT_DMA_SIZE |
 	    SDHCI_QUIRK_MMC_HS400_IF_CAN_SDR104 },
+	/*
+	 * Card detect is a GPIO, and the card supplies are regulators, which
+	 * the firmware leaves on; so the slot keeps its card, at 3 V.  DMA
+	 * goes through an SMMU the firmware may not have set up for it.
+	 */
+	{ "QCOM2466",	0, "Qualcomm SDHCI-MSM SD Controller",
+	    SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE |
+	    SDHCI_QUIRK_BROKEN_DMA |
+	    SDHCI_QUIRK_MISSING_CAPS,
+	    SDHCI_ACPI_QCOM },
 	{ NULL, 0, NULL, 0}
 };
 
@@ -91,6 +118,7 @@ static char *sdhci_ids[] = {
 	"80865ACA",
 	"80865ACC",
 	"AMDI0040",
+	"QCOM2466",
 	NULL
 };
 
@@ -116,6 +144,34 @@ sdhci_acpi_read_1(device_t dev, struct sdhci_slot *slot __unused,
 	return bus_read_1(sc->mem_res, off);
 }
 
+/*
+ * Acknowledge the power control requests of a Qualcomm controller, as
+ * Linux's sdhci-msm does: the firmware leaves the supplies on, so bus power
+ * and I/O voltage changes all succeed.
+ */
+static void
+sdhci_acpi_qcom_pwrctl(struct sdhci_acpi_softc *sc)
+{
+	uint32_t ack, st;
+	int us;
+
+	for (us = 0; us < 10000; us += 10) {
+		st = bus_read_4(sc->mem_res, SDHCI_QCOM_PWRCTL_STATUS) & 0xf;
+		if (st != 0)
+			break;
+		DELAY(10);
+	}
+	if (st == 0)
+		return;
+	bus_write_4(sc->mem_res, SDHCI_QCOM_PWRCTL_CLEAR, st);
+	ack = 0;
+	if ((st & SDHCI_QCOM_REQ_BUS) != 0)
+		ack |= SDHCI_QCOM_BUS_SUCCESS;
+	if ((st & SDHCI_QCOM_REQ_IO) != 0)
+		ack |= SDHCI_QCOM_IO_SUCCESS;
+	bus_write_4(sc->mem_res, SDHCI_QCOM_PWRCTL_CTL, ack);
+}
+
 static void
 sdhci_acpi_write_1(device_t dev, struct sdhci_slot *slot __unused,
     bus_size_t off, uint8_t val)
@@ -125,6 +181,9 @@ sdhci_acpi_write_1(device_t dev, struct sdhci_slot *slot __unused,
 	bus_barrier(sc->mem_res, 0, 0xFF,
 	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
 	bus_write_1(sc->mem_res, off, val);
+	if ((sc->acpi_dev->flags & SDHCI_ACPI_QCOM) != 0 &&
+	    (off == SDHCI_POWER_CONTROL || off == SDHCI_SOFTWARE_RESET))
+		sdhci_acpi_qcom_pwrctl(sc);
 }
 
 static uint16_t
@@ -147,6 +206,9 @@ sdhci_acpi_write_2(device_t dev, struct sdhci_slot *slot __unused,
 	bus_barrier(sc->mem_res, 0, 0xFF,
 	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
 	bus_write_2(sc->mem_res, off, val);
+	if ((sc->acpi_dev->flags & SDHCI_ACPI_QCOM) != 0 &&
+	    off == SDHCI_HOST_CONTROL2)
+		sdhci_acpi_qcom_pwrctl(sc);
 }
 
 static uint32_t
@@ -321,6 +383,20 @@ sdhci_acpi_attach(device_t dev)
 	    SDHCI_READ_4(dev, &sc->slot, SDHCI_CAPABILITIES) == 0x446cc8b2 &&
 	    SDHCI_READ_4(dev, &sc->slot, SDHCI_CAPABILITIES2) == 0x00000807)
 		quirks |= SDHCI_QUIRK_MMC_DDR52 | SDHCI_QUIRK_DATA_TIMEOUT_1MHZ;
+	/*
+	 * Qualcomm: take the power control requests, and leave out 1.8 V
+	 * signalling and the UHS modes that need it, whose supply the
+	 * firmware keeps at 3 V.
+	 */
+	if ((acpi_dev->flags & SDHCI_ACPI_QCOM) != 0) {
+		bus_write_4(sc->mem_res, SDHCI_QCOM_PWRCTL_CLEAR, 0xf);
+		bus_write_4(sc->mem_res, SDHCI_QCOM_PWRCTL_MASK, 0xf);
+		sc->slot.caps = bus_read_4(sc->mem_res, SDHCI_CAPABILITIES) &
+		    ~SDHCI_CAN_VDD_180;
+		sc->slot.caps2 = bus_read_4(sc->mem_res,
+		    SDHCI_CAPABILITIES2) & ~(SDHCI_CAN_SDR50 |
+		    SDHCI_CAN_SDR104 | SDHCI_CAN_DDR50);
+	}
 	quirks &= ~sdhci_quirk_clear;
 	quirks |= sdhci_quirk_set;
 	sc->slot.quirks = quirks;
