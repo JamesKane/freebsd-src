@@ -104,4 +104,11 @@ struct x86_cpu_id {
 /* struct usb_device_id is defined in sys/dev/usb/usbdi.h. */
 /* MODULE_DEVICE_TABLE_BUS_usb we have in usb.h. */
 
+#define	PLATFORM_NAME_SIZE	20
+
+struct platform_device_id {
+	char		name[PLATFORM_NAME_SIZE];
+	kernel_ulong_t	driver_data;
+};
+
 #endif	/* __LINUXKPI_LINUX_MOD_DEVICETABLE_H__ */

@@ -411,6 +411,9 @@ _ioremap_attr(vm_paddr_t _phys_addr, unsigned long _size, int _attr)
 
 struct device;
 #define	devm_ioremap(...)	linuxkpi_devm_ioremap(__VA_ARGS__)
+struct resource;
+void __iomem *devm_ioremap_resource(struct device *dev,
+    const struct resource *res);
 void *linuxkpi_devm_ioremap(struct device *dev, resource_size_t offset,
     resource_size_t size);
 
