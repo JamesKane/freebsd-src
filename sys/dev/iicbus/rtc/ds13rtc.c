@@ -473,15 +473,16 @@ errout:
 static int
 ds13rtc_get_chiptype(device_t dev)
 {
-#ifdef FDT
-
-	return (ofw_bus_search_compatible(dev, compat_data)->ocd_data);
-#else
 	ds13_compat_data *cdata;
 	const char *htype; 
 
+#ifdef FDT
+	if (ofw_bus_get_node(dev) != -1)
+		return (ofw_bus_search_compatible(dev, compat_data)->ocd_data);
+#endif
 	/*
-	 * We can only attach if provided a chiptype hint string.
+	 * Without a device tree node, as on ACPI systems, we can only attach
+	 * if provided a chiptype hint string.
 	 */
 	if (resource_string_value(device_get_name(dev), 
 	    device_get_unit(dev), "compatible", &htype) != 0)
@@ -496,7 +497,6 @@ ds13rtc_get_chiptype(device_t dev)
 			break;
 	}
 	return (cdata->ocd_data);
-#endif
 }
 
 static int
@@ -505,12 +505,13 @@ ds13rtc_probe(device_t dev)
 	int chiptype, goodrv;
 
 #ifdef FDT
-	if (!ofw_bus_status_okay(dev))
-		return (ENXIO);
-	goodrv = BUS_PROBE_GENERIC;
-#else
-	goodrv = BUS_PROBE_NOWILDCARD;
+	if (ofw_bus_get_node(dev) != -1) {
+		if (!ofw_bus_status_okay(dev))
+			return (ENXIO);
+		goodrv = BUS_PROBE_GENERIC;
+	} else
 #endif
+		goodrv = BUS_PROBE_NOWILDCARD;
 
 	chiptype = ds13rtc_get_chiptype(dev);
 	if (chiptype == TYPE_NONE)
