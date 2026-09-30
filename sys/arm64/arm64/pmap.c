@@ -963,6 +963,7 @@ pmap_pte_memattr(pmap_t pmap, vm_memattr_t memattr)
 		return (ATTR_S2_MEMATTR(ATTR_S2_MEMATTR_DEVICE_nGnRnE) |
 		    ATTR_S2_XN(ATTR_S2_XN_ALL));
 	case VM_MEMATTR_UNCACHEABLE:
+	case VM_MEMATTR_WRITE_COMBINING:
 		return (ATTR_S2_MEMATTR(ATTR_S2_MEMATTR_NC));
 	case VM_MEMATTR_WRITE_BACK:
 		return (ATTR_S2_MEMATTR(ATTR_S2_MEMATTR_WB));
@@ -8910,7 +8911,8 @@ pmap_change_props_locked(void *addr, vm_size_t size, vm_prot_t prot,
 			 * If moving to a non-cacheable entry flush
 			 * the cache.
 			 */
-			if (mode == VM_MEMATTR_UNCACHEABLE)
+			if (mode == VM_MEMATTR_UNCACHEABLE ||
+			    mode == VM_MEMATTR_WRITE_COMBINING)
 				cpu_dcache_wbinv_range((void *)tmpva, pte_size);
 			tmpva += pte_size;
 		}
@@ -10494,6 +10496,9 @@ sysctl_kmaps_dump(struct sbuf *sb, struct pmap_kernel_map_range *range,
 		break;
 	case ATTR_S1_IDX(VM_MEMATTR_TAGGED):
 		mode = "TAGGED";
+		break;
+	case ATTR_S1_IDX(VM_MEMATTR_WRITE_COMBINING):
+		mode = "WC";
 		break;
 	default:
 		printf(

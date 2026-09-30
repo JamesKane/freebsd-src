@@ -34,7 +34,8 @@
 #define	VM_MEMATTR_WRITE_THROUGH	3
 #define	VM_MEMATTR_DEVICE_nGnRE		4
 #define	VM_MEMATTR_TAGGED		5
-#define	VM_MEMATTR_END			(VM_MEMATTR_TAGGED + 1)
+#define	VM_MEMATTR_WRITE_COMBINING	6	/* Normal non-cacheable */
+#define	VM_MEMATTR_END			(VM_MEMATTR_WRITE_COMBINING + 1)
 
 #define	VM_MEMATTR_DEVICE		VM_MEMATTR_DEVICE_nGnRE
 #define	VM_MEMATTR_DEVICE_NP		VM_MEMATTR_DEVICE_nGnRnE
@@ -42,9 +43,6 @@
 #define	VM_MEMATTR_DEFAULT		VM_MEMATTR_WRITE_BACK
 
 #ifdef _KERNEL
-/* If defined vmstat will try to use both of these in a switch statement */
-#define	VM_MEMATTR_WRITE_COMBINING	VM_MEMATTR_WRITE_THROUGH
-
 #ifndef LOCORE
 #include <sys/_null.h>
 
@@ -64,6 +62,8 @@ vm_memattr_name(vm_memattr_t memattr)
 		return ("device-nGnRE");
 	case VM_MEMATTR_TAGGED:
 		return ("tagged");
+	case VM_MEMATTR_WRITE_COMBINING:
+		return ("write-combining");
 	default:
 		return (NULL);
 	}
