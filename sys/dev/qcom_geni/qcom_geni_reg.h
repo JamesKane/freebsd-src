@@ -73,6 +73,8 @@
  * A single 8-bit word per FIFO entry, LSB first, is one vector of 0xf.
  */
 #define	GENI_PACKING_1x8		0x0000000f
+/* The same, most significant bit first, as I2C sends it: start at bit 7. */
+#define	GENI_PACKING_1x8_MSB		0x000000ff
 
 /* Primary (M) sequencer */
 #define	GENI_M_CMD0			0x0600

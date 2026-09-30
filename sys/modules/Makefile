@@ -345,6 +345,7 @@ SUBDIR=	\
 	${_qcom_adsp} \
 	${_qcom_cmd_db} \
 	${_qcom_epss} \
+	${_qcom_geni_i2c} \
 	${_qcom_gpucc} \
 	${_qcom_scm} \
 	${_qcom_smmu} \
@@ -753,6 +754,7 @@ _em=		em
 _qcom_adsp=	qcom_adsp
 _qcom_cmd_db=	qcom_cmd_db
 _qcom_epss=	qcom_epss
+_qcom_geni_i2c=	qcom_geni_i2c
 _qcom_gpucc=	qcom_gpucc
 _qcom_scm=	qcom_scm
 _qcom_smmu=	qcom_smmu
