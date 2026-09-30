@@ -2,6 +2,7 @@
 
 KMOD=	linuxkpi
 SRCS=	linux_compat.c \
+	linux_component.c \
 	linux_current.c \
 	linux_devres.c \
 	linux_dmi.c \
