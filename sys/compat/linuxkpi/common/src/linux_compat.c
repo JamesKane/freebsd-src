@@ -95,6 +95,7 @@
 #include <linux/smp.h>
 #include <linux/wait_bit.h>
 #include <linux/rcupdate.h>
+#include <linux/pm_runtime.h>
 #include <linux/interval_tree.h>
 #include <linux/interval_tree_generic.h>
 #include <linux/printk.h>
@@ -259,6 +260,7 @@ linux_dev_release(struct kobject *kobj)
 	struct device *dev;
 
 	dev = container_of(kobj, struct device, kobj);
+	lkpi_pm_runtime_release(dev);
 	/* This is the precedence defined by linux. */
 	if (dev->release)
 		dev->release(dev);

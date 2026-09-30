@@ -47,9 +47,12 @@ typedef struct pm_message {
 struct dev_pm_domain {
 };
 
+struct lkpi_rpm;
+
 struct dev_pm_info {
 	atomic_t usage_count;
 	bool can_wakeup;
+	struct lkpi_rpm *lkpi_rpm;	/* runtime PM, made on first use */
 };
 
 #define	PM_EVENT_FREEZE		0x0001

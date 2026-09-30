@@ -26,6 +26,7 @@ SRCS=	linux_compat.c \
 	linuxkpi_page_pool.c \
 	linux_pci.c \
 	linux_platform.c \
+	linux_pm_runtime.c \
 	linux_radix.c \
 	linux_rcu.c \
 	linux_schedule.c \
