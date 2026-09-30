@@ -4,6 +4,7 @@ MAN=	\
 	armv8crypto.4 \
 	enetc.4 \
 	felix.4 \
+	qcom_adsp.4 \
 	qcom_epss.4 \
 	qcom_scm.4 \
 	qcom_tsens.4 \

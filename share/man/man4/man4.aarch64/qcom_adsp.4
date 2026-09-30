@@ -1,0 +1,107 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd September 30, 2026
+.Dt QCOM_ADSP 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_adsp
+.Nd "Qualcomm audio DSP loader"
+.Sh SYNOPSIS
+To compile this driver into the kernel,
+place the following lines in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device qcom_scm"
+.Cd "device qcom_adsp"
+.Ed
+.Pp
+Alternatively, to load the driver as a
+module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+qcom_adsp_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver starts the audio DSP (ADSP) of Qualcomm Snapdragon systems-on-chip
+with its board's firmware.
+It loads the firmware into the memory reserved for the ADSP, and has the
+TrustZone firmware authenticate it and start the ADSP through
+.Xr qcom_scm 4 .
+The firmware is read once the root file system is mounted, from a
+.Xr firmware 9
+module named after the file's path in linux-firmware with
+.Ql / ,
+.Ql \&.
+and
+.Ql -
+turned into
+.Ql _ ,
+or from
+.Pa /boot/firmware .
+.Pp
+The firmware is specific to each board, which the driver recognizes by its
+SMBIOS system maker and product.
+On the Radxa Dragon Q8B, the ADSP runs Radxa's fan control, which parks the
+fan when the system is cool; without the ADSP the fan runs at full speed.
+.Pp
+The driver does not otherwise communicate with the ADSP, and cannot stop
+it: it cannot be detached while the ADSP runs.
+.Sh HARDWARE
+The
+.Nm
+driver attaches to the ACPI device with hardware ID
+.Qq QCOM061B
+on the following boards:
+.Pp
+.Bl -bullet -compact
+.It
+Radxa Dragon Q8B (Qualcomm Snapdragon 8cx Gen 3, SC8280XP),
+with firmware
+.Pa qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn .
+.El
+.Sh SYSCTL VARIABLES
+.Bl -tag -width indent
+.It Va dev.qcom_adsp.%d.state
+Whether the ADSP is waiting to start, starting, running or stopped, or
+why it failed to start.
+.El
+.Sh SEE ALSO
+.Xr qcom_scm 4 ,
+.Xr qcom_tsens 4 ,
+.Xr firmware 9
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
