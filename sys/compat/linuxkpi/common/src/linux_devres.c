@@ -57,8 +57,9 @@ lkpi_devres_alloc(void(*release)(struct device *, void *),
 	if (size == 0)
 		return (NULL);
 
+	/* As in Linux, the resource's data starts zeroed. */
 	total = sizeof(*dr) + size;
-	dr = kmalloc(total, gfp);
+	dr = kmalloc(total, gfp | __GFP_ZERO);
 	if (dr == NULL)
 		return (NULL);
 
