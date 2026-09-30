@@ -5,8 +5,12 @@
 # Qualcomm Snapdragon drivers
 device		qcom_epss		# EPSS CPU frequency control
 device		qcom_gcc		# Global Clock Controller
+device		qcom_geni_i2c		# GENI I2C controllers
 device		qcom_mdio		# MDIO support
 device		qcom_tsens		# TSENS temperature sensors
+
+# Real-time clocks on Qualcomm boards' I2C buses
+device		ds13rtc			# DS13xx and compatible (Radxa Dragon Q8B)
 
 # Serial (COM) ports
 device		uart_msm		# Qualcomm MSM UART driver
