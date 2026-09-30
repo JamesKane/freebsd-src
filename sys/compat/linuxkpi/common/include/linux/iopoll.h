@@ -43,7 +43,7 @@
 	}									\
 										\
 	if ((_early_sleep) && (_us) > 0)					\
-		usleep_range(_us, _us);						\
+		usleep_range(((_us) >> 2) + 1, _us);				\
 	do {									\
 		(_var) = _pollfp(__VA_ARGS__);					\
 		if (_cond)							\
@@ -54,7 +54,7 @@
 				break;						\
 		}								\
 		if ((_us) != 0)							\
-			usleep_range(_us, _us);					\
+			usleep_range(((_us) >> 2) + 1, _us);			\
 	} while (1);								\
 	(_cond) ? 0 : (-ETIMEDOUT);						\
 })

@@ -75,7 +75,13 @@ usleep_range_state(unsigned long min, unsigned long max, unsigned int state)
 	/* guard against invalid values */
 	if (min == 0)
 		min = 1;
-	pause_sbt("lnxsleep", ustosbt(min), 0, C_HARDCLOCK);
+	if (max < min)
+		max = min;
+	/*
+	 * As in Linux, a high resolution sleep of at least min, with the
+	 * time to max as slack; not rounded up to a hardclock tick.
+	 */
+	pause_sbt("lnxsleep", ustosbt(min), ustosbt(max - min), 0);
 }
 
 static inline void
