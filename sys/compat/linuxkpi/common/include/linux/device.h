@@ -103,6 +103,11 @@ struct device_type {
 	const char	*name;
 };
 
+/* The bus a device is on, which tells e.g. PCI devices apart. */
+struct bus_type {
+	const char	*name;
+};
+
 struct device {
 	struct device	*parent;
 	struct list_head irqents;
@@ -117,6 +122,7 @@ struct device {
 	bool		bsddev_attached_here;
 	struct device_driver *driver;
 	struct device_type *type;
+	const struct bus_type *bus;
 	dev_t		devt;
 	struct class	*class;
 	void		(*release)(struct device *dev);

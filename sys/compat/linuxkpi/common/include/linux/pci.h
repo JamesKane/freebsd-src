@@ -400,10 +400,16 @@ int _lkpi_pci_enable_msi_range(struct pci_dev *pdev, int minvec, int maxvec);
 #define	pci_info(pdev, fmt, ...)					\
     dev_info(&(pdev)->dev, fmt, ##__VA_ARGS__)
 
+extern const struct bus_type pci_bus_type;
+
+/*
+ * Whether dev is a PCI function's device.  The FreeBSD device it stands for
+ * need not be a child of pci(4): DRM drivers attach below vgapci(4).
+ */
 static inline bool
 dev_is_pci(struct device *dev)
 {
-	return (is_pci_device(dev->bsddev));
+	return (dev != NULL && dev->bus == &pci_bus_type);
 }
 
 static inline uint16_t

@@ -431,6 +431,8 @@ lkpi_pci_dev_release(struct device *dev)
 	pdev->dev.release = NULL;
 }
 
+const struct bus_type pci_bus_type = { .name = "pci" };
+
 static int
 lkpifill_pci_dev(device_t dev, struct pci_dev *pdev)
 {
@@ -474,6 +476,7 @@ lkpifill_pci_dev(device_t dev, struct pci_dev *pdev)
 		pdev->bus->self = pdev;
 	}
 	lkpi_device_init(&pdev->dev, NULL, dev);
+	pdev->dev.bus = &pci_bus_type;
 	pdev->dev.release = lkpi_pci_dev_release;
 
 	if (pci_msi_count(dev) > 0)
