@@ -40,13 +40,22 @@
 
 typedef	irqreturn_t	(*irq_handler_t)(int, void *);
 
-#define	IRQF_SHARED		0x0004	/* Historically */
-#define	IRQF_NOBALANCING	0
+/* As in Linux; LinuxKPI acts on IRQF_SHARED and IRQF_NO_AUTOEN. */
+#define	IRQF_TRIGGER_NONE	0x00000000
+#define	IRQF_TRIGGER_RISING	0x00000001
+#define	IRQF_TRIGGER_FALLING	0x00000002
+#define	IRQF_TRIGGER_HIGH	0x00000004
+#define	IRQF_TRIGGER_LOW	0x00000008
+#define	IRQF_SHARED		0x00000080
+#define	IRQF_NOBALANCING	0x00000800
+#define	IRQF_NO_AUTOEN		0x00080000
 
 #define	IRQ_DISABLE_UNLAZY	0
 
 #define	IRQ_NOTCONNECTED	(1U << 31)
 
+/* The platform device an IRQ number belongs to, or NULL. */
+struct device *lkpi_platform_find_irq_dev(unsigned int);
 int  lkpi_request_irq(struct device *, unsigned int, irq_handler_t,
 	irq_handler_t, unsigned long, const char *, void *);
 int  lkpi_enable_irq(unsigned int);

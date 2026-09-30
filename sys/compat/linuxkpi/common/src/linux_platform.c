@@ -42,6 +42,7 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/idr.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/list.h>
@@ -377,6 +378,33 @@ platform_get_resource_byname(struct platform_device *pdev, unsigned int type,
 		    strcmp(pdev->resource[i].name, name) == 0)
 			return (&pdev->resource[i]);
 	return (NULL);
+}
+
+/*
+ * A platform device's IRQ numbers are those of its FreeBSD device's IRQ
+ * resources: the device whose IRQ resource irq is.
+ */
+struct device *
+lkpi_platform_find_irq_dev(unsigned int irq)
+{
+	struct platform_device *pdev;
+	struct device *found = NULL;
+	u32 i;
+
+	/* Exclusive: drivers request IRQs from probe(), with it held. */
+	sx_xlock(&lkpi_platform_lock);
+	list_for_each_entry(pdev, &lkpi_platform_devices, lkpi_link) {
+		for (i = 0; i < pdev->num_resources; i++) {
+			if (lkpi_resource_type(&pdev->resource[i]) ==
+			    IORESOURCE_IRQ && pdev->resource[i].start == irq) {
+				found = &pdev->dev;
+				goto out;
+			}
+		}
+	}
+out:
+	sx_xunlock(&lkpi_platform_lock);
+	return (found);
 }
 
 int
