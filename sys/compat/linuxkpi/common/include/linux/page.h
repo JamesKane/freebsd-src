@@ -82,12 +82,7 @@ pgprot2cachemode(pgprot_t prot)
 
 #define	pgprot_noncached(prot)		\
 	(((prot) & VM_PROT_ALL) | cachemode2protval(VM_MEMATTR_UNCACHEABLE))
-/*
- * arm64's VM_MEMATTR_WRITE_COMBINING is write-through, which still caches
- * reads; Linux's write-combining there is Normal non-cacheable, which
- * drivers for non-coherent devices rely on to see what the device wrote.
- */
-#if defined(VM_MEMATTR_WRITE_COMBINING) && !defined(__aarch64__)
+#ifdef VM_MEMATTR_WRITE_COMBINING
 #define	pgprot_writecombine(prot)	\
 	(((prot) & VM_PROT_ALL) | cachemode2protval(VM_MEMATTR_WRITE_COMBINING))
 #else
