@@ -18,6 +18,7 @@ device		uart_qcom_geni		# Qualcomm GENI UART
 
 # TLMM driver
 device		qcom_tlmm
+device		qcom_tlmm_acpi		# its GPIOs, under ACPI
 
 # MMC/SD/SDIO Card slot support
 device		sdhci

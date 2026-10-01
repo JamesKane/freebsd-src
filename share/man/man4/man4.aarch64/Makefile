@@ -8,6 +8,7 @@ MAN=	\
 	qcom_epss.4 \
 	qcom_geni_i2c.4 \
 	qcom_scm.4 \
+	qcom_tlmm_acpi.4 \
 	qcom_tsens.4 \
 	rk_gpio.4 \
 	rk_grf.4 \

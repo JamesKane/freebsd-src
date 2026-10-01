@@ -1,0 +1,102 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd October 1, 2026
+.Dt QCOM_TLMM_ACPI 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_tlmm_acpi
+.Nd "Qualcomm TLMM GPIO controller driver for ACPI systems"
+.Sh SYNOPSIS
+To compile this driver into the kernel,
+place the following lines in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device gpio"
+.Cd "device qcom_tlmm_acpi"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver provides a
+.Xr gpiobus 4
+for the general purpose I/O pins of the top level mode multiplexer
+(TLMM) of a Qualcomm Snapdragon system-on-chip that boots with ACPI.
+It takes the pins as the firmware leaves them, each already in the
+function and with the pull its board needs.
+Pins in a function other than GPIO can be read but not changed;
+the driver never changes a pin's function.
+.Pp
+The DSDT of these machines lists GPIO consumers from Qualcomm's
+reference design, which a board may not share.
+The ACPI GPIO bus applies every listed pin's configuration when it
+attaches; the
+.Nm
+driver ignores that, and takes configuration only from the drivers and
+programs using a pin afterwards.
+Pins the secure world owns, whose registers fault when touched, are not
+offered.
+.Pp
+The
+.Xr sdhci 4
+driver for the SoCs' SD controllers uses
+.Nm
+for card detection.
+.Sh HARDWARE
+The
+.Nm
+driver attaches to ACPI devices with hardware ID
+.Qq QCOM060C
+on the systems-on-chip it knows, which the DSDT's
+.Va \e_SB.SOID
+identifies:
+.Pp
+.Bl -bullet -compact
+.It
+Qualcomm Snapdragon 8cx Gen 3 (SC8280XP), 228 pins
+.El
+.Pp
+It has been tested on the Radxa Dragon Q8B.
+.Sh SEE ALSO
+.Xr gpio 3 ,
+.Xr gpio 4 ,
+.Xr gpiobus 4 ,
+.Xr sdhci 4 ,
+.Xr gpioctl 8
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
+.Sh BUGS
+Pin interrupts are not supported, so ACPI GPIO events and
+.Qq GpioInt
+resources do not work.
