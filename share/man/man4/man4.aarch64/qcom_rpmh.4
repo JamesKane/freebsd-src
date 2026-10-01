@@ -1,0 +1,90 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd October 1, 2026
+.Dt QCOM_RPMH 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_rpmh
+.Nd "Qualcomm RPMh request driver"
+.Sh SYNOPSIS
+To load the driver as a module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+qcom_rpmh_load="YES"
+.Ed
+.Sh DESCRIPTION
+On Qualcomm Snapdragon systems-on-chip, the power rails and the
+interconnects' bandwidth are set by the RPMh, which aggregates the votes of
+every processor.
+The
+.Nm
+driver sends the application processors' votes, as Linux's rpmh-rsc
+driver does: each is written into one of the active TCSs of the
+application processors' RSC, triggered, and waited for.
+Only active-only votes are sent; they hold until changed, including while
+the processors sleep.
+.Pp
+Other drivers vote a power rail, an ARC resource, to a level, or an
+interconnect node, a BCM, to a bandwidth, by the resource's name in the
+command DB, the firmware's table of RPMh resources, which also holds each
+rail's levels.
+.Pp
+The RSC is not described by ACPI; its registers come from a table of
+systems-on-chip, which the DSDT's
+.Va \e_SB.SOID
+identifies.
+.Sh SYSCTL VARIABLES
+.Bl -tag -width indent
+.It Va hw.qcom_rpmh.vote_max
+Written with a resource's name, votes a rail, such as
+.Qq nsp.lvl ,
+to its highest level, or a BCM, such as
+.Qq NSA0 ,
+to its highest peak bandwidth.
+For bring-up and testing; the vote stays until reboot.
+.El
+.Sh HARDWARE
+The
+.Nm
+driver supports the Qualcomm Snapdragon 8cx Gen 3 (SC8280XP).
+It has been tested on the Radxa Dragon Q8B.
+.Sh SEE ALSO
+.Xr qcom_adsp 4
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
+.Sh BUGS
+Sleep and wake votes, and dropping a vote by its owner, are not
+supported.
+The module cannot be unloaded.

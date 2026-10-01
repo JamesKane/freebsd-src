@@ -346,6 +346,7 @@ SUBDIR=	\
 	${_qcom_audio} \
 	${_qcom_glink} \
 	${_qcom_pmic_glink} \
+	${_qcom_rpmh} \
 	${_qcom_cmd_db} \
 	${_qcom_epss} \
 	${_qcom_geni_i2c} \
@@ -758,6 +759,7 @@ _qcom_adsp=	qcom_adsp
 _qcom_audio=	qcom_audio
 _qcom_glink=	qcom_glink
 _qcom_pmic_glink=	qcom_pmic_glink
+_qcom_rpmh=	qcom_rpmh
 _qcom_cmd_db=	qcom_cmd_db
 _qcom_epss=	qcom_epss
 _qcom_geni_i2c=	qcom_geni_i2c
