@@ -60,6 +60,7 @@
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
 
+#include <dev/qcom_audio/qcom_apm.h>
 #include <dev/qcom_audio/qcom_apps_smmu.h>
 #include <dev/qcom_audio/qcom_gpr.h>
 #include <dev/qcom_audio/qcom_wcd938x.h>
@@ -128,6 +129,9 @@ static MALLOC_DEFINE(M_APM, "qcom_apm", "Qualcomm APM");
 #define	DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2	0x0400100a
 #define	DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 0x05001004
 #define	WR_SH_MEM_NO_TIMESTAMP	0xff00
+/* A write's token: ours in the low half, the length in the high. */
+#define	APM_WRITE_TOKEN_MASK		0xffff
+#define	APM_WRITE_TOKEN_LEN_SHIFT	16
 
 /* Ports of ours for each graph's packets */
 #define	APM_GRAPH_PORT_BASE			0x10000000
@@ -268,6 +272,7 @@ static struct {
 	struct apm_topology	*tp;
 	struct qcom_gpr_port	*port;	/* the APM's */
 	struct qcom_apps_smmu_dom *dom;	/* the DSP's way into our memory */
+	bool			busy;	/* playing */
 } apm;
 
 SX_SYSINIT(qcom_apm, &apm.lock, "qcom_apm");
@@ -294,6 +299,14 @@ apm_find_board(void)
 	freeenv(maker);
 	freeenv(product);
 	return (b);
+}
+
+/* Whether this is a board whose audio we know. */
+bool
+qcom_apm_supported(void)
+{
+
+	return (apm_find_board() != NULL);
 }
 
 struct tplg_tuples {
@@ -1097,9 +1110,8 @@ apm_unmap(uint32_t handle)
 
 /* Graphs */
 
-static void
-apm_graph_rx(void *arg, const struct qcom_gpr_hdr *hdr, const void *payload,
-    size_t len);
+static void	apm_graph_rx(void *arg, const struct qcom_gpr_hdr *hdr,
+		    const void *payload, size_t len);
 
 static int
 apm_graph_init(struct apm_graph *g, uint32_t id)
@@ -1152,36 +1164,39 @@ apm_mixer(const char *widget, const char *control)
 	return (NULL);
 }
 
-/* The test tone: a stream graph to a device graph, from a sine table. */
+/*
+ * Playback: the MultiMedia1 stream graph, fed from a buffer of ours, into
+ * the RX_CODEC_DMA_RX_0 device graph and on through the codec to the
+ * headphones, in Linux's order (q6apm-dai and q6apm-lpass-dais).
+ */
 
-#define	TONE_RATE	48000
-#define	TONE_PERIOD	(TONE_RATE / 100)	/* 10 ms */
-#define	TONE_PERIODS	8
-#define	TONE_FRAME	4			/* 16-bit stereo */
-
-static struct {
-	struct mtx	mtx;
-	struct cv	cv;
-	u_int		done;
-	u_int		errors;
-} tone;
-
-MTX_SYSINIT(qcom_apm_tone, &tone.mtx, "qcom_apm tone", MTX_DEF);
+struct qcom_apm_play {
+	struct apm_graph	fe;	/* the stream graph */
+	struct apm_graph	be;	/* the device graph */
+	struct apm_module	*shm;	/* where samples go in */
+	vm_offset_t		buf;
+	size_t			size;
+	uint64_t		iova;
+	uint64_t		dsp_addr;	/* the buffer, as the DSP has it */
+	uint32_t		handle;		/* of its mapping */
+	qcom_apm_done_t		*done;
+	void			*arg;
+	bool			fe_open, be_open, started;
+};
 
 static void
 apm_graph_rx(void *arg, const struct qcom_gpr_hdr *hdr, const void *payload,
     size_t len)
 {
+	struct apm_graph *g = arg;
+	struct qcom_apm_play *p;
 	const uint32_t *w = payload;
 	u_int i;
 
 	if (hdr->opcode == DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2) {
-		mtx_lock(&tone.mtx);
-		if (len >= 16 && w[3] != 0)
-			tone.errors++;
-		tone.done++;
-		cv_broadcast(&tone.cv);
-		mtx_unlock(&tone.mtx);
+		p = __containerof(g, struct qcom_apm_play, fe);
+		p->done(p->arg, hdr->token & APM_WRITE_TOKEN_MASK,
+		    len >= 16 ? w[3] : 0);
 		return;
 	}
 	printf("qcom_apm: graph port %#x: opcode %#x token %#x from %#x:",
@@ -1189,223 +1204,6 @@ apm_graph_rx(void *arg, const struct qcom_gpr_hdr *hdr, const void *payload,
 	for (i = 0; i < len / 4 && i < 6; i++)
 		printf(" %#x", w[i]);
 	printf("\n");
-}
-
-static int
-apm_write(struct apm_graph *g, struct apm_module *shm, vm_paddr_t pa,
-    uint32_t handle, size_t len, u_int token)
-{
-	uint32_t cmd[11] = { 0 };
-
-	cmd[0] = (uint32_t)pa;
-	cmd[1] = (uint32_t)((uint64_t)pa >> 32);
-	cmd[2] = handle;
-	cmd[3] = len;
-	cmd[6] = WR_SH_MEM_NO_TIMESTAMP;
-	return (qcom_gpr_send(g->port, shm->iid,
-	    DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2, token | len << 16, cmd,
-	    sizeof(cmd)));
-}
-
-/* 1 kHz, quietly, in 48 samples. */
-static const int16_t tone_sine[48] = {
-	0, 535, 1060, 1567, 2045, 2485, 2879, 3219, 3500, 3714, 3858, 3929,
-	3929, 3858, 3714, 3500, 3219, 2879, 2485, 2045, 1567, 1060, 535, 0,
-	-535, -1060, -1567, -2045, -2485, -2879, -3219, -3500, -3714, -3858,
-	-3929, -3929, -3858, -3714, -3500, -3219, -2879, -2485, -2045, -1567,
-	-1060, -535, 0, 0,
-};
-
-/* How far the tone test goes, for finding what a DSP won't take. */
-static u_int apm_tone_steps = 99;
-/* Only the stream graph: the DSP reads our samples, nothing plays them. */
-static u_int apm_tone_stream_only;
-SYSCTL_DECL(_hw_qcom_apm);
-
-#define	TONE_STEP(n, what) do {						\
-	step = (n);							\
-	printf("qcom_apm: tone step %d: %s\n", step, (what));		\
-	if (step > apm_tone_steps)					\
-		goto out;						\
-} while (0)
-
-static int
-apm_tone(u_int seconds)
-{
-	struct apm_graph *fe, *be;
-	struct apm_mixer *mx;
-	struct apm_module *shm;
-	struct apm_pcm_cfg cfg;
-	int16_t *buf;
-	uint64_t iova;
-	vm_paddr_t pa;
-	size_t bufsize, period;
-	uint32_t handle;
-	u_int i, n, sent, total;
-	int error, step;
-
-	fe = malloc(sizeof(*fe), M_APM, M_WAITOK);
-	be = malloc(sizeof(*be), M_APM, M_WAITOK);
-	memset(&cfg, 0, sizeof(cfg));
-	cfg.rate = TONE_RATE;
-	cfg.bits = 16;
-	cfg.channels = 2;
-	cfg.chmap[0] = PCM_CHANNEL_FL;
-	cfg.chmap[1] = PCM_CHANNEL_FR;
-	period = TONE_PERIOD * TONE_FRAME;
-	bufsize = roundup2(period * TONE_PERIODS, PAGE_SIZE);
-	buf = NULL;
-	handle = 0;
-	step = 0;
-
-	mx = apm_mixer("RX_CODEC_DMA_RX_0 Audio Mixer", "MultiMedia1");
-	if (mx == NULL || mx->src_iid == 0 || mx->dst_iid == 0) {
-		printf("qcom_apm: no MultiMedia1 switch to RX_CODEC_DMA_RX_0\n");
-		error = ENOENT;
-		goto free;
-	}
-	error = apm_graph_init(fe, mx->src_graph);
-	if (error == 0)
-		error = apm_graph_init(be, mx->dst_graph);
-	if (error != 0)
-		goto free;
-	be->link_src = mx->src_iid;
-	be->link_dst = mx->dst_iid;
-	shm = apm_graph_module(fe, MODULE_ID_WR_SHARED_MEM_EP);
-	if (shm == NULL) {
-		error = ENOENT;
-		goto ports;
-	}
-
-	/* Samples, where the DSP can read them: mapped into its stream. */
-	buf = kmem_alloc_contig(bufsize, M_WAITOK | M_ZERO, 0,
-	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0, VM_MEMATTR_WRITE_COMBINING);
-	error = qcom_apps_smmu_map(apm.dom, vtophys(buf), bufsize, &iova);
-	if (error != 0) {
-		kmem_free(buf, bufsize);
-		goto ports;
-	}
-	pa = APM_DSP_ADDR(iova);	/* what the DSP knows it by */
-	printf("qcom_apm: tone buffer at %#jx, I/O %#jx\n",
-	    (uintmax_t)vtophys(buf), (uintmax_t)iova);
-	for (i = 0; i < bufsize / sizeof(*buf) / 2; i++)
-		buf[2 * i] = buf[2 * i + 1] = tone_sine[i % 48];
-
-	/* The codec the device graph's DMA feeds: up before the graphs. */
-	TONE_STEP(1, "bring the codec up");
-	if (!apm_tone_stream_only)
-		error = qcom_wcd938x_up();
-	if (error != 0)
-		goto out;
-	/* Source graph first, then sink, as Linux does. */
-	TONE_STEP(2, "open the stream graph");
-	error = apm_graph_open_cmd(fe);
-	if (error != 0)
-		goto out;
-	TONE_STEP(3, "open the device graph");
-	if (!apm_tone_stream_only)
-		error = apm_graph_open_cmd(be);
-	if (error != 0)
-		goto out;
-	TONE_STEP(4, "the device graph's formats");
-	if (!apm_tone_stream_only)
-		error = apm_graph_formats(be, &cfg);
-	if (error != 0)
-		goto out;
-	TONE_STEP(5, "prepare the device graph");
-	if (!apm_tone_stream_only)
-		error = apm_graph_mgmt(be, APM_CMD_GRAPH_PREPARE);
-	if (error != 0)
-		goto out;
-	TONE_STEP(6, "map the buffer");
-	error = apm_map(fe->id, pa, bufsize, &handle);
-	if (error != 0)
-		goto out;
-	TONE_STEP(7, "the stream graph's formats");
-	error = apm_graph_formats(fe, &cfg);
-	if (error != 0)
-		goto out;
-	TONE_STEP(8, "prepare and start the stream graph");
-	error = apm_graph_mgmt(fe, APM_CMD_GRAPH_PREPARE);
-	if (error == 0)
-		error = apm_graph_mgmt(fe, APM_CMD_GRAPH_START);
-	if (error == 0)
-		error = apm_set_volume(fe, VOL_CTRL_UNITY);
-	if (error != 0)
-		goto out;
-	TONE_STEP(9, "headphones on, start the device graph");
-	if (!apm_tone_stream_only)
-		error = qcom_wcd938x_hph(true);
-	if (error == 0 && !apm_tone_stream_only)
-		error = apm_graph_mgmt(be, APM_CMD_GRAPH_START);
-	if (error != 0)
-		goto out;
-
-	/* Keep every period queued until enough have played. */
-	TONE_STEP(10, "write the samples");
-	mtx_lock(&tone.mtx);
-	tone.done = tone.errors = 0;
-	mtx_unlock(&tone.mtx);
-	total = seconds * 100;
-	for (sent = 0; sent < TONE_PERIODS && sent < total; sent++) {
-		error = apm_write(fe, shm, pa + (sent % TONE_PERIODS) * period,
-		    handle, period, sent % TONE_PERIODS);
-		if (error != 0) {
-			printf("qcom_apm: tone: write %u: %d\n", sent, error);
-			goto stop;
-		}
-	}
-	mtx_lock(&tone.mtx);
-	while (tone.done < total) {
-		n = tone.done;
-		if (cv_timedwait(&tone.cv, &tone.mtx, hz) == EWOULDBLOCK &&
-		    tone.done == n) {
-			error = ETIMEDOUT;
-			break;
-		}
-		while (sent < total && sent - tone.done < TONE_PERIODS) {
-			mtx_unlock(&tone.mtx);
-			error = apm_write(fe, shm, pa + (sent % TONE_PERIODS) *
-			    period, handle, period, sent % TONE_PERIODS);
-			mtx_lock(&tone.mtx);
-			if (error != 0)
-				break;
-			sent++;
-		}
-		if (error != 0)
-			break;
-	}
-	printf("qcom_apm: tone: %u of %u periods played, %u in error\n",
-	    tone.done, total, tone.errors);
-	mtx_unlock(&tone.mtx);
-stop:
-	if (!apm_tone_stream_only)
-		(void)apm_graph_mgmt(be, APM_CMD_GRAPH_STOP);
-	(void)apm_graph_mgmt(fe, APM_CMD_GRAPH_STOP);
-out:
-	if (error != 0)
-		printf("qcom_apm: tone failed at step %d: %d\n", step, error);
-	/* Close what got opened: the steps before the one stopped at. */
-	if (step > 3 && !apm_tone_stream_only)
-		(void)apm_graph_mgmt(be, APM_CMD_GRAPH_CLOSE);
-	if (step > 2)
-		(void)apm_graph_mgmt(fe, APM_CMD_GRAPH_CLOSE);
-	if (step > 1 && !apm_tone_stream_only)
-		qcom_wcd938x_down();
-	printf("qcom_apm: tone: closed\n");
-	if (handle != 0)
-		(void)apm_unmap(handle);
-	if (buf != NULL) {
-		qcom_apps_smmu_unmap(apm.dom, iova, bufsize);
-		kmem_free(buf, bufsize);
-	}
-ports:
-	apm_graph_fini(fe);
-	apm_graph_fini(be);
-free:
-	free(fe, M_APM);
-	free(be, M_APM);
-	return (error);
 }
 
 static int
@@ -1430,6 +1228,268 @@ apm_setup(void)
 	return (error);
 }
 
+/* Undo what qcom_apm_play_open got done, in reverse. */
+static void
+apm_play_close(struct qcom_apm_play *p)
+{
+
+	sx_assert(&apm.lock, SA_XLOCKED);
+	if (p->started) {
+		(void)apm_graph_mgmt(&p->be, APM_CMD_GRAPH_STOP);
+		(void)apm_graph_mgmt(&p->fe, APM_CMD_GRAPH_STOP);
+	}
+	(void)qcom_wcd938x_hph(false);
+	if (p->be_open)
+		(void)apm_graph_mgmt(&p->be, APM_CMD_GRAPH_CLOSE);
+	if (p->fe_open)
+		(void)apm_graph_mgmt(&p->fe, APM_CMD_GRAPH_CLOSE);
+	if (p->handle != 0)
+		(void)apm_unmap(p->handle);
+	if (p->iova != 0)
+		qcom_apps_smmu_unmap(apm.dom, p->iova, p->size);
+	apm_graph_fini(&p->fe);
+	apm_graph_fini(&p->be);
+	qcom_wcd938x_down();
+	/* Nothing else talks to the APM; let the module unload. */
+	if (apm.port != NULL)
+		qcom_gpr_port_close(apm.port);
+	apm.port = NULL;
+	apm.busy = false;
+	free(p, M_APM);
+}
+
+/*
+ * Start playing 48 kHz 16-bit stereo from buf, which is physically
+ * contiguous and size bytes long, a multiple of the page size: the codec
+ * up, the graphs open and running, and the buffer mapped into the DSP.
+ * Then qcom_apm_play_write hands it periods, and done is called (from a
+ * thread that must not send to the DSP itself) as each has been consumed.
+ * Sleeps.
+ */
+int
+qcom_apm_play_open(vm_offset_t buf, size_t size, qcom_apm_done_t *done,
+    void *arg, struct qcom_apm_play **pp)
+{
+	struct qcom_apm_play *p;
+	struct apm_mixer *mx;
+	struct apm_pcm_cfg cfg;
+	int error;
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.rate = 48000;
+	cfg.bits = 16;
+	cfg.channels = 2;
+	cfg.chmap[0] = PCM_CHANNEL_FL;
+	cfg.chmap[1] = PCM_CHANNEL_FR;
+
+	sx_xlock(&apm.lock);
+	if (apm.busy) {
+		sx_xunlock(&apm.lock);
+		return (EBUSY);
+	}
+	apm.busy = true;
+	p = malloc(sizeof(*p), M_APM, M_WAITOK | M_ZERO);
+	p->buf = buf;
+	p->size = size;
+	p->done = done;
+	p->arg = arg;
+	error = apm_setup();
+	if (error != 0)
+		goto fail;
+	mx = apm_mixer("RX_CODEC_DMA_RX_0 Audio Mixer", "MultiMedia1");
+	if (mx == NULL || mx->src_iid == 0 || mx->dst_iid == 0) {
+		printf("qcom_apm: no MultiMedia1 switch to RX_CODEC_DMA_RX_0\n");
+		error = ENOENT;
+		goto fail;
+	}
+	error = apm_graph_init(&p->fe, mx->src_graph);
+	if (error == 0)
+		error = apm_graph_init(&p->be, mx->dst_graph);
+	if (error != 0)
+		goto fail;
+	p->be.link_src = mx->src_iid;
+	p->be.link_dst = mx->dst_iid;
+	p->shm = apm_graph_module(&p->fe, MODULE_ID_WR_SHARED_MEM_EP);
+	if (p->shm == NULL) {
+		error = ENOENT;
+		goto fail;
+	}
+
+	/* The codec the device graph's DMA feeds: up before the graphs. */
+	error = qcom_wcd938x_up();
+	if (error != 0)
+		goto fail;
+	/* Source graph first, then sink, as Linux does. */
+	error = apm_graph_open_cmd(&p->fe);
+	if (error != 0)
+		goto fail;
+	p->fe_open = true;
+	error = apm_graph_open_cmd(&p->be);
+	if (error != 0)
+		goto fail;
+	p->be_open = true;
+	error = apm_graph_formats(&p->be, &cfg);
+	if (error == 0)
+		error = apm_graph_mgmt(&p->be, APM_CMD_GRAPH_PREPARE);
+	if (error != 0)
+		goto fail;
+
+	error = qcom_apps_smmu_map(apm.dom, vtophys(buf), size, &p->iova);
+	if (error != 0) {
+		p->iova = 0;
+		goto fail;
+	}
+	p->dsp_addr = APM_DSP_ADDR(p->iova);
+	error = apm_map(p->fe.id, p->dsp_addr, size, &p->handle);
+	if (error != 0) {
+		p->handle = 0;
+		goto fail;
+	}
+	error = apm_graph_formats(&p->fe, &cfg);
+	if (error == 0)
+		error = apm_graph_mgmt(&p->fe, APM_CMD_GRAPH_PREPARE);
+	if (error == 0)
+		error = apm_graph_mgmt(&p->fe, APM_CMD_GRAPH_START);
+	if (error != 0)
+		goto fail;
+	p->started = true;
+	error = apm_set_volume(&p->fe, VOL_CTRL_UNITY);
+	if (error == 0)
+		error = qcom_wcd938x_hph(true);
+	if (error == 0)
+		error = apm_graph_mgmt(&p->be, APM_CMD_GRAPH_START);
+	if (error != 0)
+		goto fail;
+	sx_xunlock(&apm.lock);
+	*pp = p;
+	return (0);
+fail:
+	printf("qcom_apm: playback not started: %d\n", error);
+	apm_play_close(p);
+	sx_xunlock(&apm.lock);
+	return (error);
+}
+
+/* Hand the DSP len bytes at off in the buffer; done gets token back. */
+int
+qcom_apm_play_write(struct qcom_apm_play *p, size_t off, size_t len,
+    u_int token)
+{
+	uint32_t cmd[11] = { 0 };
+
+	KASSERT(off + len <= p->size, ("qcom_apm: write past the buffer"));
+	cmd[0] = (uint32_t)(p->dsp_addr + off);
+	cmd[1] = (uint32_t)((p->dsp_addr + off) >> 32);
+	cmd[2] = p->handle;
+	cmd[3] = len;
+	cmd[6] = WR_SH_MEM_NO_TIMESTAMP;
+	return (qcom_gpr_send(p->fe.port, p->shm->iid,
+	    DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2,
+	    (token & APM_WRITE_TOKEN_MASK) | len << APM_WRITE_TOKEN_LEN_SHIFT,
+	    cmd, sizeof(cmd)));
+}
+
+/* Stop: the DSP gives back what it held, then everything comes down. */
+void
+qcom_apm_play_close(struct qcom_apm_play *p)
+{
+
+	sx_xlock(&apm.lock);
+	apm_play_close(p);
+	sx_xunlock(&apm.lock);
+}
+
+/* The test tone, through the playback interface. */
+
+#define	TONE_PERIOD	(48000 / 100 * 4)	/* 10 ms of 16-bit stereo */
+#define	TONE_PERIODS	8
+
+static const int16_t tone_sine[48] = {
+	0, 535, 1060, 1567, 2045, 2485, 2879, 3219, 3500, 3714, 3858, 3929,
+	3929, 3858, 3714, 3500, 3219, 2879, 2485, 2045, 1567, 1060, 535, 0,
+	-535, -1060, -1567, -2045, -2485, -2879, -3219, -3500, -3714, -3858,
+	-3929, -3929, -3858, -3714, -3500, -3219, -2879, -2485, -2045, -1567,
+	-1060, -535, 0, 0,
+};
+
+static struct {
+	struct mtx	mtx;
+	struct cv	cv;
+	u_int		done;
+	u_int		errors;
+} tone;
+
+MTX_SYSINIT(qcom_apm_tone, &tone.mtx, "qcom_apm tone", MTX_DEF);
+
+static void
+apm_tone_done(void *arg __unused, u_int token __unused, uint32_t status)
+{
+
+	mtx_lock(&tone.mtx);
+	if (status != 0)
+		tone.errors++;
+	tone.done++;
+	cv_broadcast(&tone.cv);
+	mtx_unlock(&tone.mtx);
+}
+
+static int
+apm_tone(u_int seconds)
+{
+	struct qcom_apm_play *p;
+	int16_t *buf;
+	size_t size;
+	u_int i, n, sent, total;
+	int error;
+
+	size = round_page(TONE_PERIOD * TONE_PERIODS);
+	buf = kmem_alloc_contig(size, M_WAITOK | M_ZERO, 0, BUS_SPACE_MAXADDR,
+	    PAGE_SIZE, 0, VM_MEMATTR_WRITE_COMBINING);
+	for (i = 0; i < size / sizeof(*buf) / 2; i++)
+		buf[2 * i] = buf[2 * i + 1] = tone_sine[i % nitems(tone_sine)];
+	mtx_lock(&tone.mtx);
+	tone.done = tone.errors = 0;
+	mtx_unlock(&tone.mtx);
+	error = qcom_apm_play_open((vm_offset_t)buf, size, apm_tone_done, NULL,
+	    &p);
+	if (error != 0) {
+		kmem_free(buf, size);
+		return (error);
+	}
+
+	/* Keep every period queued until enough have played. */
+	total = seconds * 100;
+	for (sent = 0; sent < TONE_PERIODS && sent < total && error == 0;
+	    sent++)
+		error = qcom_apm_play_write(p, sent * TONE_PERIOD,
+		    TONE_PERIOD, sent);
+	mtx_lock(&tone.mtx);
+	while (error == 0 && tone.done < total) {
+		n = tone.done;
+		if (cv_timedwait(&tone.cv, &tone.mtx, hz) == EWOULDBLOCK &&
+		    tone.done == n) {
+			error = ETIMEDOUT;
+			break;
+		}
+		while (error == 0 && sent < total &&
+		    sent - tone.done < TONE_PERIODS) {
+			mtx_unlock(&tone.mtx);
+			error = qcom_apm_play_write(p,
+			    (sent % TONE_PERIODS) * TONE_PERIOD, TONE_PERIOD,
+			    sent % TONE_PERIODS);
+			mtx_lock(&tone.mtx);
+			if (error == 0)
+				sent++;
+		}
+	}
+	printf("qcom_apm: tone: %u of %u periods played, %u in error\n",
+	    tone.done, total, tone.errors);
+	mtx_unlock(&tone.mtx);
+	qcom_apm_play_close(p);
+	kmem_free(buf, size);
+	return (error);
+}
+
 static int
 apm_tone_sysctl(SYSCTL_HANDLER_ARGS)
 {
@@ -1441,24 +1501,11 @@ apm_tone_sysctl(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (seconds == 0 || seconds > 60)
 		return (EINVAL);
-	sx_xlock(&apm.lock);
-	error = apm_setup();
-	if (error == 0)
-		error = apm_tone(seconds);
-	/* Nothing else talks to the APM yet; let the module unload. */
-	if (apm.port != NULL)
-		qcom_gpr_port_close(apm.port);
-	apm.port = NULL;
-	sx_xunlock(&apm.lock);
-	return (error);
+	return (apm_tone(seconds));
 }
 
 SYSCTL_NODE(_hw, OID_AUTO, qcom_apm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Qualcomm audio DSP's APM");
-SYSCTL_UINT(_hw_qcom_apm, OID_AUTO, tone_steps, CTLFLAG_RW, &apm_tone_steps,
-    0, "Stop the tone test after this step");
-SYSCTL_UINT(_hw_qcom_apm, OID_AUTO, tone_stream_only, CTLFLAG_RW,
-    &apm_tone_stream_only, 0, "Play the tone into the stream graph only");
 SYSCTL_PROC(_hw_qcom_apm, OID_AUTO, tone, CTLTYPE_UINT | CTLFLAG_RW |
     CTLFLAG_MPSAFE, NULL, 0, apm_tone_sysctl, "IU",
     "Play a 1 kHz tone to the headphones for so many seconds");
@@ -1473,9 +1520,10 @@ qcom_apm_modevent(module_t mod, int type, void *data)
 		return (0);
 	case MOD_UNLOAD:
 		sx_xlock(&apm.lock);
-		if (apm.port != NULL)
-			qcom_gpr_port_close(apm.port);
-		apm.port = NULL;
+		if (apm.busy) {
+			sx_xunlock(&apm.lock);
+			return (EBUSY);
+		}
 		free(apm.tp, M_APM);
 		apm.tp = NULL;
 		sx_xunlock(&apm.lock);
