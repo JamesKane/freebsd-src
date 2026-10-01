@@ -52,6 +52,7 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/vmem.h>
 
 #include <machine/atomic.h>
 
@@ -67,7 +68,7 @@
 #include <machine/cpu.h>
 
 #include <dev/qcom_smmu/qcom_smmu.h>
-#include <dev/qcom_audio/qcom_apps_smmu.h>
+#include <dev/qcom_smmu/qcom_apps_smmu.h>
 
 #define	SMMU_IDR0		0x020
 #define	 IDR0_NUMSMRG(x)	((x) & 0xff)
@@ -133,11 +134,11 @@ static const struct qcom_apps_smmu_soc qcom_apps_smmu_socs[] = {
 
 struct qcom_apps_smmu_dom {
 	uint16_t		sid;
+	uint16_t		mask;
 	u_int			cb;
 	struct qcom_smmu_pt	*pt;
 	vm_paddr_t		l1;	/* the walk's first table */
-	uint64_t		next;	/* the next I/O address to give */
-	u_int			nmaps;
+	vmem_t			*iova;	/* the I/O addresses free */
 };
 
 static struct mtx qcom_apps_smmu_mtx;
@@ -168,7 +169,8 @@ qcom_apps_smmu_find_soc(void)
 
 /* Set up a translating bank for the stream, or find the one it has. */
 int
-qcom_apps_smmu_attach(uint16_t sid, struct qcom_apps_smmu_dom **dp)
+qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
+    struct qcom_apps_smmu_dom **dp)
 {
 	const struct qcom_apps_smmu_soc *soc;
 	struct qcom_apps_smmu_dom *d;
@@ -209,7 +211,7 @@ qcom_apps_smmu_attach(uint16_t sid, struct qcom_apps_smmu_dom **dp)
 			 * leaves it: take its bank over.  Anything else
 			 * already routing the stream is not ours to change.
 			 */
-			if (SMR_ID(smr) != sid || SMR_MASK(smr) != 0 ||
+			if (SMR_ID(smr) != sid || SMR_MASK(smr) != mask ||
 			    S2CR_TYPE(RD(SMMU_S2CR(i))) != S2CR_TYPE_TRANS) {
 				mtx_unlock(&qcom_apps_smmu_mtx);
 				return (EEXIST);
@@ -237,9 +239,11 @@ qcom_apps_smmu_attach(uint16_t sid, struct qcom_apps_smmu_dom **dp)
 
 	d = malloc(sizeof(*d), M_DEVBUF, M_WAITOK | M_ZERO);
 	d->sid = sid;
+	d->mask = mask;
 	d->cb = cb;
 	d->pt = qcom_smmu_pt_create(0);
-	d->next = IOVA_BASE;
+	d->iova = vmem_create("qcom_apps_smmu", IOVA_BASE, IOVA_END - IOVA_BASE,
+	    PAGE_SIZE, 0, M_WAITOK);
 	/*
 	 * This SMMU takes 36-bit addresses (IDR2's IAS and UBS), as Linux
 	 * sets it up: the walk starts at level 1, so the bank is given the
@@ -291,7 +295,7 @@ qcom_apps_smmu_attach(uint16_t sid, struct qcom_apps_smmu_dom **dp)
 		/* Then what points at it, then what makes it live. */
 		WR(SMMU_S2CR(free_smr), cb);
 		wmb();
-		WR(SMMU_SMR(free_smr), SMR_VALID | sid);
+		WR(SMMU_SMR(free_smr), SMR_VALID | (uint32_t)mask << 16 | sid);
 		wmb();
 	}
 	mtx_unlock(&qcom_apps_smmu_mtx);
@@ -319,27 +323,17 @@ int
 qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa, size_t size,
     uint64_t *iovap)
 {
-	uint64_t iova;
+	vmem_addr_t iova;
 	int error;
 
 	size = roundup2(size, PAGE_SIZE);
-	mtx_lock(&qcom_apps_smmu_mtx);
-	if (d->nmaps == 0)
-		d->next = IOVA_BASE;
-	iova = d->next;
-	if (iova + size > IOVA_END) {
-		mtx_unlock(&qcom_apps_smmu_mtx);
+	error = vmem_alloc(d->iova, size, M_BESTFIT | M_NOWAIT, &iova);
+	if (error != 0)
 		return (ENOSPC);
-	}
-	d->next += size;
-	d->nmaps++;
-	mtx_unlock(&qcom_apps_smmu_mtx);
 	/* Uncached: the CPU writes the buffers through a write-combining map. */
 	error = qcom_smmu_map(d->pt, iova, pa, size, QCOM_SMMU_UNCACHED);
 	if (error != 0) {
-		mtx_lock(&qcom_apps_smmu_mtx);
-		d->nmaps--;
-		mtx_unlock(&qcom_apps_smmu_mtx);
+		vmem_free(d->iova, iova, size);
 		return (error);
 	}
 	*iovap = iova;
@@ -350,9 +344,8 @@ void
 qcom_apps_smmu_unmap(struct qcom_apps_smmu_dom *d, uint64_t iova, size_t size)
 {
 
-	qcom_smmu_unmap(d->pt, iova, roundup2(size, PAGE_SIZE));
+	size = roundup2(size, PAGE_SIZE);
+	qcom_smmu_unmap(d->pt, iova, size);
 	qcom_apps_smmu_tlb_flush(d);
-	mtx_lock(&qcom_apps_smmu_mtx);
-	d->nmaps--;
-	mtx_unlock(&qcom_apps_smmu_mtx);
+	vmem_free(d->iova, iova, size);
 }

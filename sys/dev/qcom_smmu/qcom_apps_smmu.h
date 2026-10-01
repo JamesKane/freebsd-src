@@ -25,8 +25,8 @@
  * SUCH DAMAGE.
  */
 
-#ifndef _DEV_QCOM_AUDIO_QCOM_APPS_SMMU_H_
-#define	_DEV_QCOM_AUDIO_QCOM_APPS_SMMU_H_
+#ifndef _DEV_QCOM_SMMU_QCOM_APPS_SMMU_H_
+#define	_DEV_QCOM_SMMU_QCOM_APPS_SMMU_H_
 
 /*
  * A stream through the Qualcomm "apps" SMMU, translated as Linux does it:
@@ -35,10 +35,12 @@
  */
 struct qcom_apps_smmu_dom;
 
-int	qcom_apps_smmu_attach(uint16_t sid, struct qcom_apps_smmu_dom **dp);
+/* The stream, matched with mask (0 for exactly), through a bank of its own. */
+int	qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
+	    struct qcom_apps_smmu_dom **dp);
 int	qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa,
 	    size_t size, uint64_t *iovap);
 void	qcom_apps_smmu_unmap(struct qcom_apps_smmu_dom *d, uint64_t iova,
 	    size_t size);
 
-#endif /* _DEV_QCOM_AUDIO_QCOM_APPS_SMMU_H_ */
+#endif /* _DEV_QCOM_SMMU_QCOM_APPS_SMMU_H_ */

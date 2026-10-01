@@ -812,7 +812,6 @@ dev/qcom_epss/qcom_epss.c			optional qcom_epss acpi | qcom_epss fdt
 dev/qcom_geni/qcom_geni_i2c.c			optional qcom_geni_i2c acpi iicbus
 dev/qcom_tlmm/qcom_tlmm_acpi.c			optional qcom_tlmm_acpi acpi gpio
 dev/qcom_audio/qcom_apm.c			optional qcom_audio qcom_glink
-dev/qcom_audio/qcom_apps_smmu.c		optional qcom_audio acpi
 dev/qcom_audio/qcom_gpr.c			optional qcom_audio qcom_glink
 dev/qcom_audio/qcom_lpass_macro.c		optional qcom_audio qcom_glink
 dev/qcom_audio/qcom_pcm.c			optional qcom_audio qcom_glink sound
@@ -827,6 +826,7 @@ dev/qcom_pmic_glink/qcom_pmic_glink.c		optional qcom_pmic_glink qcom_glink acpi
 dev/qcom_rpmh/qcom_rpmh.c			optional qcom_rpmh qcom_cmd_db acpi
 dev/qcom_gpucc/qcom_gpucc.c			optional qcom_gpucc
 dev/qcom_scm/qcom_scm.c				optional qcom_scm acpi | qcom_scm fdt
+dev/qcom_smmu/qcom_apps_smmu.c		optional qcom_smmu acpi
 dev/qcom_smmu/qcom_smmu.c			optional qcom_smmu acpi
 dev/qcom_tsens/qcom_tsens.c			optional qcom_tsens acpi | qcom_tsens fdt
 dev/qcom_tlmm/qcom_tlmm_debug.c			optional qcom_tlmm gpio

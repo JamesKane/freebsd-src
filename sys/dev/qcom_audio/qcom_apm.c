@@ -61,7 +61,7 @@
 #include <vm/pmap.h>
 
 #include <dev/qcom_audio/qcom_apm.h>
-#include <dev/qcom_audio/qcom_apps_smmu.h>
+#include <dev/qcom_smmu/qcom_apps_smmu.h>
 #include <dev/qcom_audio/qcom_gpr.h>
 #include <dev/qcom_audio/qcom_wcd938x.h>
 
@@ -1216,7 +1216,7 @@ apm_setup(void)
 	if (error != 0)
 		return (error);
 	if (apm.dom == NULL) {
-		error = qcom_apps_smmu_attach(APM_LPASS_STREAM, &apm.dom);
+		error = qcom_apps_smmu_attach(APM_LPASS_STREAM, 0, &apm.dom);
 		if (error != 0) {
 			printf("qcom_apm: the DSP's DMA stream: %d\n", error);
 			return (error);
