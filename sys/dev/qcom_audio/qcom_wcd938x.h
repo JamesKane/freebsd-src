@@ -32,4 +32,8 @@ int	qcom_wcd938x_up(void);
 void	qcom_wcd938x_down(void);
 int	qcom_wcd938x_hph(bool on);
 
+typedef void qcom_wcd938x_jack_t(void *arg, bool plugged);
+void	qcom_wcd938x_jack_notify(qcom_wcd938x_jack_t *cb, void *arg);
+void	qcom_wcd938x_jack_check(void);
+
 #endif /* _DEV_QCOM_AUDIO_QCOM_WCD938X_H_ */

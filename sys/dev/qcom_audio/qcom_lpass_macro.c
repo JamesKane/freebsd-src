@@ -139,7 +139,10 @@ static const uint32_t macro_clocks[] = {
 static struct sx macro_lock;
 SX_SYSINIT(qcom_lpass_macro, &macro_lock, "qcom_lpass_macro");
 static volatile uint32_t *va, *rx, *tx;
-static bool macro_on;
+static bool macro_voted;	/* the LPASS core and digital codec held */
+static bool macro_clocked;
+static bool macro_swr_reset;	/* the SoundWire controllers started */
+static bool macro_hph_on;
 
 static void
 macro_set(volatile uint32_t *m, u_int off, uint32_t mask, uint32_t v)
@@ -149,73 +152,92 @@ macro_set(volatile uint32_t *m, u_int off, uint32_t mask, uint32_t v)
 }
 
 static void
-macro_rx_down(u_int nclk, u_int nvote)
+macro_clocks_off(u_int nclk)
 {
 
 	while (nclk > 0)
 		(void)qcom_prm_clock(macro_clocks[--nclk], 0);
-	if (nvote > 1)
-		(void)qcom_prm_hw_vote(QCOM_PRM_HW_DCODEC, false);
-	if (nvote > 0)
-		(void)qcom_prm_hw_vote(QCOM_PRM_HW_LPASS, false);
 }
 
+/*
+ * The LPASS core and digital codec votes, taken the first time and then
+ * held, as Linux's LPASS pin driver holds them: the macros' state and the
+ * SoundWire pins, and so the codec's wake-up, live on while the clocks are
+ * off.
+ */
+static int
+macro_vote(void)
+{
+	int error;
+
+	if (macro_voted)
+		return (0);
+	error = qcom_prm_hw_vote(QCOM_PRM_HW_LPASS, true);
+	if (error != 0)
+		return (error);
+	error = qcom_prm_hw_vote(QCOM_PRM_HW_DCODEC, true);
+	if (error != 0) {
+		(void)qcom_prm_hw_vote(QCOM_PRM_HW_LPASS, false);
+		return (error);
+	}
+	if (va == NULL) {
+		va = pmap_mapdev(VA_MACRO_BASE, MACRO_SIZE);
+		rx = pmap_mapdev(RX_MACRO_BASE, MACRO_SIZE);
+		tx = pmap_mapdev(TX_MACRO_BASE, MACRO_SIZE);
+	}
+	macro_voted = true;
+	return (0);
+}
+
+/*
+ * The macros' clocks: the codec clocks from the PRM, the VA macro's frame
+ * sync, the RX and TX macros' clocks and frame counters, and the clocks of
+ * the SoundWire controllers behind them.  The macros' registers only answer
+ * while these run.
+ */
 int
-qcom_lpass_macro_rx(bool on)
+qcom_lpass_macro_clocks(bool on)
 {
 	u_int i;
 	int error;
 
 	sx_xlock(&macro_lock);
-	if (on == macro_on) {
+	if (on == macro_clocked) {
 		sx_xunlock(&macro_lock);
 		return (0);
 	}
 	if (!on) {
-		/* The macros' registers only answer while clocked. */
+		KASSERT(!macro_hph_on, ("qcom_lpass_macro: paths still on"));
 		macro_set(rx, RX_SWR_CONTROL, RX_SWR_CLK_EN, 0);
 		macro_set(tx, TX_SWR_CONTROL, TX_SWR_CLK_EN, 0);
 		macro_set(va, VA_SWR_CONTROL, VA_SWR_CLK_EN, 0);
 		macro_set(tx, TX_FS_CNT_CONTROL, TX_FS_CNT_EN, 0);
 		macro_set(tx, TX_MCLK_CONTROL, TX_MCLK_EN, 0);
-		for (i = nitems(rx_hph); i > 0; i--)
-			rx[rx_hph[i - 1].off / 4] = rx_hph[i - 1].dflt;
 		macro_set(rx, RX_FS_CNT_CONTROL, RX_FS_CNT_EN, 0);
 		macro_set(rx, RX_FS_CNT_CONTROL, RX_FS_CNT_CLR, RX_FS_CNT_CLR);
 		macro_set(rx, RX_MCLK_CONTROL, RX_MCLK_EN | RX_MCLK2_EN, 0);
 		macro_set(va, VA_MCLK_CONTROL, VA_MCLK_EN, 0);
 		macro_set(va, VA_FS_CNT_CONTROL, VA_FS_EN, 0);
 		macro_set(va, VA_TOP_CFG0, VA_FS_BROADCAST_EN, 0);
-		macro_rx_down(nitems(macro_clocks), 2);
-		macro_on = false;
+		macro_clocks_off(nitems(macro_clocks));
+		macro_clocked = false;
 		sx_xunlock(&macro_lock);
 		return (0);
 	}
 
 	/* Power first: until then, touching the macros hangs the bus. */
-	error = qcom_prm_hw_vote(QCOM_PRM_HW_LPASS, true);
+	error = macro_vote();
 	if (error != 0) {
-		sx_xunlock(&macro_lock);
-		return (error);
-	}
-	error = qcom_prm_hw_vote(QCOM_PRM_HW_DCODEC, true);
-	if (error != 0) {
-		macro_rx_down(0, 1);
 		sx_xunlock(&macro_lock);
 		return (error);
 	}
 	for (i = 0; i < nitems(macro_clocks); i++) {
 		error = qcom_prm_clock(macro_clocks[i], MACRO_MCLK_HZ);
 		if (error != 0) {
-			macro_rx_down(i, 2);
+			macro_clocks_off(i);
 			sx_xunlock(&macro_lock);
 			return (error);
 		}
-	}
-	if (va == NULL) {
-		va = pmap_mapdev(VA_MACRO_BASE, MACRO_SIZE);
-		rx = pmap_mapdev(RX_MACRO_BASE, MACRO_SIZE);
-		tx = pmap_mapdev(TX_MACRO_BASE, MACRO_SIZE);
 	}
 
 	/* The VA macro's frame sync, which it broadcasts to the others. */
@@ -226,40 +248,78 @@ qcom_lpass_macro_rx(bool on)
 	    VA_FS_EN);
 	macro_set(va, VA_TOP_CFG0, VA_FS_BROADCAST_EN, VA_FS_BROADCAST_EN);
 
-	/* Then the RX macro's clocks and its frame counter. */
+	/* The RX and TX macros' clocks and frame counters. */
 	macro_set(rx, RX_MCLK_CONTROL, RX_MCLK_EN | RX_MCLK2_EN,
 	    RX_MCLK_EN | RX_MCLK2_EN);
 	macro_set(rx, RX_FS_CNT_CONTROL, RX_FS_CNT_CLR, 0);
 	macro_set(rx, RX_FS_CNT_CONTROL, RX_FS_CNT_EN, RX_FS_CNT_EN);
-	for (i = 0; i < nitems(rx_hph); i++)
-		rx[rx_hph[i].off / 4] = rx_hph[i].on;
-
-	/*
-	 * The SoundWire controllers' clocks: the RX macro's for the RX link,
-	 * the TX macro's (with the TX macro's own clock) for the TX link,
-	 * each started with the controller held in reset, as Linux's macro
-	 * probes do.
-	 */
-	macro_set(rx, RX_SWR_CONTROL, RX_SWR_RESET, RX_SWR_RESET);
-	macro_set(rx, RX_SWR_CONTROL, RX_SWR_CLK_EN, RX_SWR_CLK_EN);
-	macro_set(rx, RX_SWR_CONTROL, RX_SWR_RESET, 0);
 	macro_set(tx, TX_TOP_FREQ_MCLK, TX_FREQ_MCLK_9P6, TX_FREQ_MCLK_9P6);
 	macro_set(tx, TX_MCLK_CONTROL, TX_MCLK_EN, TX_MCLK_EN);
 	macro_set(tx, TX_FS_CNT_CONTROL, TX_FS_CNT_EN, TX_FS_CNT_EN);
-	macro_set(tx, TX_SWR_CONTROL, TX_SWR_RESET, TX_SWR_RESET);
+
+	/*
+	 * The SoundWire controllers' clocks: the RX macro's for the RX link,
+	 * the TX and VA macros' for the TX link.  The first time, each
+	 * starts with its controller held in reset, as Linux's macro probes
+	 * do; after that, as Linux's clock gates do, it just runs again, and
+	 * the links resume where they stopped.
+	 */
+	if (!macro_swr_reset) {
+		macro_set(rx, RX_SWR_CONTROL, RX_SWR_RESET, RX_SWR_RESET);
+		macro_set(tx, TX_SWR_CONTROL, TX_SWR_RESET, TX_SWR_RESET);
+		macro_set(va, VA_SWR_CONTROL, VA_SWR_RESET, VA_SWR_RESET);
+	}
+	macro_set(rx, RX_SWR_CONTROL, RX_SWR_CLK_EN, RX_SWR_CLK_EN);
 	macro_set(tx, TX_SWR_CONTROL, TX_SWR_CLK_EN, TX_SWR_CLK_EN);
-	macro_set(tx, TX_SWR_CONTROL, TX_SWR_RESET, 0);
-	/* The VA macro's too, which on this SoC drives the TX link. */
-	macro_set(va, VA_SWR_CONTROL, VA_SWR_RESET, VA_SWR_RESET);
 	macro_set(va, VA_SWR_CONTROL, VA_SWR_CLK_EN, VA_SWR_CLK_EN);
-	macro_set(va, VA_SWR_CONTROL, VA_SWR_RESET, 0);
-	printf("qcom_lpass_macro: RX clocked: VA mclk %#x fs %#x top %#x, "
-	    "RX mclk %#x fs %#x, paths %#x %#x, SoundWire clocks RX %#x TX %#x\n",
-	    va[VA_MCLK_CONTROL / 4], va[VA_FS_CNT_CONTROL / 4],
-	    va[VA_TOP_CFG0 / 4], rx[RX_MCLK_CONTROL / 4],
-	    rx[RX_FS_CNT_CONTROL / 4], rx[0x400 / 4], rx[0x480 / 4],
-	    rx[RX_SWR_CONTROL / 4], tx[TX_SWR_CONTROL / 4]);
-	macro_on = true;
+	if (!macro_swr_reset) {
+		macro_set(rx, RX_SWR_CONTROL, RX_SWR_RESET, 0);
+		macro_set(tx, TX_SWR_CONTROL, TX_SWR_RESET, 0);
+		macro_set(va, VA_SWR_CONTROL, VA_SWR_RESET, 0);
+		macro_swr_reset = true;
+	}
+	macro_clocked = true;
 	sx_xunlock(&macro_lock);
 	return (0);
+}
+
+/* The RX macro's headphone paths, which need the clocks. */
+int
+qcom_lpass_macro_hph(bool on)
+{
+	u_int i;
+
+	sx_xlock(&macro_lock);
+	if (!macro_clocked) {
+		sx_xunlock(&macro_lock);
+		return (ENXIO);
+	}
+	if (on != macro_hph_on) {
+		if (on)
+			for (i = 0; i < nitems(rx_hph); i++)
+				rx[rx_hph[i].off / 4] = rx_hph[i].on;
+		else
+			for (i = nitems(rx_hph); i > 0; i--)
+				rx[rx_hph[i - 1].off / 4] = rx_hph[i - 1].dflt;
+		macro_hph_on = on;
+	}
+	sx_xunlock(&macro_lock);
+	return (0);
+}
+
+/* Give everything up, for unloading. */
+void
+qcom_lpass_macro_release(void)
+{
+
+	(void)qcom_lpass_macro_hph(false);
+	(void)qcom_lpass_macro_clocks(false);
+	sx_xlock(&macro_lock);
+	if (macro_voted) {
+		(void)qcom_prm_hw_vote(QCOM_PRM_HW_DCODEC, false);
+		(void)qcom_prm_hw_vote(QCOM_PRM_HW_LPASS, false);
+		macro_voted = false;
+		macro_swr_reset = false;
+	}
+	sx_xunlock(&macro_lock);
 }

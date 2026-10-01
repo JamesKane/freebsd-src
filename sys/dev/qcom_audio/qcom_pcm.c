@@ -38,6 +38,13 @@
  *
  * The mixer's master volume is the stream's gain in the DSP; sound(4)
  * supplies the PCM control in software.
+ *
+ * The headphone jack: once the DSP is up the codec is brought up and left
+ * idle, watching the jack, and a change wakes its TX link, whose wake-up
+ * interrupt this takes.  While playing, the links run and nothing wakes,
+ * so the jack is looked at every second.  A change shows in
+ * dev.pcm.N.jack and goes to devd(8) as system SND, subsystem JACK, type
+ * INSERT or REMOVE.
  */
 
 #include <sys/param.h>
@@ -46,6 +53,7 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 
 #include <machine/bus.h>
@@ -61,6 +69,8 @@
 #include <dev/sound/pcm/sound.h>
 
 #include <dev/qcom_audio/qcom_apm.h>
+#include <dev/qcom_audio/qcom_swr.h>
+#include <dev/qcom_audio/qcom_wcd938x.h>
 
 #include "channel_if.h"
 #include "mixer_if.h"
@@ -71,6 +81,7 @@
 #define	PCM_MS		(PCM_RATE / 1000 * PCM_FRAME)	/* bytes */
 #define	PCM_BLKSZ	(10 * PCM_MS)
 #define	PCM_AHEAD_MS	40		/* queued with the DSP, about */
+#define	PCM_CODEC_TRIES	120		/* a second apart, for the DSP */
 
 struct qcom_pcm_softc {
 	struct snddev_info	info;	/* first, for sound(4) */
@@ -83,6 +94,13 @@ struct qcom_pcm_softc {
 	struct task		stop_task;
 	struct task		done_task;
 	struct task		vol_task;
+	struct timeout_task	codec_task;	/* bring the codec up */
+	struct task		jack_task;
+	struct timeout_task	jack_poll_task;	/* while playing */
+	struct resource		*wake_res;
+	void			*wake_cookie;
+	u_int			codec_tries;
+	int			jack;		/* -1 unknown, 0 empty, 1 in */
 	struct qcom_apm_play	*play;	/* the task's alone */
 	u_int			blksz;
 	u_int			blkcnt;
@@ -287,6 +305,7 @@ qcom_pcm_start_task(void *arg, int pending __unused)
 	}
 	(void)qcom_apm_play_volume(sc->play, qcom_pcm_gain[sc->volume]);
 	(void)qcom_pcm_fill(sc);
+	taskqueue_enqueue_timeout(sc->tq, &sc->jack_poll_task, hz);
 }
 
 static void
@@ -330,6 +349,69 @@ qcom_pcm_stop_task(void *arg, int pending __unused)
 		return;
 	qcom_apm_play_close(sc->play);
 	sc->play = NULL;
+}
+
+/* The jack */
+
+static void
+qcom_pcm_jack(void *arg, bool plugged)
+{
+	struct qcom_pcm_softc *sc = arg;
+	char buf[32];
+
+	sc->jack = plugged;
+	if (bootverbose)
+		device_printf(sc->dev, "headphone jack %s\n",
+		    plugged ? "in use" : "empty");
+	snprintf(buf, sizeof(buf), "cdev=dsp%d", device_get_unit(sc->dev));
+	devctl_notify("SND", "JACK", plugged ? "INSERT" : "REMOVE", buf);
+}
+
+/* The codec's TX link asks for its clock: something changed at the jack. */
+static void
+qcom_pcm_wake(void *arg)
+{
+	struct qcom_pcm_softc *sc = arg;
+
+	if (qcom_swr_wake_take(QCOM_SWR_TX))
+		taskqueue_enqueue(sc->tq, &sc->jack_task);
+}
+
+static void
+qcom_pcm_jack_task(void *arg, int pending __unused)
+{
+
+	qcom_wcd938x_jack_check();
+}
+
+static void
+qcom_pcm_jack_poll_task(void *arg, int pending __unused)
+{
+	struct qcom_pcm_softc *sc = arg;
+
+	if (sc->play == NULL)
+		return;
+	qcom_wcd938x_jack_check();
+	taskqueue_enqueue_timeout(sc->tq, &sc->jack_poll_task, hz);
+}
+
+/*
+ * Bring the codec up once the DSP is, which may be a while after boot, and
+ * leave it idle and watching the jack.
+ */
+static void
+qcom_pcm_codec_task(void *arg, int pending __unused)
+{
+	struct qcom_pcm_softc *sc = arg;
+
+	if (qcom_wcd938x_up() == 0) {
+		qcom_wcd938x_down();
+		return;
+	}
+	if (++sc->codec_tries < PCM_CODEC_TRIES)
+		taskqueue_enqueue_timeout(sc->tq, &sc->codec_task, hz);
+	else
+		device_printf(sc->dev, "codec not up; no jack detection\n");
 }
 
 /* Mixer */
@@ -407,6 +489,16 @@ qcom_pcm_attach(device_t dev)
 	TASK_INIT(&sc->vol_task, 0, qcom_pcm_vol_task, sc);
 	sc->volume = 100;
 
+	TIMEOUT_TASK_INIT(sc->tq, &sc->codec_task, 0, qcom_pcm_codec_task, sc);
+	TASK_INIT(&sc->jack_task, 0, qcom_pcm_jack_task, sc);
+	TIMEOUT_TASK_INIT(sc->tq, &sc->jack_poll_task, 0,
+	    qcom_pcm_jack_poll_task, sc);
+	sc->jack = -1;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "jack",
+	    CTLFLAG_RD, &sc->jack, 0,
+	    "Headphone jack: 1 in use, 0 empty, -1 not known yet");
+
 	pcm_init(dev, sc);
 	pcm_setflags(dev, pcm_getflags(dev) | SD_F_MPSAFE | SD_F_SOFTPCMVOL);
 	error = mixer_init(dev, &qcom_pcm_mixer_class, sc);
@@ -419,6 +511,13 @@ qcom_pcm_attach(device_t dev)
 		kmem_free(sc->ring, PCM_BUFSZ);
 		return (error);
 	}
+
+	qcom_wcd938x_jack_notify(qcom_pcm_jack, sc);
+	error = qcom_swr_wake_intr(dev, QCOM_SWR_TX, qcom_pcm_wake, sc,
+	    &sc->wake_res, &sc->wake_cookie);
+	if (error != 0)
+		device_printf(dev, "no jack wake-up interrupt: %d\n", error);
+	taskqueue_enqueue_timeout(sc->tq, &sc->codec_task, 0);
 	return (0);
 }
 
@@ -432,9 +531,16 @@ qcom_pcm_detach(device_t dev)
 	if (error != 0)
 		return (error);
 	/* pcm_unregister took the mixer down too. */
+	if (sc->wake_res != NULL) {
+		bus_teardown_intr(dev, sc->wake_res, sc->wake_cookie);
+		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->wake_res);
+	}
+	qcom_wcd938x_jack_notify(NULL, NULL);
+	taskqueue_cancel_timeout(sc->tq, &sc->codec_task, NULL);
 	/* The channels are gone, so no more triggers: finish the stop. */
 	taskqueue_enqueue(sc->tq, &sc->stop_task);
 	taskqueue_drain_all(sc->tq);
+	taskqueue_drain_timeout(sc->tq, &sc->jack_poll_task);
 	taskqueue_free(sc->tq);
 	kmem_free(sc->ring, PCM_BUFSZ);
 	return (0);

@@ -30,6 +30,11 @@
  * its headphone output up and down, with the RX SoundWire link's ports set
  * up to carry the headphone samples to it.
  *
+ * It watches the jack while idle: the codec's mechanical detection keeps
+ * running with the links' clocks stopped, and on a change it wakes the TX
+ * link, which the sound device sees as an interrupt and has the jack
+ * checked.
+ *
  * The register sequences are Linux's, as its wcd938x and SoundWire drivers
  * issue them for a 48 kHz stereo stream to the headphones: captured from
  * the controllers' command FIFOs while Linux played, in order, with the
@@ -54,6 +59,15 @@
 #define	WCD_RESET_PIN		106
 /* Both halves enumerate as device 1 on their links. */
 #define	WCD_DEV			1
+
+/* Jack detection (Linux's wcd-mbhc-v2 fields). */
+#define	WCD_ANA_MBHC_MECH	0x3014
+#define	WCD_MECH_DETECT_INS	0x20	/* watch for insertion, not removal */
+#define	WCD_ANA_MBHC_RESULT_3	0x3019
+#define	WCD_SWCH_LEVEL_REMOVE	0x10	/* nothing in the jack */
+#define	WCD_INTR_STATUS_0	0x346e
+#define	WCD_INTR_CLEAR_0	0x3471
+#define	WCD_INTR_MBHC_SW_DET	0x10	/* the jack's switch moved */
 
 struct wcd_op {
 	uint8_t		op;
@@ -327,7 +341,12 @@ static const struct wcd_op wcd_stream_off[] = {
 static struct sx wcd_lock;
 SX_SYSINIT(qcom_wcd938x, &wcd_lock, "qcom_wcd938x");
 static struct qcom_swr *wcd_tx, *wcd_rx;
+static bool wcd_ready;		/* out of reset, with its settings */
+static bool wcd_active;		/* the links running */
 static bool wcd_hph;
+static bool wcd_plugged, wcd_jack_known;
+static qcom_wcd938x_jack_t *wcd_jack_cb;
+static void *wcd_jack_arg;
 
 static int
 wcd_run(const struct wcd_op *ops, size_t n)
@@ -398,9 +417,101 @@ wcd_attached(struct qcom_swr *s)
 	return (ENXIO);
 }
 
+static int
+wcd_read(uint16_t reg, uint8_t *v)
+{
+
+	return (qcom_swr_read(wcd_tx, WCD_DEV, reg, v));
+}
+
 /*
- * Bring the codec up: out of reset, the macros clocked, both links up with
- * the codec enumerated on each, and its settings.
+ * Where the jack stands, from the switch's level; acknowledge a switch
+ * interrupt, and set the detection to watch for the opposite change, as
+ * Linux's mechanical detection handler does.  Reports a change.
+ */
+static void
+wcd_jack_update(void)
+{
+	uint8_t st, res, mech;
+	bool plugged;
+
+	sx_assert(&wcd_lock, SA_XLOCKED);
+	if (wcd_read(WCD_INTR_STATUS_0, &st) != 0 ||
+	    wcd_read(WCD_ANA_MBHC_RESULT_3, &res) != 0 ||
+	    wcd_read(WCD_ANA_MBHC_MECH, &mech) != 0)
+		return;
+	if ((st & WCD_INTR_MBHC_SW_DET) != 0) {
+		(void)qcom_swr_write(wcd_tx, WCD_DEV, WCD_INTR_CLEAR_0,
+		    WCD_INTR_MBHC_SW_DET);
+		(void)qcom_swr_write(wcd_tx, WCD_DEV, WCD_INTR_CLEAR_0, 0);
+	}
+	plugged = (res & WCD_SWCH_LEVEL_REMOVE) == 0;
+	mech = plugged ? mech & ~WCD_MECH_DETECT_INS :
+	    mech | WCD_MECH_DETECT_INS;
+	(void)qcom_swr_write(wcd_tx, WCD_DEV, WCD_ANA_MBHC_MECH, mech);
+	if (wcd_jack_known && plugged == wcd_plugged)
+		return;
+	wcd_plugged = plugged;
+	wcd_jack_known = true;
+	if (wcd_jack_cb != NULL)
+		wcd_jack_cb(wcd_jack_arg, plugged);
+}
+
+static int
+wcd_up(void)
+{
+	int error;
+
+	sx_assert(&wcd_lock, SA_XLOCKED);
+	if (wcd_active)
+		return (0);
+	error = 0;
+	if (!wcd_ready)
+		error = wcd_reset();
+	if (error == 0)
+		error = qcom_lpass_macro_clocks(true);
+	if (error == 0)
+		error = qcom_swr_up(QCOM_SWR_TX, &wcd_tx);
+	if (error == 0)
+		error = qcom_swr_up(QCOM_SWR_RX, &wcd_rx);
+	if (error == 0 && !wcd_ready) {
+		error = wcd_attached(wcd_tx);
+		if (error == 0)
+			error = wcd_attached(wcd_rx);
+		if (error == 0)
+			error = wcd_run(wcd_init, nitems(wcd_init));
+		if (error == 0) {
+			wcd_ready = true;
+			printf("qcom_wcd938x: up\n");
+		}
+	}
+	if (error == 0)
+		wcd_active = true;
+	else if (bootverbose || wcd_ready)
+		printf("qcom_wcd938x: not up: %d\n", error);
+	return (error);
+}
+
+static void
+wcd_down(void)
+{
+
+	sx_assert(&wcd_lock, SA_XLOCKED);
+	if (!wcd_active)
+		return;
+	/* A change while the links ran raised no wake-up: look now. */
+	wcd_jack_update();
+	(void)qcom_swr_stop(wcd_rx);
+	(void)qcom_swr_stop(wcd_tx);
+	(void)qcom_lpass_macro_clocks(false);
+	wcd_active = false;
+}
+
+/*
+ * Bring the codec up: the first time, out of reset, both links up with the
+ * codec enumerated on each, and its settings; after that, the macros'
+ * clocks and the links out of clock stop, the codec as it was.  Fails
+ * (with the DSP's error) until the DSP is up.
  */
 int
 qcom_wcd938x_up(void)
@@ -408,42 +519,48 @@ qcom_wcd938x_up(void)
 	int error;
 
 	sx_xlock(&wcd_lock);
-	if (wcd_tx != NULL) {
-		sx_xunlock(&wcd_lock);
-		return (0);
-	}
-	error = wcd_reset();
-	if (error == 0)
-		error = qcom_lpass_macro_rx(true);
-	if (error == 0)
-		error = qcom_swr_up(QCOM_SWR_TX, &wcd_tx);
-	if (error == 0)
-		error = qcom_swr_up(QCOM_SWR_RX, &wcd_rx);
-	if (error == 0)
-		error = wcd_attached(wcd_tx);
-	if (error == 0)
-		error = wcd_attached(wcd_rx);
-	if (error == 0)
-		error = wcd_run(wcd_init, nitems(wcd_init));
-	if (error != 0) {
-		printf("qcom_wcd938x: not up: %d\n", error);
-		wcd_tx = wcd_rx = NULL;
-	} else
-		printf("qcom_wcd938x: up\n");
+	error = wcd_up();
 	sx_xunlock(&wcd_lock);
 	return (error);
 }
 
+/* Let the codec idle: the links' clocks stopped, then the macros'. */
 void
 qcom_wcd938x_down(void)
 {
 
 	qcom_wcd938x_hph(false);
 	sx_xlock(&wcd_lock);
-	if (wcd_tx != NULL) {
-		qcom_swr_down();
-		(void)qcom_lpass_macro_rx(false);
-		wcd_tx = wcd_rx = NULL;
+	wcd_down();
+	sx_xunlock(&wcd_lock);
+}
+
+/* Who to tell when the jack changes: called with plugged, and may sleep. */
+void
+qcom_wcd938x_jack_notify(qcom_wcd938x_jack_t *cb, void *arg)
+{
+
+	sx_xlock(&wcd_lock);
+	wcd_jack_cb = cb;
+	wcd_jack_arg = arg;
+	sx_xunlock(&wcd_lock);
+}
+
+/*
+ * Look at the jack: on a wake-up from the codec, or now and then while the
+ * links run, when a change raises none.  An idle codec comes up for it and
+ * goes back to idle.
+ */
+void
+qcom_wcd938x_jack_check(void)
+{
+
+	sx_xlock(&wcd_lock);
+	if (wcd_ready) {
+		if (wcd_active)
+			wcd_jack_update();
+		else if (wcd_up() == 0)
+			wcd_down();	/* which looks */
 	}
 	sx_xunlock(&wcd_lock);
 }
@@ -455,18 +572,21 @@ qcom_wcd938x_hph(bool on)
 	int error;
 
 	sx_xlock(&wcd_lock);
-	if (wcd_tx == NULL || on == wcd_hph) {
+	if (!wcd_active || on == wcd_hph) {
 		sx_xunlock(&wcd_lock);
-		return (wcd_tx == NULL && on ? ENXIO : 0);
+		return (!wcd_active && on ? ENXIO : 0);
 	}
 	if (on) {
-		error = wcd_run(wcd_stream_on, nitems(wcd_stream_on));
+		error = qcom_lpass_macro_hph(true);
+		if (error == 0)
+			error = wcd_run(wcd_stream_on, nitems(wcd_stream_on));
 		if (error == 0)
 			error = wcd_run(wcd_hph_on, nitems(wcd_hph_on));
 	} else {
 		error = wcd_run(wcd_hph_off, nitems(wcd_hph_off));
 		if (error == 0)
 			error = wcd_run(wcd_stream_off, nitems(wcd_stream_off));
+		(void)qcom_lpass_macro_hph(false);
 	}
 	if (error == 0)
 		wcd_hph = on;

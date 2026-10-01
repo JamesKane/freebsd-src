@@ -33,9 +33,14 @@
 
 struct qcom_swr;
 
-/* Bring a link up; the codec macros must be clocked. */
+/* Bring a link up, or out of clock stop; the codec macros must be clocked. */
 int	qcom_swr_up(u_int which, struct qcom_swr **sp);
-void	qcom_swr_down(void);
+/* Stop its clock, before the macros' go. */
+int	qcom_swr_stop(struct qcom_swr *s);
+void	qcom_swr_forget(void);
+int	qcom_swr_wake_intr(device_t dev, u_int which, driver_intr_t *fn,
+	    void *arg, struct resource **resp, void **cookiep);
+bool	qcom_swr_wake_take(u_int which);
 uint32_t qcom_swr_attached(struct qcom_swr *s);
 uint64_t qcom_swr_dev_id(struct qcom_swr *s, u_int n);
 int	qcom_swr_read(struct qcom_swr *s, u_int dev, uint16_t reg,
@@ -43,6 +48,7 @@ int	qcom_swr_read(struct qcom_swr *s, u_int dev, uint16_t reg,
 int	qcom_swr_write(struct qcom_swr *s, u_int dev, uint16_t reg,
 	    uint8_t val);
 void	qcom_swr_mmio_write(struct qcom_swr *s, u_int reg, uint32_t val);
+int	qcom_swr_broadcast(struct qcom_swr *s, uint16_t reg, uint8_t val);
 int	qcom_swr_bank_switch(struct qcom_swr *s, uint16_t reg);
 
 #endif /* _DEV_QCOM_AUDIO_QCOM_SWR_H_ */

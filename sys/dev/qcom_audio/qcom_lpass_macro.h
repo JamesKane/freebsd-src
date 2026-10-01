@@ -28,7 +28,10 @@
 #ifndef _DEV_QCOM_AUDIO_QCOM_LPASS_MACRO_H_
 #define	_DEV_QCOM_AUDIO_QCOM_LPASS_MACRO_H_
 
-/* Power and clock the RX (playback) codec macro, or stop it. */
-int	qcom_lpass_macro_rx(bool on);
+/* The macros' and SoundWire controllers' clocks (holding LPASS powered). */
+int	qcom_lpass_macro_clocks(bool on);
+/* The RX macro's headphone paths. */
+int	qcom_lpass_macro_hph(bool on);
+void	qcom_lpass_macro_release(void);
 
 #endif /* _DEV_QCOM_AUDIO_QCOM_LPASS_MACRO_H_ */
