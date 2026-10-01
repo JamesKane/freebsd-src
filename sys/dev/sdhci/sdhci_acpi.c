@@ -56,6 +56,7 @@
 #ifdef __aarch64__
 #define	SDHCI_ACPI_GPIO_CD
 #include <sys/gpio.h>
+#include <dev/gpio/gpiobusvar.h>
 #include "gpio_if.h"
 #endif
 
@@ -140,6 +141,9 @@ struct sdhci_acpi_softc {
 #ifdef SDHCI_ACPI_GPIO_CD
 	device_t	cd_gpio;	/* card detect, active low */
 	uint32_t	cd_pin;
+	struct resource	*cd_irq;	/* its interrupt, or NULL to poll */
+	void		*cd_ih;
+	bool		cd_ready;	/* the slot is there to tell */
 #endif
 };
 
@@ -398,6 +402,36 @@ sdhci_acpi_get_card_present(device_t dev, struct sdhci_slot *slot)
 		return (val == 0);
 	return (sdhci_generic_get_card_present(dev, slot));
 }
+
+static void
+sdhci_acpi_cd_intr(void *arg)
+{
+	struct sdhci_acpi_softc *sc = arg;
+
+	if (sc->cd_ready)
+		sdhci_handle_card_present(&sc->slot,
+		    sdhci_acpi_get_card_present(sc->slot.bus, &sc->slot));
+}
+
+/* An interrupt on either edge of the card detect line, if it has one. */
+static bool
+sdhci_acpi_cd_intr_setup(device_t dev, struct sdhci_acpi_softc *sc)
+{
+	struct gpiobus_pin pin = { .dev = sc->cd_gpio, .pin = sc->cd_pin };
+
+	sc->cd_irq = gpio_alloc_intr_resource(dev, 1, RF_ACTIVE, &pin,
+	    GPIO_INTR_EDGE_BOTH);
+	if (sc->cd_irq == NULL)
+		return (false);
+	if (bus_setup_intr(dev, sc->cd_irq, INTR_TYPE_MISC | INTR_MPSAFE,
+	    NULL, sdhci_acpi_cd_intr, sc, &sc->cd_ih) != 0) {
+		bus_release_resource(dev, SYS_RES_IRQ,
+		    rman_get_rid(sc->cd_irq), sc->cd_irq);
+		sc->cd_irq = NULL;
+		return (false);
+	}
+	return (true);
+}
 #endif
 
 static int
@@ -456,15 +490,17 @@ sdhci_acpi_attach(device_t dev)
 		    SDHCI_CAPABILITIES2) & ~(SDHCI_CAN_SDR50 |
 		    SDHCI_CAN_SDR104 | SDHCI_CAN_DDR50);
 		/*
-		 * Card detect is a GPIO; without a driver for its
-		 * controller, the slot keeps the card it booted with.
+		 * Card detect is a GPIO, by its interrupt or polled; without
+		 * a driver for its controller, the slot keeps the card it
+		 * booted with.
 		 */
 #ifdef SDHCI_ACPI_GPIO_CD
 		AcpiWalkResources(acpi_get_handle(dev), "_CRS",
 		    sdhci_acpi_find_cd, sc);
-		if (sc->cd_gpio != NULL)
-			quirks |= SDHCI_QUIRK_POLL_CARD_PRESENT;
-		else
+		if (sc->cd_gpio != NULL) {
+			if (!sdhci_acpi_cd_intr_setup(dev, sc))
+				quirks |= SDHCI_QUIRK_POLL_CARD_PRESENT;
+		} else
 #endif
 			quirks |= SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE;
 	}
@@ -489,6 +525,9 @@ sdhci_acpi_attach(device_t dev)
 	}
 
 	/* Process cards detection. */
+#ifdef SDHCI_ACPI_GPIO_CD
+	sc->cd_ready = true;
+#endif
 	sdhci_start_slot(&sc->slot);
 
 	return (0);
@@ -499,6 +538,14 @@ sdhci_acpi_detach(device_t dev)
 {
 	struct sdhci_acpi_softc *sc = device_get_softc(dev);
 
+#ifdef SDHCI_ACPI_GPIO_CD
+	if (sc->cd_ih != NULL)
+		bus_teardown_intr(dev, sc->cd_irq, sc->cd_ih);
+	if (sc->cd_irq != NULL)
+		bus_release_resource(dev, SYS_RES_IRQ,
+		    rman_get_rid(sc->cd_irq), sc->cd_irq);
+	sc->cd_ready = false;
+#endif
 	if (sc->intrhand)
 		bus_teardown_intr(dev, sc->irq_res, sc->intrhand);
 	if (sc->irq_res)

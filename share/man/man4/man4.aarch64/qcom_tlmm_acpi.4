@@ -60,11 +60,19 @@ programs using a pin afterwards.
 Pins the secure world owns, whose registers fault when touched, are not
 offered.
 .Pp
+Pins in the GPIO function can interrupt, on either level or on rising,
+falling or both edges, through the TLMM's summary interrupt, the first of
+the device's ACPI interrupts.
+Interrupts on pins in other functions are refused, which keeps the
+reference design's ACPI GPIO events
+.Pq Va _AEI
+off pins the board uses for something else.
+.Pp
 The
 .Xr sdhci 4
 driver for the SoCs' SD controllers uses
 .Nm
-for card detection.
+for card detection, by interrupt.
 .Sh HARDWARE
 The
 .Nm
@@ -97,6 +105,5 @@ The
 driver and this manual page were written by
 .An James Kane .
 .Sh BUGS
-Pin interrupts are not supported, so ACPI GPIO events and
-.Qq GpioInt
-resources do not work.
+Pin interrupts cannot wake the system from sleep: that takes the SoC's
+power domain controller (PDC), which the driver does not program.
