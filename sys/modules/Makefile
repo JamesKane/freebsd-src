@@ -350,6 +350,7 @@ SUBDIR=	\
 	${_qcom_cmd_db} \
 	${_qcom_epss} \
 	${_qcom_fastrpc} \
+	${_qcom_fastrpc_linux} \
 	${_qcom_geni_i2c} \
 	${_qcom_gpucc} \
 	${_qcom_scm} \
@@ -764,6 +765,9 @@ _qcom_rpmh=	qcom_rpmh
 _qcom_cmd_db=	qcom_cmd_db
 _qcom_epss=	qcom_epss
 _qcom_fastrpc=	qcom_fastrpc
+.if ${MK_LINUX} != "no" || defined(ALL_MODULES)
+_qcom_fastrpc_linux=	qcom_fastrpc_linux
+.endif
 _qcom_geni_i2c=	qcom_geni_i2c
 _qcom_gpucc=	qcom_gpucc
 _qcom_scm=	qcom_scm
