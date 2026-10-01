@@ -1,0 +1,96 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd October 1, 2026
+.Dt QCOM_PMIC_GLINK 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_pmic_glink
+.Nd "Qualcomm pmic_glink USB-C orientation driver"
+.Sh SYNOPSIS
+To compile this driver into the kernel, place the following line in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device qcom_pmic_glink"
+.Ed
+.Pp
+Alternatively, to load the driver as a module at boot time, place the
+following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+qcom_pmic_glink_load="YES"
+.Ed
+.Sh DESCRIPTION
+On Qualcomm Snapdragon systems-on-chip, the audio DSP's firmware runs the
+USB-C ports' Type-C and Power Delivery state machines, and reports each
+port's state over the
+.Qq PMIC_RTR_ADSP_APPS
+channel of
+.Xr qcom_glink 4 ,
+in the protocol Linux calls pmic_glink.
+The
+.Nm
+driver asks the DSP for these reports and, for each port, switches the
+USB-C PHY's lanes to the side the plug is on, so that USB 3 SuperSpeed
+works with the plug either way round.
+The firmware sets the lanes once at boot, for whatever is plugged in
+then, and not again.
+.Pp
+Each port's state, the plug's orientation and what its lanes carry, is in
+the
+.Va hw.qcom_pmic_glink.port Ns Ar N
+sysctl, for example:
+.Bd -literal -offset indent
+hw.qcom_pmic_glink.port0: reversed, usb3
+.Ed
+.Pp
+The PHYs are not described by ACPI; their registers come from a table of
+systems-on-chip, which the DSDT's
+.Va \e_SB.SOID
+identifies.
+.Sh HARDWARE
+The
+.Nm
+driver supports the Qualcomm Snapdragon 8cx Gen 3 (SC8280XP), with two
+USB-C ports.
+It has been tested on the Radxa Dragon Q8B.
+.Sh SEE ALSO
+.Xr qcom_adsp 4 ,
+.Xr qcom_glink 4 ,
+.Xr xhci 4
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
+.Sh BUGS
+DisplayPort alternate mode, Power Delivery and the battery manager, which
+the same service offers, are not supported.
