@@ -28,6 +28,7 @@ device		qcom_glink		# GLINK, IPCC, shared memory, AOSS
 device		qcom_smmu		# MMU-500 SMMU page tables
 device		qcom_audio		# DSP audio, codec, sound(4)
 device		qcom_pmic_glink		# USB-C orientation, via the DSP
+device		qcom_fastrpc		# calls into the compute DSP (the NPU)
 
 options 	FDT
 

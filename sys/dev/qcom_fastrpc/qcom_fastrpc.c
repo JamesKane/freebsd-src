@@ -39,27 +39,45 @@
  * given to the DSP carry the session's number above bit 32.  The DSP
  * answers with the call's context and result.
  *
- * Not yet: buffers passed by file descriptor (dma-bufs), maps of memory
- * into the DSP process, static processes and poll mode.  A DSP result that
+ * Buffers shared with the DSP (Linux's dma-bufs, from ALLOC_DMA_BUFF) are
+ * anonymous POSIX shared memory objects here: the program maps them as any
+ * other, and a call argument that names one by its descriptor is mapped,
+ * for the call, into the session's bank, its pages wired and their cache
+ * lines written back before and dropped after.
+ *
+ * Not yet: maps of memory into the DSP process, static processes and poll
+ * mode.  A DSP result that
  * isn't 0 comes back as EIO (Linux returns it as the ioctl's value).
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/capsicum.h>
 #include <sys/conf.h>
+#include <sys/fcntl.h>
+#include <sys/file.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/mman.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
+#include <sys/rwlock.h>
 #include <sys/sx.h>
+#include <sys/syscallsubr.h>
 #include <sys/taskqueue.h>
 
 #include <vm/vm.h>
+#include <vm/pmap.h>
 #include <vm/vm_extern.h>
 #include <vm/vm_kern.h>
-#include <vm/pmap.h>
+#include <vm/vm_map.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pager.h>
+
+#include <machine/cpufunc.h>
 
 #include <machine/bus.h>
 
@@ -82,6 +100,8 @@ static MALLOC_DEFINE(M_FASTRPC, "qcom_fastrpc", "Qualcomm FastRPC");
 
 #define	FASTRPC_RMID_INIT_ATTACH	0
 #define	FASTRPC_RMID_INIT_RELEASE	1
+#define	FASTRPC_RMID_INIT_MMAP		4
+#define	FASTRPC_RMID_INIT_MUNMAP	5
 #define	FASTRPC_RMID_INIT_CREATE	6
 #define	FASTRPC_RMID_INIT_CREATE_ATTR	7
 
@@ -159,7 +179,13 @@ struct fastrpc_buf {
 	size_t		size;
 	uint64_t	iova;
 	uint64_t	daddr;		/* as the DSP knows it */
+	uint64_t	raddr;		/* in the DSP process, if given it */
+	TAILQ_ENTRY(fastrpc_buf) link;
 };
+
+/* MMAP's kind: pages for the DSP process's own heap. */
+#define	FASTRPC_MMAP_ADD_PAGES	0x1000
+#define	FASTRPC_MMAP_MAX	(256 * 1024 * 1024)
 
 struct fastrpc_user {
 	struct fastrpc_session *sess;
@@ -167,6 +193,7 @@ struct fastrpc_user {
 	int		pd;
 	bool		attached;	/* to a process on the DSP */
 	struct fastrpc_buf *init_mem;
+	TAILQ_HEAD(, fastrpc_buf) mmaps; /* given the DSP process, by MMAP */
 	struct sx	lock;
 };
 
@@ -174,6 +201,16 @@ struct fastrpc_ctx {
 	uint64_t	ctxid;
 	int		retval;
 	bool		done;
+	/*
+	 * A call given up on, by a signal or (the driver's own) a timeout:
+	 * the DSP may still use its buffers, which go when it answers.
+	 */
+	bool		abandoned;
+	struct fastrpc_session *sess;
+	struct fastrpc_buf *buf;
+	struct fastrpc_shbuf *sbs;
+	u_int		nsbs;
+	STAILQ_ENTRY(fastrpc_ctx) link;
 };
 
 static struct {
@@ -187,6 +224,8 @@ static struct {
 	uint32_t		*attrs;	/* the DSP's, once asked */
 	struct taskqueue	*tq;
 	struct timeout_task	start_task;
+	struct task		reap_task;	/* abandoned calls answered */
+	STAILQ_HEAD(, fastrpc_ctx) reap;
 	int			start_tries;
 } frpc;
 
@@ -232,6 +271,117 @@ fastrpc_buf_alloc(struct fastrpc_session *s, size_t size,
 	return (0);
 }
 
+/*
+ * A shared buffer for a call: the shm object the descriptor names, the
+ * pages under [ptr, ptr + len) of the program's map of it, wired and
+ * mapped into the session's bank.
+ */
+struct fastrpc_shbuf {
+	struct file	*fp;
+	vm_page_t	*ma;
+	u_int		npages;
+	uint64_t	iova;
+	uint64_t	daddr;		/* of the first page, as the DSP knows it */
+};
+
+static void
+fastrpc_shbuf_put(struct fastrpc_session *s, struct fastrpc_shbuf *sb)
+{
+	u_int i;
+
+	if (sb->npages != 0 && sb->iova != 0)
+		qcom_apps_smmu_unmap(s->dom, sb->iova, ptoa(sb->npages));
+	for (i = 0; i < sb->npages && sb->ma != NULL; i++)
+		if (sb->ma[i] != NULL)
+			vm_page_unwire(sb->ma[i], PQ_ACTIVE);
+	free(sb->ma, M_FASTRPC);
+	if (sb->fp != NULL)
+		fdrop(sb->fp, curthread);
+	memset(sb, 0, sizeof(*sb));
+}
+
+/* Write back, or (after the DSP wrote) drop, the pages' cache lines. */
+static void
+fastrpc_shbuf_sync(struct fastrpc_shbuf *sb, bool after)
+{
+	void *va;
+	u_int i;
+
+	for (i = 0; i < sb->npages; i++) {
+		va = (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(sb->ma[i]));
+		if (after)
+			cpu_dcache_inv_range(va, PAGE_SIZE);
+		else
+			cpu_dcache_wbinv_range(va, PAGE_SIZE);
+	}
+}
+
+static int
+fastrpc_shbuf_get(struct fastrpc_session *s, int fd, uint64_t ptr,
+    uint64_t len, struct fastrpc_shbuf *sb)
+{
+	struct thread *td = curthread;
+	struct shmfd *shm;
+	vm_map_entry_t entry;
+	vm_map_t map;
+	vm_object_t obj;
+	vm_ooffset_t off;
+	cap_rights_t rights;
+	u_int i;
+	int error;
+
+	memset(sb, 0, sizeof(*sb));
+	error = fget(td, fd, cap_rights_init_one(&rights, CAP_MMAP), &sb->fp);
+	if (error != 0)
+		return (error);
+	if (sb->fp->f_type != DTYPE_SHM) {
+		fastrpc_shbuf_put(s, sb);
+		return (EINVAL);
+	}
+	shm = sb->fp->f_data;
+	obj = shm->shm_object;
+
+	/* Where in the object the program's pointer is. */
+	map = &td->td_proc->p_vmspace->vm_map;
+	vm_map_lock_read(map);
+	if (!vm_map_lookup_entry(map, ptr, &entry) ||
+	    entry->object.vm_object != obj ||
+	    ptr + len > entry->end) {
+		vm_map_unlock_read(map);
+		fastrpc_shbuf_put(s, sb);
+		return (EINVAL);
+	}
+	off = entry->offset + (ptr - entry->start);
+	vm_map_unlock_read(map);
+	if (off + len > (vm_ooffset_t)shm->shm_size) {
+		fastrpc_shbuf_put(s, sb);
+		return (EINVAL);
+	}
+
+	sb->npages = atop(round_page(off + len) - trunc_page(off));
+	sb->ma = malloc(sb->npages * sizeof(*sb->ma), M_FASTRPC,
+	    M_WAITOK | M_ZERO);
+	for (i = 0; i < sb->npages; i++) {
+		error = vm_page_grab_valid_unlocked(&sb->ma[i], obj,
+		    OFF_TO_IDX(off) + i,
+		    VM_ALLOC_WIRED | VM_ALLOC_NOBUSY | VM_ALLOC_NORMAL);
+		if (error != VM_PAGER_OK) {
+			sb->ma[i] = NULL;
+			fastrpc_shbuf_put(s, sb);
+			return (EFAULT);
+		}
+	}
+	error = qcom_apps_smmu_map_pages(s->dom, sb->ma, sb->npages,
+	    &sb->iova);
+	if (error != 0) {
+		sb->iova = 0;
+		fastrpc_shbuf_put(s, sb);
+		return (error);
+	}
+	sb->daddr = sb->iova | (uint64_t)s->bank->reg << 32;
+	return (0);
+}
+
 /* Calls */
 
 /* The DSP's answer; from the GLINK rx task. */
@@ -251,7 +401,12 @@ fastrpc_rx(void *arg __unused, const void *data, size_t len)
 	if (c != NULL && CTXID_SEQ(c->ctxid) == CTXID_SEQ(rsp->ctx)) {
 		c->retval = rsp->retval;
 		c->done = true;
-		wakeup(c);
+		if (c->abandoned) {
+			frpc.ctx[slot] = NULL;
+			STAILQ_INSERT_TAIL(&frpc.reap, c, link);
+			taskqueue_enqueue(frpc.tq, &frpc.reap_task);
+		} else
+			wakeup(c);
 	} else
 		printf("qcom_fastrpc: answer for no call (%#jx)\n",
 		    (uintmax_t)rsp->ctx);
@@ -293,6 +448,7 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	struct fastrpc_phy_page *pages;
 	struct fastrpc_ctx *c;
 	struct fastrpc_buf *buf;
+	struct fastrpc_shbuf *sbs;
 	struct fastrpc_msg msg;
 	uint64_t off, pg0, pg1;
 	size_t metalen, size;
@@ -303,9 +459,24 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	inbufs = SC_INBUFS(sc);
 	nbufs = inbufs + SC_OUTBUFS(sc);
 	nscalars = SC_LENGTH(sc);
-	for (i = 0; i < nscalars; i++)
+	for (i = nbufs; i < nscalars; i++)
 		if (args[i].fd > 0)
-			return (EOPNOTSUPP);	/* dma-bufs: not yet */
+			return (EOPNOTSUPP);	/* handles to buffers: not yet */
+	/*
+	 * Buffers by descriptor, in the calling process's table and map,
+	 * kernel calls' too (the image INIT_CREATE passes).
+	 */
+	sbs = malloc(MAX(nbufs, 1) * sizeof(*sbs), M_FASTRPC,
+	    M_WAITOK | M_ZERO);
+	for (i = 0; i < nbufs; i++) {
+		if (args[i].fd <= 0 || args[i].length == 0)
+			continue;
+		error = fastrpc_shbuf_get(s, args[i].fd, args[i].ptr,
+		    args[i].length, &sbs[i]);
+		if (error != 0)
+			goto out_sbs;
+		fastrpc_shbuf_sync(&sbs[i], false);
+	}
 
 	/* The description, then each buffer at its own aligned offset. */
 	metalen = (sizeof(*rpra) + sizeof(*list) + sizeof(*pages)) *
@@ -313,13 +484,17 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	    sizeof(uint32_t) * FASTRPC_MAX_CRCLIST + sizeof(uint32_t);
 	size = roundup2(metalen, FASTRPC_ALIGN);
 	for (i = 0; i < nbufs; i++) {
-		if (args[i].length > FASTRPC_INIT_FILELEN_MAX * 4)
-			return (EINVAL);
+		if (sbs[i].npages != 0)
+			continue;
+		if (args[i].length > FASTRPC_INIT_FILELEN_MAX * 4) {
+			error = EINVAL;
+			goto out_sbs;
+		}
 		size = roundup2(size, FASTRPC_ALIGN) + args[i].length;
 	}
 	error = fastrpc_buf_alloc(s, size, &buf);
 	if (error != 0)
-		return (error);
+		goto out_sbs;
 	base = buf->va;
 	rpra = (struct fastrpc_remote_arg *)base;
 	list = (struct fastrpc_invoke_buf *)(rpra + nscalars);
@@ -327,12 +502,19 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 
 	off = roundup2(metalen, FASTRPC_ALIGN);
 	for (i = 0; i < nbufs; i++) {
-		off = roundup2(off, FASTRPC_ALIGN);
 		rpra[i].len = args[i].length;
 		list[i].num = args[i].length != 0;
 		list[i].pgidx = i;
 		if (args[i].length == 0)
 			continue;
+		if (sbs[i].npages != 0) {
+			/* In place: the program's address, the pages' own. */
+			rpra[i].pv = args[i].ptr;
+			pages[i].addr = sbs[i].daddr;
+			pages[i].size = ptoa(sbs[i].npages);
+			continue;
+		}
+		off = roundup2(off, FASTRPC_ALIGN);
 		/* The DSP takes the offset in the page from pv. */
 		rpra[i].pv = (uint64_t)(uintptr_t)(base + off);
 		pg0 = trunc_page(off);
@@ -376,20 +558,31 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	msg.size = round_page(size);
 	error = qcom_glink_send(frpc.ch, &msg, sizeof(msg));
 
+	/*
+	 * A program's call waits for as long as it takes (a listener's waits
+	 * for the DSP's next request), unless a signal comes; the driver's
+	 * own give up after ten seconds.
+	 */
 	mtx_lock(&frpc.mtx);
-	while (error == 0 && !c->done)
-		error = msleep(c, &frpc.mtx, 0, "frpc", kernel ? 10 * hz :
-		    60 * hz);
-	if (error == EWOULDBLOCK) {
-		/*
-		 * The DSP may still write the buffer and answer: leave both
-		 * to it rather than free them under it.
-		 */
-		frpc.ctx[CTXID_SLOT(c->ctxid)] = NULL;
-		mtx_unlock(&frpc.mtx);
-		printf("qcom_fastrpc: no answer from the DSP to %#x/%#x\n",
-		    handle, sc);
-		return (ETIMEDOUT);
+	if (error == 0) {
+		while (!c->done && error == 0)
+			error = msleep(c, &frpc.mtx, kernel ? 0 : PCATCH,
+			    "frpc", kernel ? 10 * hz : 0);
+		if (c->done)
+			error = 0;
+		else {
+			/* The DSP may still use the buffers: they're its. */
+			c->abandoned = true;
+			c->sess = s;
+			c->buf = buf;
+			c->sbs = sbs;
+			c->nsbs = nbufs;
+			mtx_unlock(&frpc.mtx);
+			if (kernel)
+				printf("qcom_fastrpc: no answer from the DSP "
+				    "to %#x/%#x\n", handle, sc);
+			return (error == EWOULDBLOCK ? ETIMEDOUT : EINTR);
+		}
 	}
 	frpc.ctx[CTXID_SLOT(c->ctxid)] = NULL;
 	mtx_unlock(&frpc.mtx);
@@ -408,6 +601,11 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	/* The output buffers back. */
 	off = roundup2(metalen, FASTRPC_ALIGN);
 	for (i = 0; i < nbufs; i++) {
+		if (sbs[i].npages != 0) {
+			if (i >= inbufs)
+				fastrpc_shbuf_sync(&sbs[i], true);
+			continue;
+		}
 		off = roundup2(off, FASTRPC_ALIGN);
 		if (i >= inbufs && args[i].length != 0) {
 			if (kernel)
@@ -422,7 +620,34 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	}
 out:
 	fastrpc_buf_free(s, buf);
+out_sbs:
+	for (i = 0; i < nbufs; i++)
+		if (sbs[i].fp != NULL)
+			fastrpc_shbuf_put(s, &sbs[i]);
+	free(sbs, M_FASTRPC);
 	return (error);
+}
+
+/* Free what abandoned calls held, once the DSP has answered them. */
+static void
+fastrpc_reap(void *arg __unused, int pending __unused)
+{
+	struct fastrpc_ctx *c;
+	u_int i;
+
+	mtx_lock(&frpc.mtx);
+	while ((c = STAILQ_FIRST(&frpc.reap)) != NULL) {
+		STAILQ_REMOVE_HEAD(&frpc.reap, link);
+		mtx_unlock(&frpc.mtx);
+		fastrpc_buf_free(c->sess, c->buf);
+		for (i = 0; i < c->nsbs; i++)
+			if (c->sbs[i].fp != NULL)
+				fastrpc_shbuf_put(c->sess, &c->sbs[i]);
+		free(c->sbs, M_FASTRPC);
+		free(c, M_FASTRPC);
+		mtx_lock(&frpc.mtx);
+	}
+	mtx_unlock(&frpc.mtx);
 }
 
 /* Requests */
@@ -467,12 +692,11 @@ fastrpc_init_create(struct fastrpc_user *fl, struct fastrpc_init_create *init)
 
 	if (init->filelen > FASTRPC_INIT_FILELEN_MAX)
 		return (EINVAL);
-	if (init->filelen != 0 && init->filefd > 0)
-		return (EOPNOTSUPP);	/* by dma-buf: not yet */
 	if (fl->attached)
 		return (EBUSY);
 	file = NULL;
-	if (init->filelen != 0) {
+	/* The image: in a shared buffer the caller names, or copied. */
+	if (init->filelen != 0 && init->filefd <= 0) {
 		file = malloc(init->filelen, M_FASTRPC, M_WAITOK);
 		error = copyin((void *)(uintptr_t)init->file, file,
 		    init->filelen);
@@ -503,7 +727,7 @@ fastrpc_init_create(struct fastrpc_user *fl, struct fastrpc_init_create *init)
 	args[0].length = sizeof(inbuf);
 	args[1].ptr = (uintptr_t)name;
 	args[1].length = inbuf.namelen;
-	args[2].ptr = (uintptr_t)file;
+	args[2].ptr = file != NULL ? (uintptr_t)file : init->file;
 	args[2].length = init->filelen;
 	args[3].ptr = (uintptr_t)pages;
 	args[3].length = sizeof(pages);
@@ -513,6 +737,8 @@ fastrpc_init_create(struct fastrpc_user *fl, struct fastrpc_init_create *init)
 	args[5].length = sizeof(inbuf.siglen);
 	for (int i = 0; i < 6; i++)
 		args[i].fd = -1;
+	if (file == NULL && init->filelen != 0)
+		args[2].fd = init->filefd;
 	fl->pd = USER_PD;
 	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
 	    SCALARS(init->attrs != 0 ? FASTRPC_RMID_INIT_CREATE_ATTR :
@@ -572,6 +798,130 @@ fastrpc_get_dsp_info(struct fastrpc_user *fl,
 	return (0);
 }
 
+/*
+ * A buffer to share with the DSP: an anonymous shared memory object of the
+ * size, its descriptor in the caller's table.
+ */
+static int
+fastrpc_alloc_shm(struct thread *td, struct fastrpc_alloc_dma_buf *ab)
+{
+	int error, fd;
+
+	if (ab->size == 0 || ab->size > (uint64_t)1 << 32)
+		return (EINVAL);
+	error = kern_shm_open2(td, SHM_ANON, O_RDWR | O_CLOEXEC, 0600, 0,
+	    NULL, "fastrpc", NULL);
+	if (error != 0)
+		return (error);
+	/* The descriptor comes back where the ioctl's own result goes. */
+	fd = td->td_retval[0];
+	td->td_retval[0] = 0;
+	error = kern_ftruncate(td, fd, round_page(ab->size));
+	if (error != 0) {
+		(void)kern_close(td, fd);
+		return (error);
+	}
+	ab->fd = fd;
+	return (0);
+}
+
+/*
+ * Pages the DSP process asks for (its loader's, its heap's), by way of
+ * the library: allocated here and given it, never mapped for the program.
+ */
+static int
+fastrpc_req_mmap(struct fastrpc_user *fl, struct fastrpc_req_mmap *req)
+{
+	struct {
+		int32_t		pgid;
+		uint32_t	flags;
+		uint64_t	vaddr;
+		int32_t		num;
+	} msg;		/* laid out as Linux's, unpacked */
+	struct fastrpc_phy_page page;
+	struct fastrpc_invoke_args args[3];
+	struct fastrpc_buf *b;
+	uint64_t raddr;
+	int error;
+
+	if (req->flags != FASTRPC_MMAP_ADD_PAGES || req->vaddrin != 0 ||
+	    req->size == 0 || req->size > FASTRPC_MMAP_MAX)
+		return (EINVAL);
+	error = fastrpc_buf_alloc(fl->sess, req->size, &b);
+	if (error != 0)
+		return (error);
+	msg.pgid = fl->client_id;
+	msg.flags = req->flags;
+	msg.vaddr = 0;
+	msg.num = sizeof(page);
+	page.addr = b->daddr;
+	page.size = b->size;
+	memset(args, 0, sizeof(args));
+	args[0].ptr = (uintptr_t)&msg;
+	args[0].length = sizeof(msg);
+	args[1].ptr = (uintptr_t)&page;
+	args[1].length = sizeof(page);
+	args[2].ptr = (uintptr_t)&raddr;
+	args[2].length = sizeof(raddr);
+	for (int i = 0; i < 3; i++)
+		args[i].fd = -1;
+	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
+	    SCALARS(FASTRPC_RMID_INIT_MMAP, 2, 1), args);
+	if (error != 0) {
+		/* A timeout leaves the pages the DSP's. */
+		if (error != ETIMEDOUT)
+			fastrpc_buf_free(fl->sess, b);
+		return (error);
+	}
+	b->raddr = raddr;
+	mtx_lock(&frpc.mtx);
+	TAILQ_INSERT_TAIL(&fl->mmaps, b, link);
+	mtx_unlock(&frpc.mtx);
+	req->vaddrout = raddr;
+	return (0);
+}
+
+static int
+fastrpc_req_munmap(struct fastrpc_user *fl, struct fastrpc_req_munmap *req)
+{
+	struct {
+		int32_t		pgid;
+		uint64_t	vaddr;
+		uint64_t	size;
+	} msg;		/* laid out as Linux's, unpacked */
+	struct fastrpc_invoke_args args[1];
+	struct fastrpc_buf *b;
+	int error;
+
+	mtx_lock(&frpc.mtx);
+	TAILQ_FOREACH(b, &fl->mmaps, link)
+		if (b->raddr == req->vaddrout && b->size == req->size)
+			break;
+	if (b != NULL)
+		TAILQ_REMOVE(&fl->mmaps, b, link);
+	mtx_unlock(&frpc.mtx);
+	if (b == NULL)
+		return (EINVAL);
+	msg.pgid = fl->client_id;
+	msg.vaddr = b->raddr;
+	msg.size = b->size;
+	memset(args, 0, sizeof(args));
+	args[0].ptr = (uintptr_t)&msg;
+	args[0].length = sizeof(msg);
+	args[0].fd = -1;
+	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
+	    SCALARS(FASTRPC_RMID_INIT_MUNMAP, 1, 0), args);
+	if (error == 0)
+		fastrpc_buf_free(fl->sess, b);
+	else if (error != ETIMEDOUT) {
+		/* Still the DSP's: keep it, for close to free. */
+		mtx_lock(&frpc.mtx);
+		TAILQ_INSERT_TAIL(&fl->mmaps, b, link);
+		mtx_unlock(&frpc.mtx);
+	}
+	return (error);
+}
+
 /* The device */
 
 static void
@@ -579,6 +929,7 @@ fastrpc_dtor(void *data)
 {
 	struct fastrpc_user *fl = data;
 	struct fastrpc_invoke_args args[1];
+	struct fastrpc_buf *b;
 	int32_t client_id = fl->client_id;
 
 	if (fl->attached) {
@@ -590,6 +941,11 @@ fastrpc_dtor(void *data)
 		    SCALARS(FASTRPC_RMID_INIT_RELEASE, 1, 0), args);
 	}
 	fastrpc_buf_free(fl->sess, fl->init_mem);
+	/* The DSP process is gone, and with it its use of these. */
+	while ((b = TAILQ_FIRST(&fl->mmaps)) != NULL) {
+		TAILQ_REMOVE(&fl->mmaps, b, link);
+		fastrpc_buf_free(fl->sess, b);
+	}
 	mtx_lock(&frpc.mtx);
 	fl->sess->used = false;
 	mtx_unlock(&frpc.mtx);
@@ -637,6 +993,7 @@ fastrpc_open(struct cdev *dev, int oflags, int devtype, struct thread *td)
 	fl->client_id = i + 1;		/* any nonzero ID, as Linux's */
 	fl->pd = ROOT_PD;
 	sx_init(&fl->lock, "fastrpc user");
+	TAILQ_INIT(&fl->mmaps);
 	error = devfs_set_cdevpriv(fl, fastrpc_dtor);
 	if (error != 0)
 		fastrpc_dtor(fl);
@@ -656,7 +1013,18 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	error = devfs_get_cdevpriv((void **)&fl);
 	if (error != 0)
 		return (error);
-	sx_xlock(&fl->lock);
+	/*
+	 * Calls run side by side, as on Linux: a listener thread waits in
+	 * one for the DSP's requests while others call.  Only setting up
+	 * the process takes the lock.
+	 */
+	switch (cmd) {
+	case FASTRPC_IOCTL_INIT_ATTACH:
+	case FASTRPC_IOCTL_INIT_ATTACH_SNS:
+	case FASTRPC_IOCTL_INIT_CREATE:
+		sx_xlock(&fl->lock);
+		break;
+	}
 	switch (cmd) {
 	case FASTRPC_IOCTL_INVOKE:
 		inv = (struct fastrpc_invoke *)data;
@@ -692,9 +1060,20 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		error = EOPNOTSUPP;	/* poll mode: not on this SoC */
 		break;
 	case FASTRPC_IOCTL_ALLOC_DMA_BUFF:
+		error = fastrpc_alloc_shm(td,
+		    (struct fastrpc_alloc_dma_buf *)data);
+		break;
 	case FASTRPC_IOCTL_FREE_DMA_BUFF:
+		/* Closing the descriptor frees it. */
+		error = 0;
+		break;
 	case FASTRPC_IOCTL_MMAP:
+		error = fastrpc_req_mmap(fl, (struct fastrpc_req_mmap *)data);
+		break;
 	case FASTRPC_IOCTL_MUNMAP:
+		error = fastrpc_req_munmap(fl,
+		    (struct fastrpc_req_munmap *)data);
+		break;
 	case FASTRPC_IOCTL_MEM_MAP:
 	case FASTRPC_IOCTL_MEM_UNMAP:
 	case FASTRPC_IOCTL_INIT_CREATE_STATIC:
@@ -704,7 +1083,8 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		error = ENOTTY;
 		break;
 	}
-	sx_xunlock(&fl->lock);
+	if (sx_xlocked(&fl->lock))
+		sx_xunlock(&fl->lock);
 	return (error);
 }
 
@@ -757,6 +1137,8 @@ qcom_fastrpc_modevent(module_t mod, int type, void *data)
 		taskqueue_start_threads(&frpc.tq, 1, PWAIT, "qcom_fastrpc");
 		TIMEOUT_TASK_INIT(frpc.tq, &frpc.start_task, 0, fastrpc_start,
 		    NULL);
+		TASK_INIT(&frpc.reap_task, 0, fastrpc_reap, NULL);
+		STAILQ_INIT(&frpc.reap);
 		taskqueue_enqueue_timeout(frpc.tq, &frpc.start_task, 0);
 		return (0);
 	case MOD_UNLOAD:
