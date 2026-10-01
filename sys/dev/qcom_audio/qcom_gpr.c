@@ -104,6 +104,23 @@ gpr_port_find(uint32_t id)
 	return (NULL);
 }
 
+static int gpr_trace;
+
+/* With hw.qcom_gpr.trace set, log each packet in the form gprdec reads. */
+static void
+gpr_trace_pkt(const char *dir, const void *data, size_t len)
+{
+	const uint32_t *w = data;
+	size_t i;
+
+	if (!gpr_trace)
+		return;
+	printf("qcom_gpr: %s", dir);
+	for (i = 0; i < len / 4 && i < 64; i++)
+		printf(" w%zu=%#x", i, w[i]);
+	printf("\n");
+}
+
 static void
 gpr_rx(void *arg __unused, const void *data, size_t len)
 {
@@ -115,6 +132,7 @@ gpr_rx(void *arg __unused, const void *data, size_t len)
 	size_t hlen, plen;
 	void *rxarg;
 
+	gpr_trace_pkt("gprrx:", data, len);
 	if (len < sizeof(*h) || (h->w0 & 0xf) > GPR_VERSION + 1 ||
 	    (h->w0 >> 8) != len) {
 		printf("qcom_gpr: malformed packet of %zu bytes\n", len);
@@ -224,6 +242,7 @@ gpr_send(struct qcom_gpr_port *p, uint32_t dst_port, uint32_t opcode,
 	h->opcode = opcode;
 	if (len != 0)
 		memcpy(h + 1, payload, len);
+	gpr_trace_pkt("gprtx:", h, size);
 	error = qcom_glink_send(ch, h, size);
 	free(h, M_GPR);
 	return (error);
@@ -299,6 +318,8 @@ gpr_apm_state_sysctl(SYSCTL_HANDLER_ARGS)
 
 SYSCTL_NODE(_hw, OID_AUTO, qcom_gpr, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Qualcomm GPR");
+SYSCTL_INT(_hw_qcom_gpr, OID_AUTO, trace, CTLFLAG_RW, &gpr_trace, 0,
+    "Log every packet to and from the DSP");
 SYSCTL_PROC(_hw_qcom_gpr, OID_AUTO, apm_state, CTLTYPE_U32 | CTLFLAG_RD |
     CTLFLAG_MPSAFE, NULL, 0, gpr_apm_state_sysctl, "IU",
     "The audio DSP's APM state (1: ready)");
