@@ -69,6 +69,7 @@
 #include <contrib/dev/acpica/include/acpi.h>
 #include <dev/acpica/acpivar.h>
 
+#include <dev/qcom_glink/qcom_aoss.h>
 #include <dev/qcom_scm/qcom_scm.h>
 
 /* Qualcomm's segment flags: the hash segment, and relocatable segments. */
@@ -229,6 +230,15 @@ qcom_adsp_boot(struct qcom_adsp_softc *sc, const struct firmware *fw)
 		    ph[i].p_offset + ph[i].p_filesz > fw->datasize))
 			return (EFTYPE);
 	}
+
+	/*
+	 * Tell the AOSS the image is going in, as Linux does before loading
+	 * the DSP: it holds resources for the subsystem from then on.
+	 */
+	error = qcom_aoss_send(
+	    "{class: image, res: load_state, name: adsp, val: on}");
+	if (error != 0)
+		device_printf(sc->dev, "AOSS load state: %d\n", error);
 
 	md = malloc(mdlen, M_TEMP, M_WAITOK);
 	memcpy(md, data, ph[0].p_filesz);
@@ -424,6 +434,7 @@ static driver_t qcom_adsp_driver = {
 DRIVER_MODULE(qcom_adsp, acpi, qcom_adsp_driver, 0, 0);
 MODULE_DEPEND(qcom_adsp, acpi, 1, 1, 1);
 MODULE_DEPEND(qcom_adsp, qcom_scm, 1, 1, 1);
+MODULE_DEPEND(qcom_adsp, qcom_glink, 1, 1, 1);
 MODULE_DEPEND(qcom_adsp, firmware, 1, 1, 1);
 MODULE_VERSION(qcom_adsp, 1);
 ACPI_PNP_INFO(qcom_adsp_acpi_ids);
