@@ -90,6 +90,8 @@ static MALLOC_DEFINE(M_FASTRPC, "qcom_fastrpc", "Qualcomm FastRPC");
 #define	FASTRPC_ALIGN			128
 #define	FASTRPC_MAX_FDLIST		16
 #define	FASTRPC_MAX_HANDLES		30	/* 15 in, 15 out */
+/* Internal: the DSP answered with a result of its own, in *rvp. */
+#define	FASTRPC_EDSP			(ELAST + 1)
 #define	FASTRPC_MAX_CRCLIST		64
 #define	FASTRPC_CTX_MAX			256
 #define	FASTRPC_MAX_DSP_ATTRIBUTES	256
@@ -196,7 +198,7 @@ struct fastrpc_shbuf {
 	vm_page_t	*ma;
 	u_int		npages;
 	uint64_t	iova;
-	uint64_t	daddr;		/* of the first page, as the DSP knows it */
+	uint64_t	daddr;		/* page 0's, as the DSP knows it */
 };
 
 /*
@@ -551,7 +553,7 @@ fastrpc_dmamap_release(struct fastrpc_user *fl, const uint64_t *fdlist)
 
 static int
 fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
-    uint32_t sc, struct fastrpc_invoke_args *args)
+    uint32_t sc, struct fastrpc_invoke_args *args, int *rvp)
 {
 	struct fastrpc_session *s = fl->sess;
 	struct fastrpc_remote_arg *rpra;
@@ -712,11 +714,19 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	frpc.ctx[CTXID_SLOT(c->ctxid)] = NULL;
 	mtx_unlock(&frpc.mtx);
 	if (error == 0 && c->retval != 0) {
-		if (bootverbose || kernel)
+		/*
+		 * The DSP's own result goes back to the program, as on Linux;
+		 * the driver's own calls take it as an errno.
+		 */
+		if (rvp != NULL) {
+			*rvp = c->retval;
+			error = FASTRPC_EDSP;
+		} else {
 			printf("qcom_fastrpc: DSP result %#x for %#x/%#x\n",
 			    (uint32_t)c->retval, handle, sc);
-		error = (uint32_t)c->retval == FASTRPC_DSP_UNSUPPORTED_API ?
-		    EOPNOTSUPP : EIO;
+			error = (uint32_t)c->retval ==
+			    FASTRPC_DSP_UNSUPPORTED_API ? EOPNOTSUPP : EIO;
+		}
 	}
 	free(c, M_FASTRPC);
 	if (error != 0)
@@ -786,7 +796,7 @@ fastrpc_reap(void *arg __unused, int pending __unused)
 /* Requests */
 
 static int
-fastrpc_init_attach(struct fastrpc_user *fl, int pd)
+fastrpc_init_attach(struct fastrpc_user *fl, int pd, int *rvp)
 {
 	struct fastrpc_invoke_args args[1];
 	int32_t client_id = fl->client_id;
@@ -798,14 +808,15 @@ fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 	args[0].fd = -1;
 	fl->pd = pd;
 	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
-	    SCALARS(FASTRPC_RMID_INIT_ATTACH, 1, 0), args);
+	    SCALARS(FASTRPC_RMID_INIT_ATTACH, 1, 0), args, rvp);
 	if (error == 0)
 		fl->attached = true;
 	return (error);
 }
 
 static int
-fastrpc_init_create(struct fastrpc_user *fl, struct fastrpc_init_create *init)
+fastrpc_init_create(struct fastrpc_user *fl, struct fastrpc_init_create *init,
+    int *rvp)
 {
 	struct fastrpc_invoke_args args[6];
 	struct fastrpc_phy_page pages[1];
@@ -875,7 +886,7 @@ fastrpc_init_create(struct fastrpc_user *fl, struct fastrpc_init_create *init)
 	fl->pd = USER_PD;
 	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
 	    SCALARS(init->attrs != 0 ? FASTRPC_RMID_INIT_CREATE_ATTR :
-	    FASTRPC_RMID_INIT_CREATE, 4, 0), args);
+	    FASTRPC_RMID_INIT_CREATE, 4, 0), args, rvp);
 	free(file, M_FASTRPC);
 	if (error != 0) {
 		fastrpc_buf_free(fl->sess, imem);
@@ -913,7 +924,7 @@ fastrpc_get_dsp_info(struct fastrpc_user *fl,
 		args[1].length = len * sizeof(*attrs);
 		args[1].fd = -1;
 		error = fastrpc_invoke_args(fl, true,
-		    FASTRPC_DSP_UTILITIES_HANDLE, SCALARS(0, 1, 1), args);
+		    FASTRPC_DSP_UTILITIES_HANDLE, SCALARS(0, 1, 1), args, NULL);
 		if (error != 0) {
 			free(attrs, M_FASTRPC);
 			return (error);
@@ -963,7 +974,8 @@ fastrpc_alloc_shm(struct thread *td, struct fastrpc_alloc_dma_buf *ab)
  * the library: allocated here and given it, never mapped for the program.
  */
 static int
-fastrpc_req_mmap(struct fastrpc_user *fl, struct fastrpc_req_mmap *req)
+fastrpc_req_mmap(struct fastrpc_user *fl, struct fastrpc_req_mmap *req,
+    int *rvp)
 {
 	struct {
 		int32_t		pgid;
@@ -999,7 +1011,7 @@ fastrpc_req_mmap(struct fastrpc_user *fl, struct fastrpc_req_mmap *req)
 	for (int i = 0; i < 3; i++)
 		args[i].fd = -1;
 	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
-	    SCALARS(FASTRPC_RMID_INIT_MMAP, 2, 1), args);
+	    SCALARS(FASTRPC_RMID_INIT_MMAP, 2, 1), args, rvp);
 	if (error != 0) {
 		/* A timeout leaves the pages the DSP's. */
 		if (error != ETIMEDOUT)
@@ -1015,7 +1027,8 @@ fastrpc_req_mmap(struct fastrpc_user *fl, struct fastrpc_req_mmap *req)
 }
 
 static int
-fastrpc_req_munmap(struct fastrpc_user *fl, struct fastrpc_req_munmap *req)
+fastrpc_req_munmap(struct fastrpc_user *fl, struct fastrpc_req_munmap *req,
+    int *rvp)
 {
 	struct {
 		int32_t		pgid;
@@ -1043,7 +1056,7 @@ fastrpc_req_munmap(struct fastrpc_user *fl, struct fastrpc_req_munmap *req)
 	args[0].length = sizeof(msg);
 	args[0].fd = -1;
 	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
-	    SCALARS(FASTRPC_RMID_INIT_MUNMAP, 1, 0), args);
+	    SCALARS(FASTRPC_RMID_INIT_MUNMAP, 1, 0), args, rvp);
 	if (error == 0)
 		fastrpc_buf_free(fl->sess, b);
 	else if (error != ETIMEDOUT) {
@@ -1062,7 +1075,8 @@ fastrpc_req_munmap(struct fastrpc_user *fl, struct fastrpc_req_munmap *req)
  * on Linux; the buffer goes over written back.
  */
 static int
-fastrpc_req_mem_map(struct fastrpc_user *fl, struct fastrpc_mem_map *req)
+fastrpc_req_mem_map(struct fastrpc_user *fl, struct fastrpc_mem_map *req,
+    int *rvp)
 {
 	struct {
 		int32_t		pgid;
@@ -1110,7 +1124,7 @@ fastrpc_req_mem_map(struct fastrpc_user *fl, struct fastrpc_mem_map *req)
 	for (int i = 0; i < 4; i++)
 		args[i].fd = -1;
 	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
-	    SCALARS(FASTRPC_RMID_INIT_MEM_MAP, 3, 1), args);
+	    SCALARS(FASTRPC_RMID_INIT_MEM_MAP, 3, 1), args, rvp);
 	if (error != 0) {
 		/* A timeout leaves the pages the DSP's. */
 		if (error != ETIMEDOUT) {
@@ -1128,7 +1142,8 @@ fastrpc_req_mem_map(struct fastrpc_user *fl, struct fastrpc_mem_map *req)
 }
 
 static int
-fastrpc_req_mem_unmap(struct fastrpc_user *fl, struct fastrpc_mem_unmap *req)
+fastrpc_req_mem_unmap(struct fastrpc_user *fl, struct fastrpc_mem_unmap *req,
+    int *rvp)
 {
 	struct {
 		int32_t		pgid;
@@ -1158,7 +1173,7 @@ fastrpc_req_mem_unmap(struct fastrpc_user *fl, struct fastrpc_mem_unmap *req)
 	args[0].length = sizeof(msg);
 	args[0].fd = -1;
 	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
-	    SCALARS(FASTRPC_RMID_INIT_MEM_UNMAP, 1, 0), args);
+	    SCALARS(FASTRPC_RMID_INIT_MEM_UNMAP, 1, 0), args, rvp);
 	if (error == 0) {
 		fastrpc_shbuf_put(fl->sess, &m->sb);
 		free(m, M_FASTRPC);
@@ -1187,7 +1202,7 @@ fastrpc_dtor(void *data)
 		args[0].length = sizeof(client_id);
 		args[0].fd = -1;
 		(void)fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
-		    SCALARS(FASTRPC_RMID_INIT_RELEASE, 1, 0), args);
+		    SCALARS(FASTRPC_RMID_INIT_RELEASE, 1, 0), args, NULL);
 	}
 	fastrpc_buf_free(fl->sess, fl->init_mem);
 	/* The DSP process is gone, and with it its use of these. */
@@ -1269,7 +1284,7 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	struct fastrpc_invoke *inv;
 	struct fastrpc_user *fl;
 	u_int n;
-	int error;
+	int dsprv, error;
 
 	error = devfs_get_cdevpriv((void **)&fl);
 	if (error != 0)
@@ -1300,18 +1315,18 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		    args, n * sizeof(*args));
 		if (error == 0)
 			error = fastrpc_invoke_args(fl, false, inv->handle,
-			    inv->sc, args);
+			    inv->sc, args, &dsprv);
 		free(args, M_FASTRPC);
 		break;
 	case FASTRPC_IOCTL_INIT_ATTACH:
-		error = fastrpc_init_attach(fl, ROOT_PD);
+		error = fastrpc_init_attach(fl, ROOT_PD, &dsprv);
 		break;
 	case FASTRPC_IOCTL_INIT_ATTACH_SNS:
-		error = fastrpc_init_attach(fl, SENSORS_PD);
+		error = fastrpc_init_attach(fl, SENSORS_PD, &dsprv);
 		break;
 	case FASTRPC_IOCTL_INIT_CREATE:
 		error = fastrpc_init_create(fl,
-		    (struct fastrpc_init_create *)data);
+		    (struct fastrpc_init_create *)data, &dsprv);
 		break;
 	case FASTRPC_IOCTL_GET_DSP_INFO:
 		error = fastrpc_get_dsp_info(fl,
@@ -1329,18 +1344,20 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		error = 0;
 		break;
 	case FASTRPC_IOCTL_MMAP:
-		error = fastrpc_req_mmap(fl, (struct fastrpc_req_mmap *)data);
+		error = fastrpc_req_mmap(fl, (struct fastrpc_req_mmap *)data,
+		    &dsprv);
 		break;
 	case FASTRPC_IOCTL_MUNMAP:
 		error = fastrpc_req_munmap(fl,
-		    (struct fastrpc_req_munmap *)data);
+		    (struct fastrpc_req_munmap *)data, &dsprv);
 		break;
 	case FASTRPC_IOCTL_MEM_MAP:
-		error = fastrpc_req_mem_map(fl, (struct fastrpc_mem_map *)data);
+		error = fastrpc_req_mem_map(fl, (struct fastrpc_mem_map *)data,
+		    &dsprv);
 		break;
 	case FASTRPC_IOCTL_MEM_UNMAP:
 		error = fastrpc_req_mem_unmap(fl,
-		    (struct fastrpc_mem_unmap *)data);
+		    (struct fastrpc_mem_unmap *)data, &dsprv);
 		break;
 	case FASTRPC_IOCTL_INIT_CREATE_STATIC:
 		error = EOPNOTSUPP;
@@ -1351,6 +1368,19 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	}
 	if (sx_xlocked(&fl->lock))
 		sx_xunlock(&fl->lock);
+	if (error == FASTRPC_EDSP) {
+		/*
+		 * The DSP's result is the ioctl's value, as Linux returns it
+		 * and the library reads it; in Linux's errno range, -1 and
+		 * errno, as its system calls would make it.
+		 */
+		if (dsprv < 0 && dsprv >= -4095)
+			error = -dsprv <= ELAST ? -dsprv : EIO;
+		else {
+			td->td_retval[0] = dsprv;
+			error = 0;
+		}
+	}
 	return (error);
 }
 
