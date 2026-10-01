@@ -62,7 +62,7 @@
 
 #include <dev/qcom_audio/qcom_apps_smmu.h>
 #include <dev/qcom_audio/qcom_gpr.h>
-#include <dev/qcom_audio/qcom_lpass_macro.h>
+#include <dev/qcom_audio/qcom_wcd938x.h>
 
 static MALLOC_DEFINE(M_APM, "qcom_apm", "Qualcomm APM");
 
@@ -1292,9 +1292,9 @@ apm_tone(u_int seconds)
 		buf[2 * i] = buf[2 * i + 1] = tone_sine[i % 48];
 
 	/* The codec the device graph's DMA feeds: up before the graphs. */
-	TONE_STEP(1, "clock the RX codec macro");
+	TONE_STEP(1, "bring the codec up");
 	if (!apm_tone_stream_only)
-		error = qcom_lpass_macro_rx(true);
+		error = qcom_wcd938x_up();
 	if (error != 0)
 		goto out;
 	/* Source graph first, then sink, as Linux does. */
@@ -1333,8 +1333,10 @@ apm_tone(u_int seconds)
 		error = apm_set_volume(fe, VOL_CTRL_UNITY);
 	if (error != 0)
 		goto out;
-	TONE_STEP(9, "start the device graph");
+	TONE_STEP(9, "headphones on, start the device graph");
 	if (!apm_tone_stream_only)
+		error = qcom_wcd938x_hph(true);
+	if (error == 0 && !apm_tone_stream_only)
 		error = apm_graph_mgmt(be, APM_CMD_GRAPH_START);
 	if (error != 0)
 		goto out;
@@ -1389,7 +1391,7 @@ out:
 	if (step > 2)
 		(void)apm_graph_mgmt(fe, APM_CMD_GRAPH_CLOSE);
 	if (step > 1 && !apm_tone_stream_only)
-		(void)qcom_lpass_macro_rx(false);
+		qcom_wcd938x_down();
 	printf("qcom_apm: tone: closed\n");
 	if (handle != 0)
 		(void)apm_unmap(handle);
@@ -1459,7 +1461,7 @@ SYSCTL_UINT(_hw_qcom_apm, OID_AUTO, tone_stream_only, CTLFLAG_RW,
     &apm_tone_stream_only, 0, "Play the tone into the stream graph only");
 SYSCTL_PROC(_hw_qcom_apm, OID_AUTO, tone, CTLTYPE_UINT | CTLFLAG_RW |
     CTLFLAG_MPSAFE, NULL, 0, apm_tone_sysctl, "IU",
-    "Play a 1 kHz tone to the headphones' codec DMA for so many seconds");
+    "Play a 1 kHz tone to the headphones for so many seconds");
 
 static int
 qcom_apm_modevent(module_t mod, int type, void *data)

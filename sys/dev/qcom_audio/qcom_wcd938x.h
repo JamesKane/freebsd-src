@@ -25,24 +25,11 @@
  * SUCH DAMAGE.
  */
 
-#ifndef _DEV_QCOM_AUDIO_QCOM_SWR_H_
-#define	_DEV_QCOM_AUDIO_QCOM_SWR_H_
+#ifndef _DEV_QCOM_AUDIO_QCOM_WCD938X_H_
+#define	_DEV_QCOM_AUDIO_QCOM_WCD938X_H_
 
-#define	QCOM_SWR_RX	0	/* playback */
-#define	QCOM_SWR_TX	1	/* capture, and the codec's registers */
+int	qcom_wcd938x_up(void);
+void	qcom_wcd938x_down(void);
+int	qcom_wcd938x_hph(bool on);
 
-struct qcom_swr;
-
-/* Bring a link up; the codec macros must be clocked. */
-int	qcom_swr_up(u_int which, struct qcom_swr **sp);
-void	qcom_swr_down(void);
-uint32_t qcom_swr_attached(struct qcom_swr *s);
-uint64_t qcom_swr_dev_id(struct qcom_swr *s, u_int n);
-int	qcom_swr_read(struct qcom_swr *s, u_int dev, uint16_t reg,
-	    uint8_t *val);
-int	qcom_swr_write(struct qcom_swr *s, u_int dev, uint16_t reg,
-	    uint8_t val);
-void	qcom_swr_mmio_write(struct qcom_swr *s, u_int reg, uint32_t val);
-int	qcom_swr_bank_switch(struct qcom_swr *s, uint16_t reg);
-
-#endif /* _DEV_QCOM_AUDIO_QCOM_SWR_H_ */
+#endif /* _DEV_QCOM_AUDIO_QCOM_WCD938X_H_ */

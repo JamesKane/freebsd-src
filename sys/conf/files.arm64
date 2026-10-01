@@ -817,6 +817,7 @@ dev/qcom_audio/qcom_gpr.c			optional qcom_audio qcom_glink
 dev/qcom_audio/qcom_lpass_macro.c		optional qcom_audio qcom_glink
 dev/qcom_audio/qcom_prm.c			optional qcom_audio qcom_glink
 dev/qcom_audio/qcom_swr.c			optional qcom_audio qcom_glink
+dev/qcom_audio/qcom_wcd938x.c		optional qcom_audio qcom_glink gpio
 dev/qcom_glink/qcom_aoss.c			optional qcom_glink acpi
 dev/qcom_glink/qcom_glink.c			optional qcom_glink acpi
 dev/qcom_glink/qcom_ipcc.c			optional qcom_glink acpi

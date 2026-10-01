@@ -61,6 +61,7 @@
 #define	SWRM_INTERRUPT_CLEAR		0x208
 #define	SWRM_INTERRUPT_CPU_EN		0x210
 #define	SWRM_INTERRUPT_ALL		0x1ffff
+#define	SWRM_INT_SPECIAL_CMD_DONE	0x400
 #define	SWRM_CMD_FIFO_WR_CMD		0x300
 #define	SWRM_CMD_FIFO_RD_CMD		0x304
 #define	SWRM_CMD_FIFO_CMD		0x308
@@ -89,6 +90,8 @@
 	((uint32_t)(reg) | (uint32_t)(id) << 16 | (uint32_t)(dev) << 20 | \
 	(uint32_t)(data) << 24)
 #define	SWRM_MAX_CMD_ID			14
+#define	SWRM_BROADCAST_CMD_ID		15
+#define	SWRM_BROADCAST_DEV		15
 
 /* 50 rows (index 1) by 16 columns (index 7), as Linux uses on v1.6. */
 #define	SWRM_FRAME_SHAPE		(7 | 1 << 3)
@@ -309,6 +312,38 @@ qcom_swr_write(struct qcom_swr *s, u_int dev, uint16_t reg, uint8_t val)
 	WR(s, SWRM_CMD_FIFO_WR_CMD, SWRM_CMD(val, dev, swr_next_id(&s->wcmd_id),
 	    reg));
 	return (0);
+}
+
+/* A controller register, for setting up its data ports. */
+void
+qcom_swr_mmio_write(struct qcom_swr *s, u_int reg, uint32_t val)
+{
+
+	WR(s, reg, val);
+}
+
+/*
+ * Switch banks: broadcast the new frame shape to SCP_FRAMECTRL of the bank
+ * not in use (reg), which every device and the controller take up at the
+ * next frame, and wait for the controller to say it went out.
+ */
+int
+qcom_swr_bank_switch(struct qcom_swr *s, uint16_t reg)
+{
+	int error;
+
+	WR(s, SWRM_INTERRUPT_CLEAR, SWRM_INT_SPECIAL_CMD_DONE);
+	if (swr_wr_space(s) != 0)
+		return (EIO);
+	WR(s, SWRM_CMD_FIFO_WR_CMD, SWRM_CMD(SWRM_FRAME_SHAPE,
+	    SWRM_BROADCAST_DEV, SWRM_BROADCAST_CMD_ID, reg));
+	error = swr_wait(s, SWRM_INTERRUPT_STATUS, SWRM_INT_SPECIAL_CMD_DONE,
+	    true);
+	WR(s, SWRM_INTERRUPT_CLEAR, RD(s, SWRM_INTERRUPT_STATUS));
+	if (error != 0)
+		printf("qcom_swr: %s: bank switch not done (status %#x)\n",
+		    s->link->name, RD(s, SWRM_INTERRUPT_STATUS));
+	return (error);
 }
 
 int
