@@ -432,11 +432,13 @@ fastrpc_rx(void *arg __unused, const void *data, size_t len)
 	const struct fastrpc_invoke_rsp *rsp = data;
 	struct fastrpc_ctx *c;
 	u_int slot;
+	bool reap;
 
 	if (len < offsetof(struct fastrpc_invoke_rsp, pad) ||
 	    rsp->ctx == FASTRPC_DSP_PD_NOTIFY_CTX)
 		return;
 	slot = CTXID_SLOT(rsp->ctx);
+	reap = false;
 	mtx_lock(&frpc.mtx);
 	c = frpc.ctx[slot];
 	if (c != NULL && CTXID_SEQ(c->ctxid) == CTXID_SEQ(rsp->ctx)) {
@@ -445,13 +447,16 @@ fastrpc_rx(void *arg __unused, const void *data, size_t len)
 		if (c->abandoned) {
 			frpc.ctx[slot] = NULL;
 			STAILQ_INSERT_TAIL(&frpc.reap, c, link);
-			taskqueue_enqueue(frpc.tq, &frpc.reap_task);
+			reap = true;
 		} else
 			wakeup(c);
 	} else
 		printf("qcom_fastrpc: answer for no call (%#jx)\n",
 		    (uintmax_t)rsp->ctx);
 	mtx_unlock(&frpc.mtx);
+	/* Not under the mutex: the task queue's lock shares its name. */
+	if (reap)
+		taskqueue_enqueue(frpc.tq, &frpc.reap_task);
 }
 
 static int
