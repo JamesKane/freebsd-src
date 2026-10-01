@@ -35,6 +35,9 @@
  * chn_intr() refills it, and the next block goes to the DSP.  Talking to
  * the DSP sleeps and sound(4) triggers with the channel locked, so starting
  * and stopping, and the work for each finished block, run on a task queue.
+ *
+ * The mixer's master volume is the stream's gain in the DSP; sound(4)
+ * supplies the PCM control in software.
  */
 
 #include <sys/param.h>
@@ -60,12 +63,14 @@
 #include <dev/qcom_audio/qcom_apm.h>
 
 #include "channel_if.h"
+#include "mixer_if.h"
 
 #define	PCM_RATE	48000
 #define	PCM_FRAME	4		/* 16-bit stereo */
 #define	PCM_BUFSZ	(64 * 1024)	/* the ring at most */
-#define	PCM_BLKSZ	(PCM_RATE / 100 * PCM_FRAME)	/* 10 ms */
-#define	PCM_AHEAD	2		/* blocks with the DSP */
+#define	PCM_MS		(PCM_RATE / 1000 * PCM_FRAME)	/* bytes */
+#define	PCM_BLKSZ	(10 * PCM_MS)
+#define	PCM_AHEAD_MS	40		/* queued with the DSP, about */
 
 struct qcom_pcm_softc {
 	struct snddev_info	info;	/* first, for sound(4) */
@@ -77,9 +82,11 @@ struct qcom_pcm_softc {
 	struct task		start_task;
 	struct task		stop_task;
 	struct task		done_task;
+	struct task		vol_task;
 	struct qcom_apm_play	*play;	/* the task's alone */
 	u_int			blksz;
 	u_int			blkcnt;
+	volatile u_int		volume;	/* 0 to 100 */
 	/* Under the channel lock: */
 	bool			running;
 	u_int			played;	/* blocks finished since start */
@@ -94,6 +101,21 @@ static uint32_t qcom_pcm_fmt[] = {
 };
 static struct pcmchan_caps qcom_pcm_caps = { PCM_RATE, PCM_RATE,
     qcom_pcm_fmt, 0 };
+
+/* The DSP's gain for each master volume: 0.6 dB a step, 100 unity. */
+static const uint16_t qcom_pcm_gain[101] = {
+	0, 9, 9, 10, 11, 12, 12, 13, 14, 15,
+	16, 18, 19, 20, 22, 23, 25, 27, 28, 30,
+	33, 35, 37, 40, 43, 46, 49, 53, 57, 61,
+	65, 70, 75, 80, 86, 92, 98, 106, 113, 121,
+	130, 139, 149, 160, 171, 183, 197, 211, 226, 242,
+	259, 278, 297, 319, 341, 366, 392, 420, 450, 482,
+	517, 554, 593, 636, 681, 730, 782, 838, 898, 962,
+	1031, 1105, 1184, 1269, 1360, 1457, 1561, 1673, 1792, 1920,
+	2058, 2205, 2363, 2532, 2713, 2907, 3115, 3337, 3576, 3832,
+	4106, 4399, 4714, 5051, 5412, 5799, 6214, 6659, 7135, 7645,
+	8192,
+};
 
 /* Channel */
 
@@ -131,10 +153,14 @@ qcom_pcm_chan_setblocksize(kobj_t obj, void *data, uint32_t blksz)
 {
 	struct qcom_pcm_softc *sc = data;
 
-	/* Whole frames, from 5 ms up to a quarter of the ring. */
-	blksz = rounddown2(blksz, PCM_FRAME);
-	blksz = MAX(blksz, PCM_BLKSZ / 2);
-	blksz = MIN(blksz, PCM_BUFSZ / 4);
+	/*
+	 * Whole milliseconds, which the DSP processes in: a block ending
+	 * part way through one leaves a glitch.  From 5 ms up to a quarter
+	 * of the ring.
+	 */
+	blksz = rounddown(blksz, PCM_MS);
+	blksz = MAX(blksz, 5 * PCM_MS);
+	blksz = MIN(blksz, rounddown(PCM_BUFSZ / 4, PCM_MS));
 	if (sndbuf_resize(sc->buf, PCM_BUFSZ / blksz, blksz) == 0) {
 		sc->blksz = blksz;
 		sc->blkcnt = PCM_BUFSZ / blksz;
@@ -195,16 +221,39 @@ CHANNEL_DECLARE(qcom_pcm_chan);
 
 /* The DSP's side, on the task queue */
 
-/* Hand the DSP the next block. */
+/*
+ * Keep the DSP about PCM_AHEAD_MS ahead, so that a late task doesn't leave
+ * it short: hand it the blocks after the last it has, as long as sound(4)
+ * has filled them.
+ */
 static int
-qcom_pcm_send(struct qcom_pcm_softc *sc)
+qcom_pcm_fill(struct qcom_pcm_softc *sc)
 {
-	u_int blk;
+	u_int ahead, blk, queued, ready;
+	int error;
 
-	blk = sc->sent % sc->blkcnt;
-	sc->sent++;
-	return (qcom_apm_play_write(sc->play, blk * sc->blksz, sc->blksz,
-	    blk));
+	ahead = MAX(2, howmany(PCM_AHEAD_MS * PCM_MS, sc->blksz));
+	ahead = MIN(ahead, sc->blkcnt - 1);
+	for (error = 0; error == 0;) {
+		CHN_LOCK(sc->pcm);
+		queued = sc->sent - sc->played;
+		ready = sndbuf_getready(sc->buf);
+		CHN_UNLOCK(sc->pcm);
+		/*
+		 * Two blocks always, so that the DSP keeps finishing them
+		 * and this keeps being called; more only once filled.
+		 */
+		if (queued >= ahead ||
+		    (queued >= 2 && (queued + 1) * sc->blksz > ready))
+			break;
+		blk = sc->sent % sc->blkcnt;
+		sc->sent++;
+		error = qcom_apm_play_write(sc->play, blk * sc->blksz,
+		    sc->blksz, blk);
+	}
+	if (error != 0)
+		device_printf(sc->dev, "write: %d\n", error);
+	return (error);
 }
 
 /* From the DSP link's thread, which mustn't talk to the DSP itself. */
@@ -223,7 +272,6 @@ static void
 qcom_pcm_start_task(void *arg, int pending __unused)
 {
 	struct qcom_pcm_softc *sc = arg;
-	u_int i;
 	int error;
 
 	if (sc->play != NULL)
@@ -237,10 +285,8 @@ qcom_pcm_start_task(void *arg, int pending __unused)
 		sc->play = NULL;
 		return;
 	}
-	for (i = 0, error = 0; i < PCM_AHEAD && error == 0; i++)
-		error = qcom_pcm_send(sc);
-	if (error != 0)
-		device_printf(sc->dev, "write: %d\n", error);
+	(void)qcom_apm_play_volume(sc->play, qcom_pcm_gain[sc->volume]);
+	(void)qcom_pcm_fill(sc);
 }
 
 static void
@@ -260,11 +306,19 @@ qcom_pcm_done_task(void *arg, int pending __unused)
 	CHN_UNLOCK(sc->pcm);
 	if (!running)
 		return;
-	while (n-- > 0) {
+	while (n-- > 0)
 		chn_intr(sc->pcm);
-		if (qcom_pcm_send(sc) != 0)
-			break;
-	}
+	(void)qcom_pcm_fill(sc);
+}
+
+static void
+qcom_pcm_vol_task(void *arg, int pending __unused)
+{
+	struct qcom_pcm_softc *sc = arg;
+
+	if (sc->play != NULL)
+		(void)qcom_apm_play_volume(sc->play,
+		    qcom_pcm_gain[sc->volume]);
 }
 
 static void
@@ -277,6 +331,37 @@ qcom_pcm_stop_task(void *arg, int pending __unused)
 	qcom_apm_play_close(sc->play);
 	sc->play = NULL;
 }
+
+/* Mixer */
+
+static int
+qcom_pcm_mixer_init(struct snd_mixer *m)
+{
+
+	mix_setdevs(m, SOUND_MASK_VOLUME);
+	return (0);
+}
+
+static int
+qcom_pcm_mixer_set(struct snd_mixer *m, unsigned dev, unsigned left,
+    unsigned right)
+{
+	struct qcom_pcm_softc *sc = mix_getdevinfo(m);
+
+	if (dev != SOUND_MIXER_VOLUME)
+		return (-1);
+	/* One gain for both sides. */
+	sc->volume = MIN((left + right) / 2, 100);
+	taskqueue_enqueue(sc->tq, &sc->vol_task);
+	return (left | right << 8);
+}
+
+static kobj_method_t qcom_pcm_mixer_methods[] = {
+	KOBJMETHOD(mixer_init,		qcom_pcm_mixer_init),
+	KOBJMETHOD(mixer_set,		qcom_pcm_mixer_set),
+	KOBJMETHOD_END
+};
+MIXER_DECLARE(qcom_pcm_mixer);
 
 /* Device */
 
@@ -319,9 +404,14 @@ qcom_pcm_attach(device_t dev)
 	TASK_INIT(&sc->start_task, 0, qcom_pcm_start_task, sc);
 	TASK_INIT(&sc->stop_task, 0, qcom_pcm_stop_task, sc);
 	TASK_INIT(&sc->done_task, 0, qcom_pcm_done_task, sc);
+	TASK_INIT(&sc->vol_task, 0, qcom_pcm_vol_task, sc);
+	sc->volume = 100;
 
 	pcm_init(dev, sc);
-	error = pcm_addchan(dev, PCMDIR_PLAY, &qcom_pcm_chan_class, sc);
+	pcm_setflags(dev, pcm_getflags(dev) | SD_F_MPSAFE | SD_F_SOFTPCMVOL);
+	error = mixer_init(dev, &qcom_pcm_mixer_class, sc);
+	if (error == 0)
+		error = pcm_addchan(dev, PCMDIR_PLAY, &qcom_pcm_chan_class, sc);
 	if (error == 0)
 		error = pcm_register(dev, "on the audio DSP");
 	if (error != 0) {
@@ -341,6 +431,7 @@ qcom_pcm_detach(device_t dev)
 	error = pcm_unregister(dev);
 	if (error != 0)
 		return (error);
+	/* pcm_unregister took the mixer down too. */
 	/* The channels are gone, so no more triggers: finish the stop. */
 	taskqueue_enqueue(sc->tq, &sc->stop_task);
 	taskqueue_drain_all(sc->tq);

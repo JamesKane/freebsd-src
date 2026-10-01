@@ -1389,6 +1389,18 @@ qcom_apm_play_write(struct qcom_apm_play *p, size_t off, size_t len,
 	    cmd, sizeof(cmd)));
 }
 
+/* The stream's gain, in Q13: 0x2000 is unity. */
+int
+qcom_apm_play_volume(struct qcom_apm_play *p, uint16_t gain)
+{
+	int error;
+
+	sx_xlock(&apm.lock);
+	error = apm_set_volume(&p->fe, gain);
+	sx_xunlock(&apm.lock);
+	return (error);
+}
+
 /* Stop: the DSP gives back what it held, then everything comes down. */
 void
 qcom_apm_play_close(struct qcom_apm_play *p)

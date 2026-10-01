@@ -43,6 +43,7 @@ int	qcom_apm_play_open(vm_offset_t buf, size_t size, qcom_apm_done_t *done,
 	    void *arg, struct qcom_apm_play **pp);
 int	qcom_apm_play_write(struct qcom_apm_play *p, size_t off, size_t len,
 	    u_int token);
+int	qcom_apm_play_volume(struct qcom_apm_play *p, uint16_t gain);
 void	qcom_apm_play_close(struct qcom_apm_play *p);
 
 #endif /* _DEV_QCOM_AUDIO_QCOM_APM_H_ */
