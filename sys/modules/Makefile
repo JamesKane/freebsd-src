@@ -343,6 +343,7 @@ SUBDIR=	\
 	${_qat_c2xxx} \
 	${_qat_c2xxxfw} \
 	${_qcom_adsp} \
+	${_qcom_audio} \
 	${_qcom_glink} \
 	${_qcom_cmd_db} \
 	${_qcom_epss} \
@@ -753,6 +754,7 @@ _dpaa2=		dpaa2
 _sff=		sff
 _em=		em
 _qcom_adsp=	qcom_adsp
+_qcom_audio=	qcom_audio
 _qcom_glink=	qcom_glink
 _qcom_cmd_db=	qcom_cmd_db
 _qcom_epss=	qcom_epss

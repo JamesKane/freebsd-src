@@ -811,6 +811,7 @@ dev/qcom_cmd_db/qcom_cmd_db.c			optional qcom_cmd_db acpi | qcom_cmd_db fdt
 dev/qcom_epss/qcom_epss.c			optional qcom_epss acpi | qcom_epss fdt
 dev/qcom_geni/qcom_geni_i2c.c			optional qcom_geni_i2c acpi iicbus
 dev/qcom_tlmm/qcom_tlmm_acpi.c			optional qcom_tlmm_acpi acpi gpio
+dev/qcom_audio/qcom_gpr.c			optional qcom_audio qcom_glink
 dev/qcom_glink/qcom_glink.c			optional qcom_glink acpi
 dev/qcom_glink/qcom_ipcc.c			optional qcom_glink acpi
 dev/qcom_glink/qcom_smem.c			optional qcom_glink acpi
