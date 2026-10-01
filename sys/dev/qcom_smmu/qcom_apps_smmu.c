@@ -340,6 +340,33 @@ qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa, size_t size,
 	return (0);
 }
 
+/* Pages, wherever they are, at consecutive I/O addresses. */
+int
+qcom_apps_smmu_map_pages(struct qcom_apps_smmu_dom *d, vm_page_t *ma,
+    u_int npages, uint64_t *iovap)
+{
+	vmem_addr_t iova;
+	u_int i;
+	int error;
+
+	error = vmem_alloc(d->iova, ptoa(npages), M_BESTFIT | M_NOWAIT, &iova);
+	if (error != 0)
+		return (ENOSPC);
+	for (i = 0; i < npages; i++) {
+		error = qcom_smmu_map(d->pt, iova + ptoa(i),
+		    VM_PAGE_TO_PHYS(ma[i]), PAGE_SIZE, QCOM_SMMU_UNCACHED);
+		if (error != 0) {
+			if (i > 0)
+				qcom_smmu_unmap(d->pt, iova, ptoa(i));
+			qcom_apps_smmu_tlb_flush(d);
+			vmem_free(d->iova, iova, ptoa(npages));
+			return (error);
+		}
+	}
+	*iovap = iova;
+	return (0);
+}
+
 void
 qcom_apps_smmu_unmap(struct qcom_apps_smmu_dom *d, uint64_t iova, size_t size)
 {

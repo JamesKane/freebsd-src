@@ -40,6 +40,9 @@ int	qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
 	    struct qcom_apps_smmu_dom **dp);
 int	qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa,
 	    size_t size, uint64_t *iovap);
+/* Pages, wherever they are, at consecutive I/O addresses; uncached. */
+int	qcom_apps_smmu_map_pages(struct qcom_apps_smmu_dom *d, vm_page_t *ma,
+	    u_int npages, uint64_t *iovap);
 void	qcom_apps_smmu_unmap(struct qcom_apps_smmu_dom *d, uint64_t iova,
 	    size_t size);
 
