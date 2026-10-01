@@ -23,6 +23,11 @@ device		qcom_tlmm_acpi		# its GPIOs, under ACPI
 # MMC/SD/SDIO Card slot support
 device		sdhci
 
+# The audio DSP: its links, and audio through it
+device		qcom_glink		# GLINK, IPCC, shared memory, AOSS
+device		qcom_smmu		# MMU-500 SMMU page tables
+device		qcom_audio		# DSP audio, codec, sound(4)
+
 options 	FDT
 
 # DTBs
