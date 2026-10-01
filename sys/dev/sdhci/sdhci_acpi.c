@@ -49,6 +49,16 @@
 #include "mmcbr_if.h"
 #include "sdhci_if.h"
 
+/*
+ * Card detect through a GPIO, for the Qualcomm controllers.  Every arm64
+ * kernel has gpio(4); the other platforms' kernels may not.
+ */
+#ifdef __aarch64__
+#define	SDHCI_ACPI_GPIO_CD
+#include <sys/gpio.h>
+#include "gpio_if.h"
+#endif
+
 #define	SDHCI_AMD_RESET_DLL_REG	0x908
 
 /*
@@ -100,13 +110,12 @@ static const struct sdhci_acpi_device {
 	    SDHCI_QUIRK_32BIT_DMA_SIZE |
 	    SDHCI_QUIRK_MMC_HS400_IF_CAN_SDR104 },
 	/*
-	 * Card detect is a GPIO, and the card supplies are regulators, which
-	 * the firmware leaves on; so the slot keeps its card, at 3 V.  DMA
-	 * goes through an SMMU the firmware may not have set up for it.
+	 * Card detect is a GPIO, polled.  The card supplies are regulators,
+	 * which the firmware leaves on, at 3 V.  The controller has ADMA2 but
+	 * not SDMA, which sdhci doesn't use, so transfers are PIO; forcing
+	 * SDMA on hangs the SoC.
 	 */
 	{ "QCOM2466",	0, "Qualcomm SDHCI-MSM SD Controller",
-	    SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE |
-	    SDHCI_QUIRK_BROKEN_DMA |
 	    SDHCI_QUIRK_MISSING_CAPS,
 	    SDHCI_ACPI_QCOM },
 	{ NULL, 0, NULL, 0}
@@ -128,6 +137,10 @@ struct sdhci_acpi_softc {
 	struct resource *irq_res;	/* IRQ resource */
 	void		*intrhand;	/* Interrupt handle */
 	const struct sdhci_acpi_device *acpi_dev;
+#ifdef SDHCI_ACPI_GPIO_CD
+	device_t	cd_gpio;	/* card detect, active low */
+	uint32_t	cd_pin;
+#endif
 };
 
 static void sdhci_acpi_intr(void *arg);
@@ -341,6 +354,52 @@ sdhci_acpi_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+#ifdef SDHCI_ACPI_GPIO_CD
+/* The first GpioIo of the device's resources is its card detect line. */
+static ACPI_STATUS
+sdhci_acpi_find_cd(ACPI_RESOURCE *res, void *arg)
+{
+	struct sdhci_acpi_softc *sc = arg;
+	ACPI_RESOURCE_GPIO *gpio = &res->Data.Gpio;
+	ACPI_HANDLE handle;
+	device_t ctrl;
+	uint32_t flags;
+
+	if (res->Type != ACPI_RESOURCE_TYPE_GPIO ||
+	    gpio->ConnectionType != ACPI_RESOURCE_GPIO_TYPE_IO ||
+	    gpio->PinTableLength < 1)
+		return (AE_OK);
+	if (ACPI_FAILURE(AcpiGetHandle(ACPI_ROOT_OBJECT,
+	    gpio->ResourceSource.StringPtr, &handle)) ||
+	    (ctrl = acpi_get_device(handle)) == NULL ||
+	    !device_is_attached(ctrl))
+		return (AE_CTRL_TERMINATE);
+	/* As an input, with the pull the firmware's tables give it. */
+	flags = GPIO_PIN_INPUT;
+	if (gpio->PinConfig == ACPI_PIN_CONFIG_PULLUP)
+		flags |= GPIO_PIN_PULLUP;
+	else if (gpio->PinConfig == ACPI_PIN_CONFIG_PULLDOWN)
+		flags |= GPIO_PIN_PULLDOWN;
+	if (GPIO_PIN_SETFLAGS(ctrl, gpio->PinTable[0], flags) == 0) {
+		sc->cd_gpio = ctrl;
+		sc->cd_pin = gpio->PinTable[0];
+	}
+	return (AE_CTRL_TERMINATE);
+}
+
+static bool
+sdhci_acpi_get_card_present(device_t dev, struct sdhci_slot *slot)
+{
+	struct sdhci_acpi_softc *sc = device_get_softc(dev);
+	uint32_t val;
+
+	if (sc->cd_gpio != NULL &&
+	    GPIO_PIN_GET(sc->cd_gpio, sc->cd_pin, &val) == 0)
+		return (val == 0);
+	return (sdhci_generic_get_card_present(dev, slot));
+}
+#endif
+
 static int
 sdhci_acpi_attach(device_t dev)
 {
@@ -396,6 +455,18 @@ sdhci_acpi_attach(device_t dev)
 		sc->slot.caps2 = bus_read_4(sc->mem_res,
 		    SDHCI_CAPABILITIES2) & ~(SDHCI_CAN_SDR50 |
 		    SDHCI_CAN_SDR104 | SDHCI_CAN_DDR50);
+		/*
+		 * Card detect is a GPIO; without a driver for its
+		 * controller, the slot keeps the card it booted with.
+		 */
+#ifdef SDHCI_ACPI_GPIO_CD
+		AcpiWalkResources(acpi_get_handle(dev), "_CRS",
+		    sdhci_acpi_find_cd, sc);
+		if (sc->cd_gpio != NULL)
+			quirks |= SDHCI_QUIRK_POLL_CARD_PRESENT;
+		else
+#endif
+			quirks |= SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE;
 	}
 	quirks &= ~sdhci_quirk_clear;
 	quirks |= sdhci_quirk_set;
@@ -518,6 +589,9 @@ static device_method_t sdhci_methods[] = {
 	DEVMETHOD(sdhci_write_4,	sdhci_acpi_write_4),
 	DEVMETHOD(sdhci_write_multi_4,	sdhci_acpi_write_multi_4),
 	DEVMETHOD(sdhci_set_uhs_timing,	sdhci_acpi_set_uhs_timing),
+#ifdef SDHCI_ACPI_GPIO_CD
+	DEVMETHOD(sdhci_get_card_present, sdhci_acpi_get_card_present),
+#endif
 
 	DEVMETHOD_END
 };
@@ -530,6 +604,9 @@ static driver_t sdhci_acpi_driver = {
 
 DRIVER_MODULE(sdhci_acpi, acpi, sdhci_acpi_driver, NULL, NULL);
 SDHCI_DEPEND(sdhci_acpi);
+#ifdef SDHCI_ACPI_GPIO_CD
+MODULE_DEPEND(sdhci_acpi, gpiobus, 1, 1, 1);
+#endif
 
 #ifndef MMCCAM
 MMC_DECLARE_BRIDGE(sdhci_acpi);
