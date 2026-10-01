@@ -6,6 +6,7 @@ MAN=	\
 	felix.4 \
 	qcom_adsp.4 \
 	qcom_epss.4 \
+	qcom_fastrpc.4 \
 	qcom_geni_i2c.4 \
 	qcom_glink.4 \
 	qcom_pmic_glink.4 \

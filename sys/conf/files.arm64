@@ -809,6 +809,7 @@ dev/qcom_mdio/qcom_mdio_ipq4018.c		optional qcom_mdio fdt mdio mii
 dev/qcom_adsp/qcom_adsp.c			optional qcom_adsp acpi
 dev/qcom_cmd_db/qcom_cmd_db.c			optional qcom_cmd_db acpi | qcom_cmd_db fdt
 dev/qcom_epss/qcom_epss.c			optional qcom_epss acpi | qcom_epss fdt
+dev/qcom_fastrpc/qcom_fastrpc.c		optional qcom_fastrpc qcom_glink qcom_smmu
 dev/qcom_geni/qcom_geni_i2c.c			optional qcom_geni_i2c acpi iicbus
 dev/qcom_tlmm/qcom_tlmm_acpi.c			optional qcom_tlmm_acpi acpi gpio
 dev/qcom_audio/qcom_apm.c			optional qcom_audio qcom_glink

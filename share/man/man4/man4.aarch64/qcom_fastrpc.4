@@ -1,0 +1,94 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd October 1, 2026
+.Dt QCOM_FASTRPC 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_fastrpc
+.Nd "Qualcomm FastRPC driver"
+.Sh SYNOPSIS
+To load the driver as a module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+qcom_fastrpc_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver lets programs call code on the compute DSP (CDSP) of Qualcomm
+Snapdragon systems-on-chip, home of the NPU, through
+.Pa /dev/fastrpc-cdsp ,
+with the requests and structures of Linux's FastRPC driver, so that its
+user space ports unchanged.
+The CDSP must be running, which
+.Xr qcom_adsp 4
+does; the device appears once the DSP has opened its FastRPC channel over
+.Xr qcom_glink 4 .
+.Pp
+Each open of the device takes a session, one of the DSP's compute context
+banks, which translates the DSP's accesses to that program's buffers
+through the apps SMMU.
+A call's arguments are copied into a buffer mapped through the session,
+and its results copied back.
+.Pp
+The requests supported are
+.Dv FASTRPC_IOCTL_INVOKE ,
+.Dv FASTRPC_IOCTL_INIT_ATTACH ,
+.Dv FASTRPC_IOCTL_INIT_ATTACH_SNS ,
+.Dv FASTRPC_IOCTL_INIT_CREATE
+and
+.Dv FASTRPC_IOCTL_GET_DSP_INFO ,
+defined in
+.In dev/qcom_fastrpc/fastrpc.h .
+.Sh HARDWARE
+The
+.Nm
+driver supports the compute DSP (NSP0) of the Qualcomm Snapdragon 8cx
+Gen 3 (SC8280XP), with twelve sessions.
+It has been tested on the Radxa Dragon Q8B.
+.Sh SEE ALSO
+.Xr qcom_adsp 4 ,
+.Xr qcom_glink 4
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver and this manual page were written by
+.An James Kane .
+.Sh BUGS
+Buffers passed by file descriptor (dma-bufs), maps of memory into the
+DSP's processes, static processes and poll mode are not supported, and
+their requests fail with
+.Er EOPNOTSUPP .
+A call the DSP fails returns
+.Er EIO ,
+where Linux returns the DSP's result as the request's value.
+The module cannot be unloaded.
