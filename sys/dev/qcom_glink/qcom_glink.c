@@ -130,6 +130,8 @@ struct qcom_glink_soc {
 static const struct qcom_glink_edge_conf sc8280xp_edges[] = {
 	{ "lpass", QCOM_SMEM_HOST_ADSP, QCOM_IPCC_CLIENT_LPASS,
 	    QCOM_IPCC_SIGNAL_GLINK },
+	{ "cdsp", QCOM_SMEM_HOST_CDSP, QCOM_IPCC_CLIENT_CDSP,
+	    QCOM_IPCC_SIGNAL_GLINK },
 };
 
 static const struct qcom_glink_soc qcom_glink_socs[] = {

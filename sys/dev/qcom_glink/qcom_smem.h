@@ -36,6 +36,7 @@
 
 #define	QCOM_SMEM_HOST_APPS	0	/* this processor */
 #define	QCOM_SMEM_HOST_ADSP	2
+#define	QCOM_SMEM_HOST_CDSP	5
 
 /* Find an item: its address and size, or ENOENT. */
 int	qcom_smem_get(u_int host, u_int item, void **ptr, size_t *size);

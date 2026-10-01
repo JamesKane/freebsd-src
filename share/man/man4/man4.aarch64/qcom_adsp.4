@@ -24,12 +24,12 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd September 30, 2026
+.Dd October 1, 2026
 .Dt QCOM_ADSP 4 aarch64
 .Os
 .Sh NAME
 .Nm qcom_adsp
-.Nd "Qualcomm audio DSP loader"
+.Nd "Qualcomm audio and compute DSP loader"
 .Sh SYNOPSIS
 To compile this driver into the kernel,
 place the following lines in your
@@ -48,11 +48,17 @@ qcom_adsp_load="YES"
 .Sh DESCRIPTION
 The
 .Nm
-driver starts the audio DSP (ADSP) of Qualcomm Snapdragon systems-on-chip
-with its board's firmware.
-It loads the firmware into the memory reserved for the ADSP, and has the
-TrustZone firmware authenticate it and start the ADSP through
+driver starts the audio DSP (ADSP) and the compute DSP (CDSP, which holds
+the NPU) of Qualcomm Snapdragon systems-on-chip with their board's
+firmware.
+It loads each DSP's firmware into the memory reserved for it, and has the
+TrustZone firmware authenticate it and start the DSP through
 .Xr qcom_scm 4 .
+Before a DSP that needs them starts, it votes, through
+.Xr qcom_rpmh 4 ,
+the DSP's power rail to its highest level and its path to memory to its
+highest bandwidth, as Linux holds them while the DSP boots; the votes
+stay.
 The firmware is read once the root file system is mounted, from a
 .Xr firmware 9
 module named after the file's path in linux-firmware with
@@ -66,32 +72,41 @@ or from
 .Pa /boot/firmware .
 .Pp
 The firmware is specific to each board, which the driver recognizes by its
-SMBIOS system maker and product.
+SMBIOS system maker and product, and each DSP by its ACPI hardware ID.
 On the Radxa Dragon Q8B, the ADSP runs Radxa's fan control, which parks the
 fan when the system is cool; without the ADSP the fan runs at full speed.
 .Pp
-The driver does not otherwise communicate with the ADSP, and cannot stop
-it: it cannot be detached while the ADSP runs.
+The driver does not otherwise communicate with the DSPs, and cannot stop
+them: it cannot be detached while a DSP runs.
+Once running, they talk to the application processors over
+.Xr qcom_glink 4 .
 .Sh HARDWARE
 The
 .Nm
-driver attaches to the ACPI device with hardware ID
+driver attaches to the ACPI devices with hardware IDs
 .Qq QCOM061B
-on the following boards:
+(the ADSP) and
+.Qq QCOM06B0
+(the CDSP) on the following boards:
 .Pp
 .Bl -bullet -compact
 .It
 Radxa Dragon Q8B (Qualcomm Snapdragon 8cx Gen 3, SC8280XP),
 with firmware
-.Pa qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn .
+.Pa qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn
+for the ADSP and
+.Pa qcom/sc8280xp/qccdsp8280.mbn
+for the CDSP.
 .El
 .Sh SYSCTL VARIABLES
 .Bl -tag -width indent
 .It Va dev.qcom_adsp.%d.state
-Whether the ADSP is waiting to start, starting, running or stopped, or
+Whether the DSP is waiting to start, starting, running or stopped, or
 why it failed to start.
 .El
 .Sh SEE ALSO
+.Xr qcom_glink 4 ,
+.Xr qcom_rpmh 4 ,
 .Xr qcom_scm 4 ,
 .Xr qcom_tsens 4 ,
 .Xr firmware 9

@@ -26,25 +26,27 @@
  */
 
 /*
- * Qualcomm audio DSP (ADSP) loader: starts the ADSP with the board's
- * firmware, through the TrustZone peripheral authentication service (PAS),
- * as Linux's qcom_q6v5_pas and mdt_loader do.
+ * Qualcomm DSP loader: starts the audio DSP (ADSP) and the compute DSP
+ * (CDSP, home of the NPU) with the board's firmware, through the TrustZone
+ * peripheral authentication service (PAS), as Linux's qcom_q6v5_pas and
+ * mdt_loader do.
  *
  * The firmware is an ELF image with Qualcomm's program header flags.  Its
  * metadata, the ELF and program headers followed by the hash segment, goes
- * to TrustZone first; its loadable segments are then copied into the ADSP's
+ * to TrustZone first; its loadable segments are then copied into the DSP's
  * reserved memory, relocated to its start, and TrustZone authenticates them
- * and releases the ADSP from reset.  The firmware is board-specific: boards
- * are matched by their SMBIOS names.  It is read once the root filesystem is
- * mounted, from a firmware(9) module named after its path in linux-firmware
- * with '/', '.' and '-' turned into '_', or from /boot/firmware, and once
- * qcom_scm(4) has attached, which its module may do after this one's.
+ * and releases the DSP from reset.  The firmware is board-specific: boards
+ * are matched by their SMBIOS names, and each DSP by its ACPI ID.  It is
+ * read once the root filesystem is mounted, from a firmware(9) module named
+ * after its path in linux-firmware with '/', '.' and '-' turned into '_', or
+ * from /boot/firmware, and once qcom_scm(4) has attached, which its module
+ * may do after this one's.
  *
- * Nothing here talks to the ADSP once it runs: its power votes, its GLINK
+ * Nothing here talks to a DSP once it runs: its own power votes, its GLINK
  * services and its crash notifications are not handled, and it can't be
- * stopped, which needs its stop handshake; the driver stays attached.  On the Radxa Dragon
- * Q8B, Radxa's firmware controls the fan by itself; without the ADSP the fan
- * runs at full speed.
+ * stopped, which needs its stop handshake; the driver stays attached.  On
+ * the Radxa Dragon Q8B, Radxa's firmware controls the fan by itself;
+ * without the ADSP the fan runs at full speed.
  */
 
 #include "opt_acpi.h"
@@ -70,6 +72,7 @@
 #include <dev/acpica/acpivar.h>
 
 #include <dev/qcom_glink/qcom_aoss.h>
+#include <dev/qcom_rpmh/qcom_rpmh.h>
 #include <dev/qcom_scm/qcom_scm.h>
 
 /* Qualcomm's segment flags: the hash segment, and relocatable segments. */
@@ -80,7 +83,13 @@
 struct qcom_adsp_board {
 	const char	*maker;		/* SMBIOS system maker and product */
 	const char	*product;
+	const char	*hid;		/* the DSP's ACPI ID */
+	const char	*name;		/* adsp, cdsp */
+	const char	*desc;
 	const char	*firmware;	/* the path in linux-firmware */
+	const char	*load_state;	/* the AOSS's name for it, if any */
+	const char	*rail;		/* an RPMh rail it needs, if any */
+	const char	*bcms[4];	/* its path to memory's BCMs */
 	uint32_t	pas_id;
 	vm_paddr_t	mem;		/* the reserved memory */
 	vm_size_t	mem_size;
@@ -90,10 +99,29 @@ static const struct qcom_adsp_board qcom_adsp_boards[] = {
 	{
 		.maker = "Radxa Computer Co., Ltd.",
 		.product = "Radxa Dragon Q8B",
+		.hid = "QCOM061B",
+		.name = "adsp",
+		.desc = "Qualcomm audio DSP",
 		.firmware = "qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn",
+		.load_state = "adsp",
 		.pas_id = 1,
 		.mem = 0x86c00000,
 		.mem_size = 0x2000000,
+	},
+	{
+		/* NSP0; the SoC's second NSP isn't used here. */
+		.maker = "Radxa Computer Co., Ltd.",
+		.product = "Radxa Dragon Q8B",
+		.hid = "QCOM06B0",
+		.name = "cdsp",
+		.desc = "Qualcomm compute DSP",
+		.firmware = "qcom/sc8280xp/qccdsp8280.mbn",
+		.rail = "nsp.lvl",
+		/* NSP-A NoC to the memory NoC; SH0 and MC0 are UEFI's. */
+		.bcms = { "NSA1", "NSA0" },
+		.pas_id = 18,
+		.mem = 0x8a100000,
+		.mem_size = 0x1e00000,
 	},
 };
 
@@ -116,10 +144,11 @@ struct qcom_adsp_softc {
 	eventhandler_tag		mountroot_tag;
 };
 
-static char *qcom_adsp_acpi_ids[] = { "QCOM061B", NULL };
+static char *qcom_adsp_acpi_ids[] = { "QCOM061B", "QCOM06B0", NULL };
 
+/* This board's entry for the DSP with ACPI ID hid. */
 static const struct qcom_adsp_board *
-qcom_adsp_find_board(void)
+qcom_adsp_find_board(const char *hid)
 {
 	const struct qcom_adsp_board *b;
 	char *maker, *product;
@@ -131,7 +160,8 @@ qcom_adsp_find_board(void)
 	for (i = 0; maker != NULL && product != NULL &&
 	    i < nitems(qcom_adsp_boards); i++) {
 		if (strcmp(maker, qcom_adsp_boards[i].maker) == 0 &&
-		    strcmp(product, qcom_adsp_boards[i].product) == 0) {
+		    strcmp(product, qcom_adsp_boards[i].product) == 0 &&
+		    strcmp(hid, qcom_adsp_boards[i].hid) == 0) {
 			b = &qcom_adsp_boards[i];
 			break;
 		}
@@ -166,7 +196,7 @@ qcom_adsp_loadable(const Elf32_Phdr *ph)
 	    (ph->p_flags & QCOM_MDT_TYPE_MASK) != QCOM_MDT_TYPE_HASH);
 }
 
-/* Load the image into the ADSP's memory and start it. */
+/* Load the image into the DSP's memory and start it. */
 static int
 qcom_adsp_boot(struct qcom_adsp_softc *sc, const struct firmware *fw)
 {
@@ -232,13 +262,43 @@ qcom_adsp_boot(struct qcom_adsp_softc *sc, const struct firmware *fw)
 	}
 
 	/*
-	 * Tell the AOSS the image is going in, as Linux does before loading
-	 * the DSP: it holds resources for the subsystem from then on.
+	 * The DSP's rail at its highest level, as Linux's proxy vote holds
+	 * it while the DSP boots.  Linux drops it once the DSP has taken
+	 * over its own votes; here it stays.
 	 */
-	error = qcom_aoss_send(
-	    "{class: image, res: load_state, name: adsp, val: on}");
-	if (error != 0)
-		device_printf(sc->dev, "AOSS load state: %d\n", error);
+	if (b->rail != NULL) {
+		error = qcom_rpmh_arc_vote(b->rail, QCOM_RPMH_ARC_MAX);
+		if (error != 0) {
+			device_printf(sc->dev, "no vote for %s: %d\n", b->rail,
+			    error);
+			return (error);
+		}
+	}
+	/* And its path to memory, at full peak, as Linux's proxy vote. */
+	for (i = 0; i < (int)nitems(b->bcms) && b->bcms[i] != NULL; i++) {
+		error = qcom_rpmh_bcm_vote(b->bcms[i], 0, QCOM_RPMH_BCM_MAX);
+		if (error != 0) {
+			device_printf(sc->dev, "no vote for %s: %d\n",
+			    b->bcms[i], error);
+			return (error);
+		}
+	}
+
+	/*
+	 * Tell the AOSS the image is going in, as Linux does before loading
+	 * those DSPs that have a load state: it holds resources for the
+	 * subsystem from then on.
+	 */
+	if (b->load_state != NULL) {
+		char msg[64];
+
+		snprintf(msg, sizeof(msg),
+		    "{class: image, res: load_state, name: %s, val: on}",
+		    b->load_state);
+		error = qcom_aoss_send(msg);
+		if (error != 0)
+			device_printf(sc->dev, "AOSS load state: %d\n", error);
+	}
 
 	md = malloc(mdlen, M_TEMP, M_WAITOK);
 	memcpy(md, data, ph[0].p_filesz);
@@ -312,6 +372,9 @@ qcom_adsp_start(void *arg, int pending __unused)
 		    sc->board->firmware);
 		error = ENOENT;
 	} else {
+		if (bootverbose)
+			device_printf(sc->dev, "starting at %jd ms\n",
+			    (intmax_t)(sbinuptime() / SBT_1MS));
 		error = qcom_adsp_boot(sc, fw);
 		firmware_put(fw, FIRMWARE_UNLOAD);
 	}
@@ -360,10 +423,13 @@ qcom_adsp_state_sysctl(SYSCTL_HANDLER_ARGS)
 static int
 qcom_adsp_probe(device_t dev)
 {
+	const struct qcom_adsp_board *b;
+	char *hid;
+
 	if (ACPI_ID_PROBE(device_get_parent(dev), dev, qcom_adsp_acpi_ids,
-	    NULL) > 0 || qcom_adsp_find_board() == NULL)
+	    &hid) > 0 || (b = qcom_adsp_find_board(hid)) == NULL)
 		return (ENXIO);
-	device_set_desc(dev, "Qualcomm audio DSP");
+	device_set_desc(dev, b->desc);
 	return (BUS_PROBE_DEFAULT);
 }
 
@@ -371,9 +437,12 @@ static int
 qcom_adsp_attach(device_t dev)
 {
 	struct qcom_adsp_softc *sc = device_get_softc(dev);
+	char *hid;
 
 	sc->dev = dev;
-	sc->board = qcom_adsp_find_board();
+	(void)ACPI_ID_PROBE(device_get_parent(dev), dev, qcom_adsp_acpi_ids,
+	    &hid);
+	sc->board = qcom_adsp_find_board(hid);
 	mtx_init(&sc->mtx, "qcom_adsp", NULL, MTX_DEF);
 	sc->state = QCOM_ADSP_WAITING;
 	sc->scm_wait = 60;
@@ -382,7 +451,7 @@ qcom_adsp_attach(device_t dev)
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "state",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
-	    qcom_adsp_state_sysctl, "A", "The ADSP's state");
+	    qcom_adsp_state_sysctl, "A", "The DSP's state");
 
 	/* The firmware is on the root filesystem. */
 	if (root_mounted())
@@ -408,7 +477,7 @@ qcom_adsp_detach(device_t dev)
 	mtx_unlock(&sc->mtx);
 	taskqueue_drain_timeout(taskqueue_thread, &sc->start_task);
 	/*
-	 * A running ADSP must first be asked to stop, through the stop state
+	 * A running DSP must first be asked to stop, through the stop state
 	 * in SMEM and its acknowledgement, which isn't done here: shutting it
 	 * down straight away hangs the SoC.  It runs until reset.
 	 */
@@ -435,6 +504,7 @@ DRIVER_MODULE(qcom_adsp, acpi, qcom_adsp_driver, 0, 0);
 MODULE_DEPEND(qcom_adsp, acpi, 1, 1, 1);
 MODULE_DEPEND(qcom_adsp, qcom_scm, 1, 1, 1);
 MODULE_DEPEND(qcom_adsp, qcom_glink, 1, 1, 1);
+MODULE_DEPEND(qcom_adsp, qcom_rpmh, 1, 1, 1);
 MODULE_DEPEND(qcom_adsp, firmware, 1, 1, 1);
 MODULE_VERSION(qcom_adsp, 1);
 ACPI_PNP_INFO(qcom_adsp_acpi_ids);

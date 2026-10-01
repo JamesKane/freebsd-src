@@ -34,6 +34,7 @@
  */
 
 #define	QCOM_IPCC_CLIENT_LPASS	3	/* the audio DSP */
+#define	QCOM_IPCC_CLIENT_CDSP	6	/* the compute DSP */
 #define	QCOM_IPCC_SIGNAL_GLINK	0
 
 typedef void qcom_ipcc_handler_t(void *arg);
