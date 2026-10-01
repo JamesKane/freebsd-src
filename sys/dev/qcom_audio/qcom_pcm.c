@@ -33,8 +33,9 @@
  * the DSP blocks by offset, a few ahead of the one playing.  Each block the
  * DSP finishes is an "interrupt": the hardware pointer moves on a block,
  * chn_intr() refills it, and the next block goes to the DSP.  Talking to
- * the DSP sleeps and sound(4) triggers with the channel locked, so starting
- * and stopping, and the work for each finished block, run on a task queue.
+ * the DSP sleeps and sound(4) triggers with the channel locked, so a trigger
+ * only says what's wanted, and one task brings the stream there; it and
+ * the work for each finished block run on a task queue.
  *
  * The mixer's master volume is the stream's gain in the DSP; sound(4)
  * supplies the PCM control in software.
@@ -90,8 +91,7 @@ struct qcom_pcm_softc {
 	struct snd_dbuf		*buf;
 	void			*ring;
 	struct taskqueue	*tq;
-	struct task		start_task;
-	struct task		stop_task;
+	struct task		sync_task;	/* the stream as wanted */
 	struct task		done_task;
 	struct task		vol_task;
 	struct timeout_task	codec_task;	/* bring the codec up */
@@ -106,7 +106,9 @@ struct qcom_pcm_softc {
 	u_int			blkcnt;
 	volatile u_int		volume;	/* 0 to 100 */
 	/* Under the channel lock: */
-	bool			running;
+	bool			running;	/* wanted, by the last trigger */
+	u_int			gen;		/* STARTs so far */
+	u_int			play_gen;	/* the START sc->play serves */
 	u_int			played;	/* blocks finished since start */
 	/* The task's: */
 	u_int			sent;	/* blocks handed to the DSP */
@@ -152,6 +154,26 @@ qcom_pcm_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b,
 	return (sc);
 }
 
+static void	qcom_pcm_sync_task(void *arg, int pending);
+
+/*
+ * The channel is going (after its last trigger, unlocked): the stream
+ * stops, and nothing on the task queue touches the channel again.
+ */
+static int
+qcom_pcm_chan_free(kobj_t obj, void *data)
+{
+	struct qcom_pcm_softc *sc = data;
+
+	CHN_LOCK(sc->pcm);
+	sc->running = false;
+	CHN_UNLOCK(sc->pcm);
+	taskqueue_enqueue(sc->tq, &sc->sync_task);
+	taskqueue_drain_all(sc->tq);
+	taskqueue_drain_timeout(sc->tq, &sc->jack_poll_task);
+	return (0);
+}
+
 static int
 qcom_pcm_chan_setformat(kobj_t obj, void *data, uint32_t format)
 {
@@ -191,22 +213,25 @@ qcom_pcm_chan_trigger(kobj_t obj, void *data, int go)
 {
 	struct qcom_pcm_softc *sc = data;
 
+	/*
+	 * Only say what's wanted: the task brings the stream there, however
+	 * many triggers came meanwhile.  A START is always a fresh stream,
+	 * from the start of the ring, as sound(4) expects.
+	 */
 	switch (go) {
 	case PCMTRIG_START:
 		sc->running = true;
+		sc->gen++;
 		sc->played = 0;
-		taskqueue_enqueue(sc->tq, &sc->start_task);
 		break;
 	case PCMTRIG_STOP:
 	case PCMTRIG_ABORT:
-		if (sc->running) {
-			sc->running = false;
-			taskqueue_enqueue(sc->tq, &sc->stop_task);
-		}
+		sc->running = false;
 		break;
 	default:
-		break;
+		return (0);
 	}
+	taskqueue_enqueue(sc->tq, &sc->sync_task);
 	return (0);
 }
 
@@ -227,6 +252,7 @@ qcom_pcm_chan_getcaps(kobj_t obj, void *data)
 
 static kobj_method_t qcom_pcm_chan_methods[] = {
 	KOBJMETHOD(channel_init,	qcom_pcm_chan_init),
+	KOBJMETHOD(channel_free,	qcom_pcm_chan_free),
 	KOBJMETHOD(channel_setformat,	qcom_pcm_chan_setformat),
 	KOBJMETHOD(channel_setspeed,	qcom_pcm_chan_setspeed),
 	KOBJMETHOD(channel_setblocksize, qcom_pcm_chan_setblocksize),
@@ -254,7 +280,7 @@ qcom_pcm_fill(struct qcom_pcm_softc *sc)
 	ahead = MIN(ahead, sc->blkcnt - 1);
 	for (error = 0; error == 0;) {
 		CHN_LOCK(sc->pcm);
-		queued = sc->sent - sc->played;
+		queued = sc->sent > sc->played ? sc->sent - sc->played : 0;
 		ready = sndbuf_getready(sc->buf);
 		CHN_UNLOCK(sc->pcm);
 		/*
@@ -287,13 +313,36 @@ qcom_pcm_done(void *arg, u_int token __unused, uint32_t status)
 }
 
 static void
-qcom_pcm_start_task(void *arg, int pending __unused)
+qcom_pcm_close(struct qcom_pcm_softc *sc)
+{
+
+	if (sc->play == NULL)
+		return;
+	qcom_apm_play_close(sc->play);
+	sc->play = NULL;
+}
+
+/* Bring the stream to what the last trigger wanted. */
+static void
+qcom_pcm_sync_task(void *arg, int pending __unused)
 {
 	struct qcom_pcm_softc *sc = arg;
+	u_int gen;
+	bool want;
 	int error;
 
-	if (sc->play != NULL)
+	CHN_LOCK(sc->pcm);
+	want = sc->running;
+	gen = sc->gen;
+	CHN_UNLOCK(sc->pcm);
+
+	/* Stopped, or started again since: this stream is done. */
+	if (sc->play != NULL && (!want || sc->play_gen != gen))
+		qcom_pcm_close(sc);
+	if (!want || sc->play != NULL)
 		return;
+
+	/* The DSP's answers for an earlier stream are all in by now. */
 	sc->sent = 0;
 	atomic_store_int(&sc->finished, 0);
 	error = qcom_apm_play_open((vm_offset_t)sc->ring, PCM_BUFSZ,
@@ -303,6 +352,9 @@ qcom_pcm_start_task(void *arg, int pending __unused)
 		sc->play = NULL;
 		return;
 	}
+	CHN_LOCK(sc->pcm);
+	sc->play_gen = gen;
+	CHN_UNLOCK(sc->pcm);
 	(void)qcom_apm_play_volume(sc->play, qcom_pcm_gain[sc->volume]);
 	(void)qcom_pcm_fill(sc);
 	taskqueue_enqueue_timeout(sc->tq, &sc->jack_poll_task, hz);
@@ -318,8 +370,9 @@ qcom_pcm_done_task(void *arg, int pending __unused)
 	n = atomic_readandclear_int(&sc->finished);
 	if (sc->play == NULL || n == 0)
 		return;
+	/* Only for the stream sound(4) is running now. */
 	CHN_LOCK(sc->pcm);
-	running = sc->running;
+	running = sc->running && sc->play_gen == sc->gen;
 	if (running)
 		sc->played += n;
 	CHN_UNLOCK(sc->pcm);
@@ -338,17 +391,6 @@ qcom_pcm_vol_task(void *arg, int pending __unused)
 	if (sc->play != NULL)
 		(void)qcom_apm_play_volume(sc->play,
 		    qcom_pcm_gain[sc->volume]);
-}
-
-static void
-qcom_pcm_stop_task(void *arg, int pending __unused)
-{
-	struct qcom_pcm_softc *sc = arg;
-
-	if (sc->play == NULL)
-		return;
-	qcom_apm_play_close(sc->play);
-	sc->play = NULL;
 }
 
 /* The jack */
@@ -483,8 +525,7 @@ qcom_pcm_attach(device_t dev)
 	    taskqueue_thread_enqueue, &sc->tq);
 	taskqueue_start_threads(&sc->tq, 1, PI_SOFT, "%s taskq",
 	    device_get_nameunit(dev));
-	TASK_INIT(&sc->start_task, 0, qcom_pcm_start_task, sc);
-	TASK_INIT(&sc->stop_task, 0, qcom_pcm_stop_task, sc);
+	TASK_INIT(&sc->sync_task, 0, qcom_pcm_sync_task, sc);
 	TASK_INIT(&sc->done_task, 0, qcom_pcm_done_task, sc);
 	TASK_INIT(&sc->vol_task, 0, qcom_pcm_vol_task, sc);
 	sc->volume = 100;
@@ -536,11 +577,12 @@ qcom_pcm_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->wake_res);
 	}
 	qcom_wcd938x_jack_notify(NULL, NULL);
-	taskqueue_cancel_timeout(sc->tq, &sc->codec_task, NULL);
-	/* The channels are gone, so no more triggers: finish the stop. */
-	taskqueue_enqueue(sc->tq, &sc->stop_task);
+	/*
+	 * The channel's free stopped the stream.  The codec bring-up re-arms
+	 * itself, which draining its timeout prevents.
+	 */
+	taskqueue_drain_timeout(sc->tq, &sc->codec_task);
 	taskqueue_drain_all(sc->tq);
-	taskqueue_drain_timeout(sc->tq, &sc->jack_poll_task);
 	taskqueue_free(sc->tq);
 	kmem_free(sc->ring, PCM_BUFSZ);
 	return (0);

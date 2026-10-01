@@ -70,6 +70,7 @@ struct qcom_gpr_port {
 	uint32_t	id;
 	qcom_gpr_rx_t	*rx;
 	void		*arg;
+	u_int		in_rx;		/* callbacks running, under gpr.mtx */
 	struct sx	cmd_lock;	/* one command at a time */
 	/* The command waiting for its answer, under gpr.mtx. */
 	bool		waiting;
@@ -174,9 +175,18 @@ gpr_rx(void *arg __unused, const void *data, size_t len)
 	}
 	rx = p->rx;
 	rxarg = p->arg;
+	if (rx == NULL) {
+		mtx_unlock(&gpr.mtx);
+		return;
+	}
+	/* Called unlocked; closing the port waits for it. */
+	p->in_rx++;
 	mtx_unlock(&gpr.mtx);
-	if (rx != NULL)
-		rx(rxarg, h, payload, plen);
+	rx(rxarg, h, payload, plen);
+	mtx_lock(&gpr.mtx);
+	if (--p->in_rx == 0)
+		cv_broadcast(&gpr.cv);
+	mtx_unlock(&gpr.mtx);
 }
 
 int
@@ -203,6 +213,7 @@ qcom_gpr_port_open(uint32_t id, qcom_gpr_rx_t *rx, void *arg,
 	return (0);
 }
 
+/* Not from the port's own rx callback, which this waits for. */
 void
 qcom_gpr_port_close(struct qcom_gpr_port *p)
 {
@@ -210,6 +221,9 @@ qcom_gpr_port_close(struct qcom_gpr_port *p)
 	sx_xlock(&p->cmd_lock);
 	mtx_lock(&gpr.mtx);
 	LIST_REMOVE(p, link);
+	/* Nothing new reaches it now; let a callback under way finish. */
+	while (p->in_rx != 0)
+		cv_wait(&gpr.cv, &gpr.mtx);
 	mtx_unlock(&gpr.mtx);
 	sx_xunlock(&p->cmd_lock);
 	sx_destroy(&p->cmd_lock);

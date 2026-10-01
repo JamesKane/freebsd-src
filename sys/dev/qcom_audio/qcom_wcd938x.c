@@ -259,7 +259,7 @@ static const struct wcd_op wcd_hph_on[] = {
 };
 
 /* And down again. */
-static const struct wcd_op wcd_hph_off[] = {
+static const struct wcd_op wcd_hph_off_seq[] = {
 	SEQ_CODEC(0x346c, 0xbf),	/* DIGITAL_INTR_MASK_1 */
 	SEQ_DELAY(21745),
 	SEQ_CODEC(0x3009, 0x78),	/* ANA_HPH */
@@ -343,46 +343,65 @@ SX_SYSINIT(qcom_wcd938x, &wcd_lock, "qcom_wcd938x");
 static struct qcom_swr *wcd_tx, *wcd_rx;
 static bool wcd_ready;		/* out of reset, with its settings */
 static bool wcd_active;		/* the links running */
+static u_int wcd_users;		/* qcom_wcd938x_up()s not yet downed */
 static bool wcd_hph;
 static bool wcd_plugged, wcd_jack_known;
 static qcom_wcd938x_jack_t *wcd_jack_cb;
 static void *wcd_jack_arg;
 
+static void	wcd_hph_off(void);
+
 static int
-wcd_run(const struct wcd_op *ops, size_t n)
+wcd_op(const struct wcd_op *op)
+{
+
+	switch (op->op) {
+	case OP_CODEC:
+		return (qcom_swr_write(wcd_tx, WCD_DEV, op->reg, op->val));
+	case OP_RXDEV:
+		return (qcom_swr_write(wcd_rx, WCD_DEV, op->reg, op->val));
+	case OP_RXMMIO:
+		qcom_swr_mmio_write(wcd_rx, op->reg, op->val);
+		return (0);
+	case OP_BANK_SWITCH:
+		return (qcom_swr_bank_switch(wcd_rx, op->reg));
+	case OP_DELAY:
+		if (op->val >= 10000)
+			pause("wcd", howmany(op->val * hz, 1000000));
+		else
+			DELAY(op->val);
+		return (0);
+	}
+	return (EINVAL);
+}
+
+/*
+ * Run a sequence: up to its first failure, or (all) through to its end
+ * regardless, for taking things down, where one step failing shouldn't
+ * stop the rest.  Returns the first failure.
+ */
+static int
+wcd_run_seq(const struct wcd_op *ops, size_t n, bool all)
 {
 	size_t i;
-	int error;
+	int error, first;
 
-	for (i = 0, error = 0; i < n && error == 0; i++) {
-		switch (ops[i].op) {
-		case OP_CODEC:
-			error = qcom_swr_write(wcd_tx, WCD_DEV, ops[i].reg,
-			    ops[i].val);
+	for (i = 0, first = 0; i < n; i++) {
+		error = wcd_op(&ops[i]);
+		if (error == 0)
+			continue;
+		printf("qcom_wcd938x: step %zu (%#x): %d\n", i, ops[i].reg,
+		    error);
+		if (first == 0)
+			first = error;
+		if (!all)
 			break;
-		case OP_RXDEV:
-			error = qcom_swr_write(wcd_rx, WCD_DEV, ops[i].reg,
-			    ops[i].val);
-			break;
-		case OP_RXMMIO:
-			qcom_swr_mmio_write(wcd_rx, ops[i].reg, ops[i].val);
-			break;
-		case OP_BANK_SWITCH:
-			error = qcom_swr_bank_switch(wcd_rx, ops[i].reg);
-			break;
-		case OP_DELAY:
-			if (ops[i].val >= 10000)
-				pause("wcd", howmany(ops[i].val * hz, 1000000));
-			else
-				DELAY(ops[i].val);
-			break;
-		}
 	}
-	if (error != 0)
-		printf("qcom_wcd938x: step %zu (%#x): %d\n", i - 1,
-		    ops[i - 1].reg, error);
-	return (error);
+	return (first);
 }
+
+#define	wcd_run(ops, n)		wcd_run_seq((ops), (n), false)
+#define	wcd_run_all(ops, n)	wcd_run_seq((ops), (n), true)
 
 static int
 wcd_reset(void)
@@ -508,10 +527,11 @@ wcd_down(void)
 }
 
 /*
- * Bring the codec up: the first time, out of reset, both links up with the
- * codec enumerated on each, and its settings; after that, the macros'
- * clocks and the links out of clock stop, the codec as it was.  Fails
- * (with the DSP's error) until the DSP is up.
+ * Bring the codec up for a user: the first time, out of reset, both links
+ * up with the codec enumerated on each, and its settings; after that, the
+ * macros' clocks and the links out of clock stop, the codec as it was.
+ * Fails (with the DSP's error) until the DSP is up.  Each success is
+ * matched by a qcom_wcd938x_down().
  */
 int
 qcom_wcd938x_up(void)
@@ -520,18 +540,23 @@ qcom_wcd938x_up(void)
 
 	sx_xlock(&wcd_lock);
 	error = wcd_up();
+	if (error == 0)
+		wcd_users++;
 	sx_xunlock(&wcd_lock);
 	return (error);
 }
 
-/* Let the codec idle: the links' clocks stopped, then the macros'. */
+/* A user is done: the last lets the codec idle, the headphones off first. */
 void
 qcom_wcd938x_down(void)
 {
 
-	qcom_wcd938x_hph(false);
 	sx_xlock(&wcd_lock);
-	wcd_down();
+	KASSERT(wcd_users > 0, ("qcom_wcd938x: down without up"));
+	if (wcd_users > 0 && --wcd_users == 0) {
+		wcd_hph_off();
+		wcd_down();
+	}
 	sx_xunlock(&wcd_lock);
 }
 
@@ -555,6 +580,7 @@ void
 qcom_wcd938x_jack_check(void)
 {
 
+	/* Only a look: it holds the codec up for no one. */
 	sx_xlock(&wcd_lock);
 	if (wcd_ready) {
 		if (wcd_active)
@@ -565,6 +591,23 @@ qcom_wcd938x_jack_check(void)
 	sx_xunlock(&wcd_lock);
 }
 
+/*
+ * The headphones off, and the RX link's ports: every step tried, so that
+ * whatever fails, the codec and the macros' paths end up off, as recorded.
+ */
+static void
+wcd_hph_off(void)
+{
+
+	sx_assert(&wcd_lock, SA_XLOCKED);
+	if (!wcd_hph)
+		return;
+	(void)wcd_run_all(wcd_hph_off_seq, nitems(wcd_hph_off_seq));
+	(void)wcd_run_all(wcd_stream_off, nitems(wcd_stream_off));
+	(void)qcom_lpass_macro_hph(false);
+	wcd_hph = false;
+}
+
 /* The headphone output on, with the RX link carrying its ports, or off. */
 int
 qcom_wcd938x_hph(bool on)
@@ -572,24 +615,22 @@ qcom_wcd938x_hph(bool on)
 	int error;
 
 	sx_xlock(&wcd_lock);
-	if (!wcd_active || on == wcd_hph) {
-		sx_xunlock(&wcd_lock);
-		return (!wcd_active && on ? ENXIO : 0);
-	}
-	if (on) {
+	error = 0;
+	if (!on)
+		wcd_hph_off();
+	else if (!wcd_active)
+		error = ENXIO;
+	else if (!wcd_hph) {
+		/* Marked on first, so that a failure part way comes down. */
+		wcd_hph = true;
 		error = qcom_lpass_macro_hph(true);
 		if (error == 0)
 			error = wcd_run(wcd_stream_on, nitems(wcd_stream_on));
 		if (error == 0)
 			error = wcd_run(wcd_hph_on, nitems(wcd_hph_on));
-	} else {
-		error = wcd_run(wcd_hph_off, nitems(wcd_hph_off));
-		if (error == 0)
-			error = wcd_run(wcd_stream_off, nitems(wcd_stream_off));
-		(void)qcom_lpass_macro_hph(false);
+		if (error != 0)
+			wcd_hph_off();
 	}
-	if (error == 0)
-		wcd_hph = on;
 	sx_xunlock(&wcd_lock);
 	return (error);
 }

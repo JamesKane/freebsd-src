@@ -156,6 +156,8 @@ struct qcom_glink_chan {
 	uint16_t	lcid;		/* ours; 0 until we open it */
 	uint16_t	rcid;		/* the remote's; 0 until it opens it */
 	bool		open_acked;	/* the remote acknowledged our open */
+	bool		remote_acked;	/* we acknowledged the remote's */
+	struct thread	*rx_td;		/* in the client's rx callback */
 	qcom_glink_rx_t	*rx;		/* the client, if any */
 	void		*arg;
 	struct glink_intents lintents;	/* we receive into */
@@ -514,9 +516,17 @@ glink_rx_open(struct glink_edge *e, u_int rcid, const char *name)
 		return;
 	}
 	ch->rcid = rcid;
+	ch->remote_acked = false;
 	if (bootverbose)
 		device_printf(e->sc->dev, "%s: the remote opened %s\n",
 		    e->conf->label, name);
+	/*
+	 * Open on our side already (the remote reopening it): acknowledge
+	 * now.  While our own open is in progress, qcom_glink_open does.
+	 */
+	if (ch->rx != NULL && ch->open_acked &&
+	    glink_send_cmd(e, GLINK_CMD_OPEN_ACK, rcid, 0) == 0)
+		ch->remote_acked = true;
 }
 
 static void
@@ -529,6 +539,7 @@ glink_rx_close(struct glink_edge *e, u_int rcid)
 		return;
 	(void)glink_send_cmd(e, GLINK_CMD_CLOSE_ACK, rcid, 0);
 	ch->rcid = 0;
+	ch->remote_acked = false;
 	glink_intents_free(&ch->rintents);
 	glink_chan_gc(e, ch);
 }
@@ -647,25 +658,33 @@ glink_rx_data(struct glink_edge *e, size_t avail)
 	}
 	ch->rx_partial = NULL;
 
-	/* The client may send, so it's called without the lock. */
+	/*
+	 * The client may send, so it's called without the lock.  The intent
+	 * is off the channel's list meanwhile, out of a close's way, and the
+	 * channel is marked busy, which a close waits for.
+	 */
+	TAILQ_REMOVE(&ch->lintents, in, link);
 	rx = ch->rx;
 	arg = ch->arg;
 	if (rx != NULL) {
+		ch->rx_td = curthread;
 		mtx_unlock(&e->mtx);
 		rx(arg, in->data, in->offset);
 		mtx_lock(&e->mtx);
+		ch->rx_td = NULL;
 	}
 	in->offset = 0;
-	reuse = in->reuse;
-	if (!reuse)
-		TAILQ_REMOVE(&ch->lintents, in, link);
+	reuse = in->reuse && ch->lcid != 0;
 	if (ch->lcid != 0)
 		(void)glink_send_cmd(e, reuse ? GLINK_CMD_RX_DONE_W_REUSE :
 		    GLINK_CMD_RX_DONE, ch->lcid, in->id);
-	if (!reuse) {
+	if (reuse)
+		TAILQ_INSERT_TAIL(&ch->lintents, in, link);
+	else {
 		free(in->data, M_GLINK);
 		free(in, M_GLINK);
 	}
+	cv_broadcast(&e->cv);
 	return (true);
 }
 
@@ -935,8 +954,10 @@ qcom_glink_open(const char *label, const char *name, size_t intent_size,
 	} while (ch->lcid == 0 || glink_chan_by_lcid(e, ch->lcid) != ch);
 
 	/* The remote's open first, if it has; ours either way. */
-	if (ch->rcid != 0)
+	if (ch->rcid != 0 && !ch->remote_acked) {
 		error = glink_send_cmd(e, GLINK_CMD_OPEN_ACK, ch->rcid, 0);
+		ch->remote_acked = error == 0;
+	}
 	if (error == 0) {
 		open.hdr.cmd = GLINK_CMD_OPEN;
 		open.hdr.param1 = ch->lcid;
@@ -947,12 +968,20 @@ qcom_glink_open(const char *label, const char *name, size_t intent_size,
 	}
 	if (error == 0)
 		error = glink_wait(e, &ch->open_acked);
-	if (error == 0 && ch->rcid == 0) {
-		/* An open of our own: the remote's comes now. */
+	if (error == 0 && !ch->remote_acked) {
+		/*
+		 * An open of our own: the remote's comes now, perhaps already
+		 * with its acknowledgement of ours, and wants acknowledging.
+		 */
 		for (i = 0; ch->rcid == 0 && i < 100 && !e->dead; i++)
 			cv_timedwait(&e->cv, &e->mtx, MAX(hz / 10, 1));
-		error = ch->rcid != 0 ? glink_send_cmd(e, GLINK_CMD_OPEN_ACK,
-		    ch->rcid, 0) : ETIMEDOUT;
+		if (ch->rcid == 0)
+			error = ETIMEDOUT;
+		else if (!ch->remote_acked) {
+			error = glink_send_cmd(e, GLINK_CMD_OPEN_ACK, ch->rcid,
+			    0);
+			ch->remote_acked = error == 0;
+		}
 	}
 	for (i = 0; error == 0 && i < nintents; i++)
 		error = glink_intent_advertise(e, ch, intent_size, true);
@@ -979,6 +1008,7 @@ qcom_glink_send(struct qcom_glink_chan *ch, const void *data, size_t len)
 	struct glink_intent *in, *best;
 	struct glink_hdr req;
 	size_t chunk, off;
+	uint32_t iid;
 	int error, waited;
 
 	mtx_lock(&e->mtx);
@@ -1016,13 +1046,22 @@ qcom_glink_send(struct qcom_glink_chan *ch, const void *data, size_t len)
 	}
 	ch->intent_req = INTENT_REQ_NONE;
 	best->in_use = true;
+	/*
+	 * By its ID from here: sending may sleep, and a close from the remote
+	 * meanwhile frees its intents.
+	 */
+	iid = best->id;
 	for (off = 0, error = 0; error == 0 && (off < len || len == 0);
 	    off += chunk) {
+		if (ch->rcid == 0 || e->dead) {
+			error = ENOTCONN;
+			break;
+		}
 		chunk = MIN(len - off, GLINK_CHUNK);
 		h.hdr.cmd = off == 0 ? GLINK_CMD_TX_DATA :
 		    GLINK_CMD_TX_DATA_CONT;
 		h.hdr.param1 = ch->lcid;
-		h.hdr.param2 = best->id;
+		h.hdr.param2 = iid;
 		h.chunk = chunk;
 		h.left = len - off - chunk;
 		error = glink_tx(e, &h, sizeof(h), (const char *)data + off,
@@ -1031,7 +1070,11 @@ qcom_glink_send(struct qcom_glink_chan *ch, const void *data, size_t len)
 			break;
 	}
 	if (error != 0)
-		best->in_use = false;
+		TAILQ_FOREACH(in, &ch->rintents, link)
+			if (in->id == iid) {
+				in->in_use = false;
+				break;
+			}
 out:
 	mtx_unlock(&e->mtx);
 	return (error);
@@ -1045,6 +1088,10 @@ qcom_glink_close(struct qcom_glink_chan *ch)
 
 	mtx_lock(&e->mtx);
 	ch->rx = NULL;
+	/* Not while the rx task is in the client's callback, unless it's us. */
+	while (ch->rx_td != NULL && ch->rx_td != curthread)
+		cv_wait(&e->cv, &e->mtx);
+	ch->rx_partial = NULL;
 	if (ch->lcid != 0 && !e->dead &&
 	    glink_send_cmd(e, GLINK_CMD_CLOSE, ch->lcid, 0) == 0)
 		for (i = 0; ch->lcid != 0 && i < 50; i++)
