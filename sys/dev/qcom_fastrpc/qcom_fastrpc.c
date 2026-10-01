@@ -89,6 +89,7 @@ static MALLOC_DEFINE(M_FASTRPC, "qcom_fastrpc", "Qualcomm FastRPC");
 
 #define	FASTRPC_ALIGN			128
 #define	FASTRPC_MAX_FDLIST		16
+#define	FASTRPC_MAX_HANDLES		30	/* 15 in, 15 out */
 #define	FASTRPC_MAX_CRCLIST		64
 #define	FASTRPC_CTX_MAX			256
 #define	FASTRPC_MAX_DSP_ATTRIBUTES	256
@@ -104,6 +105,8 @@ static MALLOC_DEFINE(M_FASTRPC, "qcom_fastrpc", "Qualcomm FastRPC");
 #define	FASTRPC_RMID_INIT_MUNMAP	5
 #define	FASTRPC_RMID_INIT_CREATE	6
 #define	FASTRPC_RMID_INIT_CREATE_ATTR	7
+#define	FASTRPC_RMID_INIT_MEM_MAP	10
+#define	FASTRPC_RMID_INIT_MEM_UNMAP	11
 
 #define	ROOT_PD				0
 #define	USER_PD				1
@@ -183,6 +186,30 @@ struct fastrpc_buf {
 	TAILQ_ENTRY(fastrpc_buf) link;
 };
 
+/*
+ * A shared buffer for a call: the shm object the descriptor names, the
+ * pages under [ptr, ptr + len) of the program's map of it, wired and
+ * mapped into the session's bank.
+ */
+struct fastrpc_shbuf {
+	struct file	*fp;
+	vm_page_t	*ma;
+	u_int		npages;
+	uint64_t	iova;
+	uint64_t	daddr;		/* of the first page, as the DSP knows it */
+};
+
+/*
+ * A program's shared buffer mapped into the DSP process, by MEM_MAP or
+ * as a call's handle argument.
+ */
+struct fastrpc_memmap {
+	struct fastrpc_shbuf sb;
+	int		fd;
+	uint64_t	raddr;
+	TAILQ_ENTRY(fastrpc_memmap) link;
+};
+
 /* MMAP's kind: pages for the DSP process's own heap. */
 #define	FASTRPC_MMAP_ADD_PAGES	0x1000
 #define	FASTRPC_MMAP_MAX	(256 * 1024 * 1024)
@@ -194,6 +221,8 @@ struct fastrpc_user {
 	bool		attached;	/* to a process on the DSP */
 	struct fastrpc_buf *init_mem;
 	TAILQ_HEAD(, fastrpc_buf) mmaps; /* given the DSP process, by MMAP */
+	TAILQ_HEAD(, fastrpc_memmap) memmaps; /* and by MEM_MAP */
+	TAILQ_HEAD(, fastrpc_memmap) dmamaps; /* passed as handles, held */
 	struct sx	lock;
 };
 
@@ -271,19 +300,6 @@ fastrpc_buf_alloc(struct fastrpc_session *s, size_t size,
 	return (0);
 }
 
-/*
- * A shared buffer for a call: the shm object the descriptor names, the
- * pages under [ptr, ptr + len) of the program's map of it, wired and
- * mapped into the session's bank.
- */
-struct fastrpc_shbuf {
-	struct file	*fp;
-	vm_page_t	*ma;
-	u_int		npages;
-	uint64_t	iova;
-	uint64_t	daddr;		/* of the first page, as the DSP knows it */
-};
-
 static void
 fastrpc_shbuf_put(struct fastrpc_session *s, struct fastrpc_shbuf *sb)
 {
@@ -316,48 +332,40 @@ fastrpc_shbuf_sync(struct fastrpc_shbuf *sb, bool after)
 	}
 }
 
+/* The shm object a descriptor names, held. */
 static int
-fastrpc_shbuf_get(struct fastrpc_session *s, int fd, uint64_t ptr,
-    uint64_t len, struct fastrpc_shbuf *sb)
+fastrpc_shbuf_hold(int fd, struct fastrpc_shbuf *sb)
 {
-	struct thread *td = curthread;
-	struct shmfd *shm;
-	vm_map_entry_t entry;
-	vm_map_t map;
-	vm_object_t obj;
-	vm_ooffset_t off;
 	cap_rights_t rights;
-	u_int i;
 	int error;
 
 	memset(sb, 0, sizeof(*sb));
-	error = fget(td, fd, cap_rights_init_one(&rights, CAP_MMAP), &sb->fp);
+	error = fget(curthread, fd, cap_rights_init_one(&rights, CAP_MMAP),
+	    &sb->fp);
 	if (error != 0)
 		return (error);
 	if (sb->fp->f_type != DTYPE_SHM) {
-		fastrpc_shbuf_put(s, sb);
+		fdrop(sb->fp, curthread);
+		sb->fp = NULL;
 		return (EINVAL);
 	}
-	shm = sb->fp->f_data;
-	obj = shm->shm_object;
+	return (0);
+}
 
-	/* Where in the object the program's pointer is. */
-	map = &td->td_proc->p_vmspace->vm_map;
-	vm_map_lock_read(map);
-	if (!vm_map_lookup_entry(map, ptr, &entry) ||
-	    entry->object.vm_object != obj ||
-	    ptr + len > entry->end) {
-		vm_map_unlock_read(map);
-		fastrpc_shbuf_put(s, sb);
-		return (EINVAL);
-	}
-	off = entry->offset + (ptr - entry->start);
-	vm_map_unlock_read(map);
-	if (off + len > (vm_ooffset_t)shm->shm_size) {
-		fastrpc_shbuf_put(s, sb);
-		return (EINVAL);
-	}
+/* Wire the held object's pages [off, off + len) and map them. */
+static int
+fastrpc_shbuf_pin(struct fastrpc_session *s, struct fastrpc_shbuf *sb,
+    vm_ooffset_t off, uint64_t len)
+{
+	struct shmfd *shm = sb->fp->f_data;
+	vm_object_t obj = shm->shm_object;
+	u_int i;
+	int error;
 
+	if (len == 0 || off + len > (vm_ooffset_t)shm->shm_size) {
+		fastrpc_shbuf_put(s, sb);
+		return (EINVAL);
+	}
 	sb->npages = atop(round_page(off + len) - trunc_page(off));
 	sb->ma = malloc(sb->npages * sizeof(*sb->ma), M_FASTRPC,
 	    M_WAITOK | M_ZERO);
@@ -380,6 +388,37 @@ fastrpc_shbuf_get(struct fastrpc_session *s, int fd, uint64_t ptr,
 	}
 	sb->daddr = sb->iova | (uint64_t)s->bank->reg << 32;
 	return (0);
+}
+
+static int
+fastrpc_shbuf_get(struct fastrpc_session *s, int fd, uint64_t ptr,
+    uint64_t len, struct fastrpc_shbuf *sb)
+{
+	struct thread *td = curthread;
+	vm_map_entry_t entry;
+	vm_map_t map;
+	vm_object_t obj;
+	vm_ooffset_t off;
+	int error;
+
+	error = fastrpc_shbuf_hold(fd, sb);
+	if (error != 0)
+		return (error);
+	obj = ((struct shmfd *)sb->fp->f_data)->shm_object;
+
+	/* Where in the object the program's pointer is. */
+	map = &td->td_proc->p_vmspace->vm_map;
+	vm_map_lock_read(map);
+	if (!vm_map_lookup_entry(map, ptr, &entry) ||
+	    entry->object.vm_object != obj ||
+	    ptr + len > entry->end) {
+		vm_map_unlock_read(map);
+		fastrpc_shbuf_put(s, sb);
+		return (EINVAL);
+	}
+	off = entry->offset + (ptr - entry->start);
+	vm_map_unlock_read(map);
+	return (fastrpc_shbuf_pin(s, sb, off, len));
 }
 
 /* Calls */
@@ -438,6 +477,78 @@ fastrpc_ctx_alloc(struct fastrpc_ctx *c)
  * arguments' pointers are the kernel's, and the call is the driver's own
  * (client 0).  Sleeps.
  */
+/*
+ * A buffer passed as a handle, the DSP's to keep past the call (as
+ * HAP_mmap_get() does) until it lists the descriptor in a call's fdlist
+ * or the descriptor closes: mapped whole on first use, then shared.
+ */
+static int
+fastrpc_dmamap_get(struct fastrpc_user *fl, int fd, struct fastrpc_memmap **mp)
+{
+	struct fastrpc_memmap *m, *o;
+	struct fastrpc_shbuf sb;
+	int error;
+
+	error = fastrpc_shbuf_hold(fd, &sb);
+	if (error != 0)
+		return (error);
+	mtx_lock(&frpc.mtx);
+	TAILQ_FOREACH(o, &fl->dmamaps, link)
+		if (o->fd == fd && o->sb.fp->f_data == sb.fp->f_data)
+			break;
+	mtx_unlock(&frpc.mtx);
+	if (o != NULL) {
+		fastrpc_shbuf_put(fl->sess, &sb);
+		*mp = o;
+		return (0);
+	}
+	m = malloc(sizeof(*m), M_FASTRPC, M_WAITOK | M_ZERO);
+	m->fd = fd;
+	m->sb = sb;
+	error = fastrpc_shbuf_pin(fl->sess, &m->sb, 0,
+	    ((struct shmfd *)sb.fp->f_data)->shm_size);
+	if (error != 0) {
+		free(m, M_FASTRPC);
+		return (error);
+	}
+	mtx_lock(&frpc.mtx);
+	TAILQ_FOREACH(o, &fl->dmamaps, link)	/* raced another thread? */
+		if (o->fd == fd && o->sb.fp->f_data == m->sb.fp->f_data)
+			break;
+	if (o == NULL)
+		TAILQ_INSERT_TAIL(&fl->dmamaps, m, link);
+	mtx_unlock(&frpc.mtx);
+	if (o != NULL) {
+		fastrpc_shbuf_put(fl->sess, &m->sb);
+		free(m, M_FASTRPC);
+		m = o;
+	}
+	*mp = m;
+	return (0);
+}
+
+/* The DSP is done with these handles' buffers. */
+static void
+fastrpc_dmamap_release(struct fastrpc_user *fl, const uint64_t *fdlist)
+{
+	struct fastrpc_memmap *m;
+	u_int i;
+
+	for (i = 0; i < FASTRPC_MAX_FDLIST && fdlist[i] != 0; i++) {
+		mtx_lock(&frpc.mtx);
+		TAILQ_FOREACH(m, &fl->dmamaps, link)
+			if (m->fd == (int)fdlist[i])
+				break;
+		if (m != NULL)
+			TAILQ_REMOVE(&fl->dmamaps, m, link);
+		mtx_unlock(&frpc.mtx);
+		if (m != NULL) {
+			fastrpc_shbuf_put(fl->sess, &m->sb);
+			free(m, M_FASTRPC);
+		}
+	}
+}
+
 static int
 fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
     uint32_t sc, struct fastrpc_invoke_args *args)
@@ -449,6 +560,7 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	struct fastrpc_ctx *c;
 	struct fastrpc_buf *buf;
 	struct fastrpc_shbuf *sbs;
+	struct fastrpc_memmap *dm[FASTRPC_MAX_HANDLES];
 	struct fastrpc_msg msg;
 	uint64_t off, pg0, pg1;
 	size_t metalen, size;
@@ -459,9 +571,17 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	inbufs = SC_INBUFS(sc);
 	nbufs = inbufs + SC_OUTBUFS(sc);
 	nscalars = SC_LENGTH(sc);
-	for (i = nbufs; i < nscalars; i++)
-		if (args[i].fd > 0)
-			return (EOPNOTSUPP);	/* handles to buffers: not yet */
+	/* Buffers passed as handles, mapped and kept. */
+	for (i = nbufs; i < nscalars; i++) {
+		dm[i - nbufs] = NULL;
+		if (args[i].fd <= 0)
+			continue;
+		if (kernel)
+			return (EINVAL);
+		error = fastrpc_dmamap_get(fl, args[i].fd, &dm[i - nbufs]);
+		if (error != 0)
+			return (error);
+	}
 	/*
 	 * Buffers by descriptor, in the calling process's table and map,
 	 * kernel calls' too (the image INIT_CREATE passes).
@@ -533,12 +653,17 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 		off += args[i].length;
 	}
 	for (i = nbufs; i < nscalars; i++) {
-		/* Handles: an fd, its offset and length (none here). */
+		/* Handles: an fd, its offset and length, and its pages. */
 		rpra[i].pv = (uint64_t)(uint32_t)args[i].fd |
 		    (uint64_t)(uint32_t)args[i].ptr << 32;
 		rpra[i].len = args[i].length;
 		list[i].num = args[i].length != 0;
 		list[i].pgidx = i;
+		if (dm[i - nbufs] != NULL) {
+			fastrpc_shbuf_sync(&dm[i - nbufs]->sb, false);
+			pages[i].addr = dm[i - nbufs]->sb.daddr;
+			pages[i].size = ptoa(dm[i - nbufs]->sb.npages);
+		}
 	}
 	wmb();
 
@@ -597,6 +722,14 @@ fastrpc_invoke_args(struct fastrpc_user *fl, bool kernel, uint32_t handle,
 	if (error != 0)
 		goto out;
 	rmb();
+
+	/* Handles' buffers as the DSP left them; those it is done with go. */
+	for (i = nbufs; i < nscalars; i++)
+		if (dm[i - nbufs] != NULL)
+			fastrpc_shbuf_sync(&dm[i - nbufs]->sb, true);
+	if (!kernel)
+		fastrpc_dmamap_release(fl, (const uint64_t *)(pages +
+		    nscalars));
 
 	/* The output buffers back. */
 	off = roundup2(metalen, FASTRPC_ALIGN);
@@ -922,6 +1055,121 @@ fastrpc_req_munmap(struct fastrpc_user *fl, struct fastrpc_req_munmap *req)
 	return (error);
 }
 
+/*
+ * A program's shared buffer, whole, mapped into the DSP process until
+ * MEM_UNMAP or close; the DSP sees it at the address it answers.
+ * Keeping the CPU's caches in step afterwards is the program's job, as
+ * on Linux; the buffer goes over written back.
+ */
+static int
+fastrpc_req_mem_map(struct fastrpc_user *fl, struct fastrpc_mem_map *req)
+{
+	struct {
+		int32_t		pgid;
+		int32_t		fd;
+		int32_t		offset;
+		uint32_t	flags;
+		uint64_t	vaddrin;
+		int32_t		num;
+		int32_t		data_len;
+	} msg;		/* laid out as Linux's */
+	struct fastrpc_phy_page page;
+	struct fastrpc_invoke_args args[4];
+	struct fastrpc_memmap *m;
+	uint64_t raddr;
+	int error;
+
+	m = malloc(sizeof(*m), M_FASTRPC, M_WAITOK | M_ZERO);
+	m->fd = req->fd;
+	error = fastrpc_shbuf_hold(req->fd, &m->sb);
+	if (error == 0)
+		error = fastrpc_shbuf_pin(fl->sess, &m->sb, 0, req->length);
+	if (error != 0) {
+		free(m, M_FASTRPC);
+		return (error);
+	}
+	fastrpc_shbuf_sync(&m->sb, false);
+	msg.pgid = fl->client_id;
+	msg.fd = req->fd;
+	msg.offset = req->offset;
+	msg.flags = req->flags;
+	msg.vaddrin = req->vaddrin;
+	msg.num = sizeof(page);
+	msg.data_len = 0;
+	page.addr = m->sb.daddr;
+	page.size = req->length;
+	memset(args, 0, sizeof(args));
+	args[0].ptr = (uintptr_t)&msg;
+	args[0].length = sizeof(msg);
+	args[1].ptr = (uintptr_t)&page;
+	args[1].length = sizeof(page);
+	args[2].ptr = (uintptr_t)&page;
+	args[2].length = 0;
+	args[3].ptr = (uintptr_t)&raddr;
+	args[3].length = sizeof(raddr);
+	for (int i = 0; i < 4; i++)
+		args[i].fd = -1;
+	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
+	    SCALARS(FASTRPC_RMID_INIT_MEM_MAP, 3, 1), args);
+	if (error != 0) {
+		/* A timeout leaves the pages the DSP's. */
+		if (error != ETIMEDOUT) {
+			fastrpc_shbuf_put(fl->sess, &m->sb);
+			free(m, M_FASTRPC);
+		}
+		return (error);
+	}
+	m->raddr = raddr;
+	mtx_lock(&frpc.mtx);
+	TAILQ_INSERT_TAIL(&fl->memmaps, m, link);
+	mtx_unlock(&frpc.mtx);
+	req->vaddrout = raddr;
+	return (0);
+}
+
+static int
+fastrpc_req_mem_unmap(struct fastrpc_user *fl, struct fastrpc_mem_unmap *req)
+{
+	struct {
+		int32_t		pgid;
+		int32_t		fd;
+		uint64_t	vaddrin;
+		uint64_t	len;
+	} msg;
+	struct fastrpc_invoke_args args[1];
+	struct fastrpc_memmap *m;
+	int error;
+
+	mtx_lock(&frpc.mtx);
+	TAILQ_FOREACH(m, &fl->memmaps, link)
+		if (m->fd == req->fd && m->raddr == req->vaddr)
+			break;
+	if (m != NULL)
+		TAILQ_REMOVE(&fl->memmaps, m, link);
+	mtx_unlock(&frpc.mtx);
+	if (m == NULL)
+		return (EINVAL);
+	msg.pgid = fl->client_id;
+	msg.fd = m->fd;
+	msg.vaddrin = m->raddr;
+	msg.len = req->length;
+	memset(args, 0, sizeof(args));
+	args[0].ptr = (uintptr_t)&msg;
+	args[0].length = sizeof(msg);
+	args[0].fd = -1;
+	error = fastrpc_invoke_args(fl, true, FASTRPC_INIT_HANDLE,
+	    SCALARS(FASTRPC_RMID_INIT_MEM_UNMAP, 1, 0), args);
+	if (error == 0) {
+		fastrpc_shbuf_put(fl->sess, &m->sb);
+		free(m, M_FASTRPC);
+	} else if (error != ETIMEDOUT) {
+		mtx_lock(&frpc.mtx);
+		TAILQ_INSERT_TAIL(&fl->memmaps, m, link);
+		mtx_unlock(&frpc.mtx);
+	}
+	return (error);
+}
+
 /* The device */
 
 static void
@@ -930,6 +1178,7 @@ fastrpc_dtor(void *data)
 	struct fastrpc_user *fl = data;
 	struct fastrpc_invoke_args args[1];
 	struct fastrpc_buf *b;
+	struct fastrpc_memmap *m;
 	int32_t client_id = fl->client_id;
 
 	if (fl->attached) {
@@ -945,6 +1194,16 @@ fastrpc_dtor(void *data)
 	while ((b = TAILQ_FIRST(&fl->mmaps)) != NULL) {
 		TAILQ_REMOVE(&fl->mmaps, b, link);
 		fastrpc_buf_free(fl->sess, b);
+	}
+	while ((m = TAILQ_FIRST(&fl->memmaps)) != NULL) {
+		TAILQ_REMOVE(&fl->memmaps, m, link);
+		fastrpc_shbuf_put(fl->sess, &m->sb);
+		free(m, M_FASTRPC);
+	}
+	while ((m = TAILQ_FIRST(&fl->dmamaps)) != NULL) {
+		TAILQ_REMOVE(&fl->dmamaps, m, link);
+		fastrpc_shbuf_put(fl->sess, &m->sb);
+		free(m, M_FASTRPC);
 	}
 	mtx_lock(&frpc.mtx);
 	fl->sess->used = false;
@@ -994,6 +1253,8 @@ fastrpc_open(struct cdev *dev, int oflags, int devtype, struct thread *td)
 	fl->pd = ROOT_PD;
 	sx_init(&fl->lock, "fastrpc user");
 	TAILQ_INIT(&fl->mmaps);
+	TAILQ_INIT(&fl->memmaps);
+	TAILQ_INIT(&fl->dmamaps);
 	error = devfs_set_cdevpriv(fl, fastrpc_dtor);
 	if (error != 0)
 		fastrpc_dtor(fl);
@@ -1075,7 +1336,12 @@ fastrpc_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		    (struct fastrpc_req_munmap *)data);
 		break;
 	case FASTRPC_IOCTL_MEM_MAP:
+		error = fastrpc_req_mem_map(fl, (struct fastrpc_mem_map *)data);
+		break;
 	case FASTRPC_IOCTL_MEM_UNMAP:
+		error = fastrpc_req_mem_unmap(fl,
+		    (struct fastrpc_mem_unmap *)data);
+		break;
 	case FASTRPC_IOCTL_INIT_CREATE_STATIC:
 		error = EOPNOTSUPP;
 		break;
