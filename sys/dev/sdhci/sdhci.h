@@ -244,7 +244,7 @@
 #define	 SDHCI_INT_DATA_MASK	(SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | \
 		SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL | \
 		SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC | \
-		SDHCI_INT_DATA_END_BIT)
+		SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMAERR)
 
 #define	SDHCI_ACMD12_ERR	0x3C
 
@@ -326,6 +326,12 @@
 #define	SDHCI_ADMA_ADDRESS_LO	0x58
 #define	SDHCI_ADMA_ADDRESS_HI	0x5C
 
+/* A 32-bit ADMA2 descriptor: attributes and length, then address. */
+#define	SDHCI_ADMA2_VALID	0x0001
+#define	SDHCI_ADMA2_END		0x0002
+#define	SDHCI_ADMA2_ACT_TRAN	0x0020
+#define	SDHCI_ADMA2_DESC_LEN	32768	/* bytes a descriptor moves */
+
 #define	SDHCI_PRESET_VALUE	0x60
 #define	SDHCI_SHARED_BUS_CTRL	0xE0
 
@@ -364,6 +370,7 @@ struct sdhci_slot {
 #define	SDHCI_TUNING_ENABLED		0x10
 #define	SDHCI_SDR50_NEEDS_TUNING	0x20
 #define	SDHCI_SLOT_EMBEDDED		0x40
+#define	SDHCI_HAVE_ADMA2		0x80	/* DMA is ADMA2, not SDMA */
 	u_char		version;
 	int		timeout;	/* Transfer timeout */
 	uint32_t	max_clk;	/* Max possible freq */
@@ -372,7 +379,7 @@ struct sdhci_slot {
 	bus_dmamap_t	dmamap;
 	u_char		*dmamem;
 	bus_addr_t	paddr;		/* DMA buffer address */
-	uint32_t	sdma_bbufsz;	/* SDMA bounce buffer size */
+	uint32_t	sdma_bbufsz;	/* SDMA or ADMA2 bounce buffer size */
 	uint8_t		sdma_boundary;	/* SDMA boundary */
 	struct task	card_task;	/* Card presence check task */
 	struct timeout_task
@@ -409,6 +416,10 @@ struct sdhci_slot {
 #define	STOP_STARTED		2
 #define	SDHCI_USE_DMA		4	/* Use DMA for this req. */
 #define	PLATFORM_DATA_STARTED	8	/* Data xfer is handled by platform */
+	bus_dma_tag_t	adma_tag;	/* ADMA2 descriptor table */
+	bus_dmamap_t	adma_map;
+	uint64_t	*adma_desc;
+	bus_addr_t	adma_paddr;
 
 #ifdef MMCCAM
 	/* CAM stuff */

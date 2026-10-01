@@ -307,6 +307,7 @@ sdhci_dumpcaps_buf(struct sdhci_slot *slot, struct sbuf *s)
 	    (host_caps & MMC_CAP_DRIVER_TYPE_A) ? "A" : "",
 	    (host_caps & MMC_CAP_DRIVER_TYPE_C) ? "C" : "",
 	    (host_caps & MMC_CAP_DRIVER_TYPE_D) ? "D" : "",
+	    (slot->opt & SDHCI_HAVE_ADMA2) ? "ADMA2" :
 	    (slot->opt & SDHCI_HAVE_DMA) ? "DMA" : "PIO",
 	    (slot->opt & SDHCI_SLOT_EMBEDDED) ? "embedded" :
 	    (slot->opt & SDHCI_NON_REMOVABLE) ? "non-removable" :
@@ -394,6 +395,8 @@ sdhci_init(struct sdhci_slot *slot)
 	    SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL |
 	    SDHCI_INT_DMA_END | SDHCI_INT_DATA_END | SDHCI_INT_RESPONSE |
 	    SDHCI_INT_ACMD12ERR;
+	if (slot->opt & SDHCI_HAVE_ADMA2)
+		slot->intmask |= SDHCI_INT_ADMAERR;
 
 	if (!(slot->quirks & SDHCI_QUIRK_POLL_CARD_PRESENT) &&
 	    !(slot->opt & SDHCI_NON_REMOVABLE)) {
@@ -791,6 +794,100 @@ sdhci_card_poll(void *arg)
 	    sdhci_card_poll, slot);
 }
 
+/*
+ * ADMA2, for controllers without SDMA: a bounce buffer for a whole
+ * request, below 4 GB for 32-bit descriptors, and a table of descriptors
+ * built for each request to cover its length.
+ */
+static int
+sdhci_adma_alloc(struct sdhci_slot *slot)
+{
+	size_t tblsz;
+	int err;
+
+	slot->sdma_bbufsz = maxphys;
+	tblsz = howmany(slot->sdma_bbufsz, SDHCI_ADMA2_DESC_LEN) *
+	    sizeof(*slot->adma_desc);
+
+	err = bus_dma_tag_create(bus_get_dma_tag(slot->bus), PAGE_SIZE, 0,
+	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
+	    slot->sdma_bbufsz, 1, slot->sdma_bbufsz, BUS_DMA_ALLOCNOW,
+	    NULL, NULL, &slot->dmatag);
+	if (err != 0) {
+		slot_printf(slot, "Can't create DMA tag for ADMA2\n");
+		return (err);
+	}
+	err = bus_dmamem_alloc(slot->dmatag, (void **)&slot->dmamem,
+	    BUS_DMA_NOWAIT, &slot->dmamap);
+	if (err != 0) {
+		slot_printf(slot, "Can't alloc DMA memory for ADMA2\n");
+		goto fail_tag;
+	}
+	err = bus_dmamap_load(slot->dmatag, slot->dmamap, slot->dmamem,
+	    slot->sdma_bbufsz, sdhci_getaddr, &slot->paddr, BUS_DMA_NOWAIT);
+	if (err != 0 || slot->paddr == 0) {
+		slot_printf(slot, "Can't load DMA memory for ADMA2\n");
+		goto fail_mem;
+	}
+
+	err = bus_dma_tag_create(bus_get_dma_tag(slot->bus), 4, 0,
+	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
+	    tblsz, 1, tblsz, BUS_DMA_ALLOCNOW, NULL, NULL, &slot->adma_tag);
+	if (err != 0) {
+		slot_printf(slot, "Can't create ADMA2 descriptor tag\n");
+		goto fail_load;
+	}
+	err = bus_dmamem_alloc(slot->adma_tag, (void **)&slot->adma_desc,
+	    BUS_DMA_NOWAIT | BUS_DMA_ZERO | BUS_DMA_COHERENT, &slot->adma_map);
+	if (err != 0) {
+		slot_printf(slot, "Can't alloc ADMA2 descriptors\n");
+		goto fail_adma_tag;
+	}
+	err = bus_dmamap_load(slot->adma_tag, slot->adma_map,
+	    slot->adma_desc, tblsz, sdhci_getaddr, &slot->adma_paddr,
+	    BUS_DMA_NOWAIT);
+	if (err != 0 || slot->adma_paddr == 0) {
+		slot_printf(slot, "Can't load ADMA2 descriptors\n");
+		goto fail_adma_mem;
+	}
+	return (0);
+
+fail_adma_mem:
+	bus_dmamem_free(slot->adma_tag, slot->adma_desc, slot->adma_map);
+fail_adma_tag:
+	bus_dma_tag_destroy(slot->adma_tag);
+fail_load:
+	bus_dmamap_unload(slot->dmatag, slot->dmamap);
+fail_mem:
+	bus_dmamem_free(slot->dmatag, slot->dmamem, slot->dmamap);
+fail_tag:
+	bus_dma_tag_destroy(slot->dmatag);
+	return (err != 0 ? err : EFAULT);
+}
+
+/* Describe the first len bytes of the bounce buffer to the controller. */
+static void
+sdhci_adma_load(struct sdhci_slot *slot, size_t len)
+{
+	bus_addr_t addr;
+	uint32_t attr, n;
+	int i;
+
+	addr = slot->paddr;
+	for (i = 0; len > 0; i++) {
+		n = MIN(len, SDHCI_ADMA2_DESC_LEN);
+		len -= n;
+		attr = SDHCI_ADMA2_VALID | SDHCI_ADMA2_ACT_TRAN;
+		if (len == 0)
+			attr |= SDHCI_ADMA2_END;
+		slot->adma_desc[i] = htole64((uint64_t)addr << 32 |
+		    (uint64_t)n << 16 | attr);
+		addr += n;
+	}
+	bus_dmamap_sync(slot->adma_tag, slot->adma_map, BUS_DMASYNC_PREWRITE);
+	WR4(slot, SDHCI_ADMA_ADDRESS_LO, slot->adma_paddr);
+}
+
 static int
 sdhci_dma_alloc(struct sdhci_slot *slot)
 {
@@ -815,6 +912,8 @@ sdhci_dma_alloc(struct sdhci_slot *slot)
 			slot->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_512K;
 	}
 	slot->sdma_bbufsz = SDHCI_SDMA_BNDRY_TO_BBUFSZ(slot->sdma_boundary);
+	if (slot->opt & SDHCI_HAVE_ADMA2)
+		return (sdhci_adma_alloc(slot));
 
 	/*
 	 * Allocate the DMA tag for an SDMA bounce buffer.
@@ -861,6 +960,12 @@ static void
 sdhci_dma_free(struct sdhci_slot *slot)
 {
 
+	if (slot->opt & SDHCI_HAVE_ADMA2) {
+		bus_dmamap_unload(slot->adma_tag, slot->adma_map);
+		bus_dmamem_free(slot->adma_tag, slot->adma_desc,
+		    slot->adma_map);
+		bus_dma_tag_destroy(slot->adma_tag);
+	}
 	bus_dmamap_unload(slot->dmatag, slot->dmamap);
 	bus_dmamem_free(slot->dmatag, slot->dmamem, slot->dmamap);
 	bus_dma_tag_destroy(slot->dmatag);
@@ -1092,12 +1197,18 @@ no_tuning:
 		host_caps |= MMC_CAP_DRIVER_TYPE_D;
 	slot->host.caps = host_caps;
 
-	/* Decide if we have usable DMA. */
+	/*
+	 * Decide if we have usable DMA: SDMA, or ADMA2 when the controller
+	 * has no SDMA.
+	 */
 	if (caps & SDHCI_CAN_DO_DMA)
 		slot->opt |= SDHCI_HAVE_DMA;
+	else if ((caps & SDHCI_CAN_DO_ADMA2) &&
+	    !(slot->quirks & SDHCI_QUIRK_FORCE_DMA))
+		slot->opt |= SDHCI_HAVE_DMA | SDHCI_HAVE_ADMA2;
 
 	if (slot->quirks & SDHCI_QUIRK_BROKEN_DMA)
-		slot->opt &= ~SDHCI_HAVE_DMA;
+		slot->opt &= ~(SDHCI_HAVE_DMA | SDHCI_HAVE_ADMA2);
 	if (slot->quirks & SDHCI_QUIRK_FORCE_DMA)
 		slot->opt |= SDHCI_HAVE_DMA;
 	if (slot->quirks & SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE)
@@ -1108,7 +1219,7 @@ no_tuning:
 	 * with PIO as a fallback mechanism
 	 */
 	if (slot->opt & SDHCI_PLATFORM_TRANSFER)
-		slot->opt &= ~SDHCI_HAVE_DMA;
+		slot->opt &= ~(SDHCI_HAVE_DMA | SDHCI_HAVE_ADMA2);
 
 	if (slot->opt & SDHCI_HAVE_DMA) {
 		err = sdhci_dma_alloc(slot);
@@ -1971,6 +2082,10 @@ sdhci_start_data(struct sdhci_slot *slot, const struct mmc_data *data)
 	if ((slot->quirks & SDHCI_QUIRK_32BIT_DMA_SIZE) &&
 	    ((data->len) & 0x3))
 		slot->flags &= ~SDHCI_USE_DMA;
+	/* ADMA2 moves whole words, and the whole request at once. */
+	if ((slot->opt & SDHCI_HAVE_ADMA2) &&
+	    ((data->len & 0x3) || data->len > slot->sdma_bbufsz))
+		slot->flags &= ~SDHCI_USE_DMA;
 	/* Load DMA buffer. */
 	if (slot->flags & SDHCI_USE_DMA) {
 		sdma_bbufsz = slot->sdma_bbufsz;
@@ -1983,15 +2098,24 @@ sdhci_start_data(struct sdhci_slot *slot, const struct mmc_data *data)
 			bus_dmamap_sync(slot->dmatag, slot->dmamap,
 			    BUS_DMASYNC_PREWRITE);
 		}
-		WR4(slot, SDHCI_DMA_ADDRESS, slot->paddr);
-		/*
-		 * Interrupt aggregation: Mask border interrupt for the last
-		 * bounce buffer and unmask otherwise.
-		 */
-		if (data->len == sdma_bbufsz)
+		if (slot->opt & SDHCI_HAVE_ADMA2) {
+			sdhci_adma_load(slot, data->len);
+			slot->hostctrl = (slot->hostctrl &
+			    ~SDHCI_CTRL_DMA_MASK) | SDHCI_CTRL_ADMA2;
+			WR1(slot, SDHCI_HOST_CONTROL, slot->hostctrl);
+			/* No borders: the table covers the request. */
 			slot->intmask &= ~SDHCI_INT_DMA_END;
-		else
-			slot->intmask |= SDHCI_INT_DMA_END;
+		} else {
+			WR4(slot, SDHCI_DMA_ADDRESS, slot->paddr);
+			/*
+			 * Interrupt aggregation: Mask border interrupt for
+			 * the last bounce buffer and unmask otherwise.
+			 */
+			if (data->len == sdma_bbufsz)
+				slot->intmask &= ~SDHCI_INT_DMA_END;
+			else
+				slot->intmask |= SDHCI_INT_DMA_END;
+		}
 		WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
 	}
 	/* Current data offset for both PIO and DMA. */
@@ -2264,6 +2388,12 @@ sdhci_data_irq(struct sdhci_slot *slot, uint32_t intmask)
 		slot->curcmd->error = MMC_ERR_TIMEOUT;
 	else if (intmask & (SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT))
 		slot->curcmd->error = MMC_ERR_BADCRC;
+	else if (intmask & SDHCI_INT_ADMAERR) {
+		slot_printf(slot, "ADMA2 error 0x%02x at descriptor 0x%08x\n",
+		    RD1(slot, SDHCI_ADMA_ERR),
+		    RD4(slot, SDHCI_ADMA_ADDRESS_LO));
+		slot->curcmd->error = MMC_ERR_FAILED;
+	}
 	if (slot->curcmd->data == NULL &&
 	    (intmask & (SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL |
 	    SDHCI_INT_DMA_END))) {

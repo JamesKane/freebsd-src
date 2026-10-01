@@ -112,8 +112,8 @@ static const struct sdhci_acpi_device {
 	/*
 	 * Card detect is a GPIO, polled.  The card supplies are regulators,
 	 * which the firmware leaves on, at 3 V.  The controller has ADMA2 but
-	 * not SDMA, which sdhci doesn't use, so transfers are PIO; forcing
-	 * SDMA on hangs the SoC.
+	 * not SDMA (forcing SDMA on hangs the SoC), and the firmware leaves
+	 * its SMMU context bypassed, so DMA addresses are physical.
 	 */
 	{ "QCOM2466",	0, "Qualcomm SDHCI-MSM SD Controller",
 	    SDHCI_QUIRK_MISSING_CAPS,
