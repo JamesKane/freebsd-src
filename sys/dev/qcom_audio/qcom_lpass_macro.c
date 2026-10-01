@@ -28,10 +28,10 @@
 /*
  * The LPASS codec macros: the digital half of the codec, between the DSP's
  * codec DMA and the SoundWire links to the analog codecs.  Here, clocking
- * the RX (playback) macro and opening its headphone paths, as Linux's
- * lpass-rx-macro and lpass-va-macro drivers do: the DSP's PRM powers them
- * and runs their clocks, and the VA macro generates the frame sync the RX
- * macro counts from.
+ * the RX (playback) macro and opening its headphone paths, and clocking the
+ * RX and TX SoundWire controllers, as Linux's lpass-rx/tx/va-macro drivers
+ * do: the DSP's PRM powers the macros and runs their clocks, and the VA
+ * macro generates the frame sync the others count from.
  */
 
 #include <sys/param.h>
@@ -50,6 +50,7 @@
 
 /* SC8280XP */
 #define	RX_MACRO_BASE		0x3200000
+#define	TX_MACRO_BASE		0x3220000
 #define	VA_MACRO_BASE		0x3370000
 #define	MACRO_SIZE		0x1000
 #define	MACRO_MCLK_HZ		19200000
@@ -59,8 +60,21 @@
 #define	VA_FS_CNT_CONTROL	0x0004
 #define	VA_FS_EN		0x01
 #define	VA_FS_COUNTER_CLR	0x02
+#define	VA_SWR_CONTROL		0x0008
+#define	VA_SWR_CLK_EN		0x01
+#define	VA_SWR_RESET		0x02
 #define	VA_TOP_CFG0		0x0080
 #define	VA_FS_BROADCAST_EN	0x02
+
+#define	TX_MCLK_CONTROL		0x0000
+#define	TX_MCLK_EN		0x01
+#define	TX_FS_CNT_CONTROL	0x0004
+#define	TX_FS_CNT_EN		0x01
+#define	TX_SWR_CONTROL		0x0008
+#define	TX_SWR_CLK_EN		0x01
+#define	TX_SWR_RESET		0x02
+#define	TX_TOP_FREQ_MCLK	0x0090
+#define	TX_FREQ_MCLK_9P6	0x01
 
 #define	RX_MCLK_CONTROL		0x0100
 #define	RX_MCLK_EN		0x01
@@ -68,6 +82,9 @@
 #define	RX_FS_CNT_CONTROL	0x0104
 #define	RX_FS_CNT_EN		0x01
 #define	RX_FS_CNT_CLR		0x02
+#define	RX_SWR_CONTROL		0x0108
+#define	RX_SWR_CLK_EN		0x01
+#define	RX_SWR_RESET		0x02
 
 /*
  * The headphone paths, interpolators 0 and 1 (left and right), as Linux
@@ -121,7 +138,7 @@ static const uint32_t macro_clocks[] = {
 
 static struct sx macro_lock;
 SX_SYSINIT(qcom_lpass_macro, &macro_lock, "qcom_lpass_macro");
-static volatile uint32_t *va, *rx;
+static volatile uint32_t *va, *rx, *tx;
 static bool macro_on;
 
 static void
@@ -156,6 +173,11 @@ qcom_lpass_macro_rx(bool on)
 	}
 	if (!on) {
 		/* The macros' registers only answer while clocked. */
+		macro_set(rx, RX_SWR_CONTROL, RX_SWR_CLK_EN, 0);
+		macro_set(tx, TX_SWR_CONTROL, TX_SWR_CLK_EN, 0);
+		macro_set(va, VA_SWR_CONTROL, VA_SWR_CLK_EN, 0);
+		macro_set(tx, TX_FS_CNT_CONTROL, TX_FS_CNT_EN, 0);
+		macro_set(tx, TX_MCLK_CONTROL, TX_MCLK_EN, 0);
 		for (i = nitems(rx_hph); i > 0; i--)
 			rx[rx_hph[i - 1].off / 4] = rx_hph[i - 1].dflt;
 		macro_set(rx, RX_FS_CNT_CONTROL, RX_FS_CNT_EN, 0);
@@ -193,6 +215,7 @@ qcom_lpass_macro_rx(bool on)
 	if (va == NULL) {
 		va = pmap_mapdev(VA_MACRO_BASE, MACRO_SIZE);
 		rx = pmap_mapdev(RX_MACRO_BASE, MACRO_SIZE);
+		tx = pmap_mapdev(TX_MACRO_BASE, MACRO_SIZE);
 	}
 
 	/* The VA macro's frame sync, which it broadcasts to the others. */
@@ -210,11 +233,32 @@ qcom_lpass_macro_rx(bool on)
 	macro_set(rx, RX_FS_CNT_CONTROL, RX_FS_CNT_EN, RX_FS_CNT_EN);
 	for (i = 0; i < nitems(rx_hph); i++)
 		rx[rx_hph[i].off / 4] = rx_hph[i].on;
+
+	/*
+	 * The SoundWire controllers' clocks: the RX macro's for the RX link,
+	 * the TX macro's (with the TX macro's own clock) for the TX link,
+	 * each started with the controller held in reset, as Linux's macro
+	 * probes do.
+	 */
+	macro_set(rx, RX_SWR_CONTROL, RX_SWR_RESET, RX_SWR_RESET);
+	macro_set(rx, RX_SWR_CONTROL, RX_SWR_CLK_EN, RX_SWR_CLK_EN);
+	macro_set(rx, RX_SWR_CONTROL, RX_SWR_RESET, 0);
+	macro_set(tx, TX_TOP_FREQ_MCLK, TX_FREQ_MCLK_9P6, TX_FREQ_MCLK_9P6);
+	macro_set(tx, TX_MCLK_CONTROL, TX_MCLK_EN, TX_MCLK_EN);
+	macro_set(tx, TX_FS_CNT_CONTROL, TX_FS_CNT_EN, TX_FS_CNT_EN);
+	macro_set(tx, TX_SWR_CONTROL, TX_SWR_RESET, TX_SWR_RESET);
+	macro_set(tx, TX_SWR_CONTROL, TX_SWR_CLK_EN, TX_SWR_CLK_EN);
+	macro_set(tx, TX_SWR_CONTROL, TX_SWR_RESET, 0);
+	/* The VA macro's too, which on this SoC drives the TX link. */
+	macro_set(va, VA_SWR_CONTROL, VA_SWR_RESET, VA_SWR_RESET);
+	macro_set(va, VA_SWR_CONTROL, VA_SWR_CLK_EN, VA_SWR_CLK_EN);
+	macro_set(va, VA_SWR_CONTROL, VA_SWR_RESET, 0);
 	printf("qcom_lpass_macro: RX clocked: VA mclk %#x fs %#x top %#x, "
-	    "RX mclk %#x fs %#x, paths %#x %#x\n", va[VA_MCLK_CONTROL / 4],
-	    va[VA_FS_CNT_CONTROL / 4], va[VA_TOP_CFG0 / 4],
-	    rx[RX_MCLK_CONTROL / 4], rx[RX_FS_CNT_CONTROL / 4],
-	    rx[0x400 / 4], rx[0x480 / 4]);
+	    "RX mclk %#x fs %#x, paths %#x %#x, SoundWire clocks RX %#x TX %#x\n",
+	    va[VA_MCLK_CONTROL / 4], va[VA_FS_CNT_CONTROL / 4],
+	    va[VA_TOP_CFG0 / 4], rx[RX_MCLK_CONTROL / 4],
+	    rx[RX_FS_CNT_CONTROL / 4], rx[0x400 / 4], rx[0x480 / 4],
+	    rx[RX_SWR_CONTROL / 4], tx[TX_SWR_CONTROL / 4]);
 	macro_on = true;
 	sx_xunlock(&macro_lock);
 	return (0);
