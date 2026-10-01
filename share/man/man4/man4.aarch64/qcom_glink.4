@@ -1,0 +1,99 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 James Kane
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd October 1, 2026
+.Dt QCOM_GLINK 4 aarch64
+.Os
+.Sh NAME
+.Nm qcom_glink
+.Nd "Qualcomm GLINK, IPCC and shared memory drivers"
+.Sh SYNOPSIS
+To load the drivers as a module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+qcom_glink_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+module connects the application processors of a Qualcomm Snapdragon
+system-on-chip that boots with ACPI to its other processors, such as the
+audio DSP that
+.Xr qcom_adsp 4
+starts.
+It provides three parts, for other drivers to use:
+.Bl -tag -width "qcom_smem"
+.It Nm qcom_smem
+The shared memory (SMEM) the boot loader sets up: finding and allocating
+its numbered items, in the partitions shared with each processor, under
+the hardware mutex the processors share.
+.It Nm qcom_ipcc
+The inter-processor communication controller: a doorbell to and from each
+processor.
+.It Nm qcom_glink
+GLINK over shared memory: named, message-oriented channels to a processor
+over a pair of rings, an
+.Em edge .
+An edge starts once the processor announces itself, whether it booted
+before or after the driver attached.
+Its state and the channels each side has opened are in the
+.Va dev.qcom_glink.0 Ns \&. Ns Ar edge
+sysctl, for example
+.Va dev.qcom_glink.0.lpass
+for the audio DSP.
+.El
+.Pp
+ACPI describes the IPCC
+.Pq Qq QCOM06C2
+and GLINK
+.Pq Qq QCOM0684
+devices, but not their registers or edges, nor the shared memory; these
+come from a table of systems-on-chip, which the DSDT's
+.Va \e_SB.SOID
+identifies.
+.Sh HARDWARE
+The
+.Nm
+module supports the Qualcomm Snapdragon 8cx Gen 3 (SC8280XP), with an edge
+to the audio DSP
+.Pq Qq lpass .
+It has been tested on the Radxa Dragon Q8B.
+.Sh SEE ALSO
+.Xr qcom_adsp 4
+.Sh HISTORY
+The
+.Nm
+module first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+module and this manual page were written by
+.An James Kane .
+.Sh BUGS
+A processor that restarts takes its edge with it: the edge is not brought
+up again.
+Global heap allocation (SMEM version 11) is not supported.
