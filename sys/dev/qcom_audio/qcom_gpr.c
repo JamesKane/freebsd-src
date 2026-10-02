@@ -332,7 +332,7 @@ gpr_apm_state_sysctl(SYSCTL_HANDLER_ARGS)
 
 SYSCTL_NODE(_hw, OID_AUTO, qcom_gpr, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Qualcomm GPR");
-SYSCTL_INT(_hw_qcom_gpr, OID_AUTO, trace, CTLFLAG_RW, &gpr_trace, 0,
+SYSCTL_INT(_hw_qcom_gpr, OID_AUTO, trace, CTLFLAG_RWTUN, &gpr_trace, 0,
     "Log every packet to and from the DSP");
 SYSCTL_PROC(_hw_qcom_gpr, OID_AUTO, apm_state, CTLTYPE_U32 | CTLFLAG_RD |
     CTLFLAG_MPSAFE, NULL, 0, gpr_apm_state_sysctl, "IU",
