@@ -52,6 +52,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/capsicum.h>
 #include <sys/conf.h>
 #include <sys/fcntl.h>
@@ -260,6 +261,20 @@ static struct {
 	int			start_tries;
 } frpc;
 
+/*
+ * The CDSP's accesses snoop the CPUs' caches (found on SC8280XP, whose
+ * compute banks Linux's devicetree leaves non-coherent), and QNN relies on
+ * it: it writes into buffers the DSP has mapped, between calls, with no
+ * cache maintenance.  So programs' shared buffers are mapped write-back and
+ * shareable; hw.qcom_fastrpc.coherent=0 maps them uncached instead, and
+ * then only what is passed to a call is kept in step.
+ */
+static bool fastrpc_coherent = true;
+SYSCTL_NODE(_hw, OID_AUTO, qcom_fastrpc, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "Qualcomm FastRPC");
+SYSCTL_BOOL(_hw_qcom_fastrpc, OID_AUTO, coherent, CTLFLAG_RWTUN,
+    &fastrpc_coherent, 0, "Map shared buffers cacheable, for the snooping DSP");
+
 #define	FASTRPC_START_TRIES	300	/* a second apart, for the DSP */
 
 /* Buffers */
@@ -382,7 +397,7 @@ fastrpc_shbuf_pin(struct fastrpc_session *s, struct fastrpc_shbuf *sb,
 		}
 	}
 	error = qcom_apps_smmu_map_pages(s->dom, sb->ma, sb->npages,
-	    &sb->iova);
+	    &sb->iova, fastrpc_coherent ? QCOM_SMMU_CACHED : 0);
 	if (error != 0) {
 		sb->iova = 0;
 		fastrpc_shbuf_put(s, sb);

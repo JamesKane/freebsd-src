@@ -42,7 +42,8 @@ int	qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa,
 	    size_t size, uint64_t *iovap);
 /* Pages, wherever they are, at consecutive I/O addresses; uncached. */
 int	qcom_apps_smmu_map_pages(struct qcom_apps_smmu_dom *d, vm_page_t *ma,
-	    u_int npages, uint64_t *iovap);
+	    u_int npages, uint64_t *iovap, u_int flags);
+#define	QCOM_SMMU_CACHED	0x100	/* map_pages: write-back, snooped */
 void	qcom_apps_smmu_unmap(struct qcom_apps_smmu_dom *d, uint64_t iova,
 	    size_t size);
 

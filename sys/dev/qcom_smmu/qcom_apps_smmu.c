@@ -340,10 +340,14 @@ qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa, size_t size,
 	return (0);
 }
 
-/* Pages, wherever they are, at consecutive I/O addresses. */
+/*
+ * Pages, wherever they are, at consecutive I/O addresses: uncached, or,
+ * with QCOM_SMMU_CACHED, write-back and shareable, for a master whose
+ * accesses snoop the CPUs' caches.
+ */
 int
 qcom_apps_smmu_map_pages(struct qcom_apps_smmu_dom *d, vm_page_t *ma,
-    u_int npages, uint64_t *iovap)
+    u_int npages, uint64_t *iovap, u_int flags)
 {
 	vmem_addr_t iova;
 	u_int i;
@@ -354,7 +358,8 @@ qcom_apps_smmu_map_pages(struct qcom_apps_smmu_dom *d, vm_page_t *ma,
 		return (ENOSPC);
 	for (i = 0; i < npages; i++) {
 		error = qcom_smmu_map(d->pt, iova + ptoa(i),
-		    VM_PAGE_TO_PHYS(ma[i]), PAGE_SIZE, QCOM_SMMU_UNCACHED);
+		    VM_PAGE_TO_PHYS(ma[i]), PAGE_SIZE,
+		    (flags & QCOM_SMMU_CACHED) != 0 ? 0 : QCOM_SMMU_UNCACHED);
 		if (error != 0) {
 			if (i > 0)
 				qcom_smmu_unmap(d->pt, iova, ptoa(i));
