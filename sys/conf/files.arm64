@@ -15,6 +15,7 @@ libkern/arm64/crc32c_armv8.S			standard
 
 arm/arm/generic_timer.c				standard
 arm/arm/generic_timer_mem.c			optional acpi
+arm/arm/sbsa_gwdt.c				optional acpi
 arm/arm/gic.c					standard
 arm/arm/gic_acpi.c				optional acpi
 arm/arm/gic_fdt.c				optional fdt
