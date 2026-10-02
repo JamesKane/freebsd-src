@@ -28,6 +28,7 @@ arm64/acpica/OsdEnvironment.c			optional acpi
 arm64/acpica/acpi_wakeup.c			optional acpi
 arm64/acpica/pci_cfgreg.c			optional acpi pci
 arm64/arm64/autoconf.c				standard
+arm64/cix/sky1_gpt.c				optional acpi
 arm64/spe/arm_spe_backend.c			optional hwt spe
 arm64/spe/arm_spe_dev.c				optional hwt spe
 arm64/spe/arm_spe_acpi.c			optional hwt spe acpi
