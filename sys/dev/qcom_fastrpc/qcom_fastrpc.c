@@ -1418,6 +1418,8 @@ fastrpc_start(void *arg __unused, int pending __unused)
 	struct qcom_glink_chan *ch;
 	int error;
 
+	if (qcom_glink_absent())
+		return;
 	error = qcom_glink_open("cdsp", "fastrpcglink-apps-dsp", 1024, 8,
 	    fastrpc_rx, NULL, &ch);
 	if (error != 0) {

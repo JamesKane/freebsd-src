@@ -237,6 +237,8 @@ pmic_glink_start(void *arg __unused, int pending __unused)
 	u_int i;
 	int error;
 
+	if (qcom_glink_absent())
+		return;
 	/*
 	 * Which SoC, here rather than at load: built into the kernel, this
 	 * loads before ACPI is up.  Not one we know: nothing to do.

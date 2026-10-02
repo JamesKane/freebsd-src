@@ -66,4 +66,10 @@ bool	qcom_glink_announced(const char *edge, const char *name);
 /* Whether the edge is up: the remote processor has booted and said so. */
 bool	qcom_glink_up(const char *edge);
 
+/*
+ * Whether boot has finished with no GLINK device attached: on machines
+ * other than Qualcomm's, clients waiting for a channel can stop.
+ */
+bool	qcom_glink_absent(void);
+
 #endif /* _DEV_QCOM_GLINK_QCOM_GLINK_H_ */

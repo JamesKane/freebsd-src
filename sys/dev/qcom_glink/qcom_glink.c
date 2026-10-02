@@ -1083,6 +1083,15 @@ out:
 }
 
 bool
+qcom_glink_absent(void)
+{
+	devclass_t dc;
+
+	dc = devclass_find("qcom_glink");
+	return (!cold && (dc == NULL || devclass_get_count(dc) == 0));
+}
+
+bool
 qcom_glink_up(const char *label)
 {
 	struct glink_edge *e;

@@ -345,6 +345,8 @@ gpr_start(void *arg __unused, int pending __unused)
 	struct qcom_glink_chan *ch;
 	int error;
 
+	if (qcom_glink_absent())
+		return;
 	error = qcom_glink_open("lpass", "adsp_apps", GPR_INTENT_SIZE,
 	    GPR_INTENTS, gpr_rx, NULL, &ch);
 	if (error == 0) {
