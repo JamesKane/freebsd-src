@@ -72,6 +72,13 @@ struct pmic_glink_hdr {
 #define	USBC_CMD_WRITE_REQ		0x15
 #define	USBC_NOTIFY_IND			0x16
 #define	ALTMODE_PAN_EN			0x10	/* send me notifications */
+#define	ALTMODE_PAN_ACK			0x11	/* a port's notification handled */
+
+/* DisplayPort alternate mode: its SVID, and its byte of the extended data. */
+#define	USB_TYPEC_DP_SVID		0xff01
+#define	DP_PIN_ASSIGNMENT(b)		((b) & 0x3f)	/* 1 A ... 6 F */
+#define	DP_HPD_STATE(b)			(((b) >> 6) & 1)
+#define	DP_HPD_IRQ(b)			(((b) >> 7) & 1)
 
 struct usbc_write_req {
 	struct pmic_glink_hdr hdr;
@@ -123,6 +130,11 @@ static struct {
 	volatile uint32_t	*phy[PMIC_GLINK_PORTS];
 	int			orientation[PMIC_GLINK_PORTS]; /* -1 none */
 	int			mux[PMIC_GLINK_PORTS];
+	/* DisplayPort: pin assignment (-1 none) and HPD, as last told. */
+	int			dp_pin[PMIC_GLINK_PORTS];
+	int			dp_hpd[PMIC_GLINK_PORTS];
+	u_int			ack_ports;	/* notifications to acknowledge */
+	struct task		ack_task;
 	struct qcom_glink_chan	*ch;
 	struct taskqueue	*tq;
 	struct timeout_task	start_task;
@@ -192,12 +204,26 @@ pmic_glink_rx(void *arg __unused, const void *data, size_t len)
 		pg.orientation[n->port_idx] = n->orientation <=
 		    ORIENTATION_REVERSE ? n->orientation : -1;
 		pg.mux[n->port_idx] = n->mux_ctrl;
+		if (h->opcode >> 16 == USB_TYPEC_DP_SVID) {
+			pg.dp_pin[n->port_idx] =
+			    DP_PIN_ASSIGNMENT(n->extended[0]);
+			pg.dp_hpd[n->port_idx] = DP_HPD_STATE(n->extended[0]);
+		} else
+			pg.dp_pin[n->port_idx] = pg.dp_hpd[n->port_idx] = -1;
 		pmic_glink_set_orientation(n->port_idx, n->orientation);
+		/*
+		 * Acknowledged once handled, as Linux does, from the task
+		 * queue: sending here, on GLINK's receive thread, could wait
+		 * for buffers announced on that thread.
+		 */
+		pg.ack_ports |= 1u << n->port_idx;
 		mtx_unlock(&pg.mtx);
+		taskqueue_enqueue(pg.tq, &pg.ack_task);
 		if (bootverbose)
 			printf("qcom_pmic_glink: port %u: orientation %u, "
-			    "mux %u, svid %#x\n", n->port_idx, n->orientation,
-			    n->mux_ctrl, h->opcode >> 16);
+			    "mux %u, svid %#x, extended %#x\n", n->port_idx,
+			    n->orientation, n->mux_ctrl, h->opcode >> 16,
+			    n->extended[0]);
 		break;
 	}
 }
@@ -264,23 +290,54 @@ pmic_glink_start(void *arg __unused, int pending __unused)
 		printf("qcom_pmic_glink: no USB-C notifications: %d\n", error);
 }
 
+static void
+pmic_glink_ack(void *arg __unused, int pending __unused)
+{
+	struct usbc_write_req req;
+	struct qcom_glink_chan *ch;
+	u_int i, ports;
+
+	mtx_lock(&pg.mtx);
+	ports = pg.ack_ports;
+	pg.ack_ports = 0;
+	ch = pg.ch;
+	mtx_unlock(&pg.mtx);
+	for (i = 0; ch != NULL && i < PMIC_GLINK_PORTS; i++) {
+		if ((ports & (1u << i)) == 0)
+			continue;
+		memset(&req, 0, sizeof(req));
+		req.hdr.owner = PMIC_GLINK_OWNER_USBC_PAN;
+		req.hdr.type = PMIC_GLINK_REQ_RESP;
+		req.hdr.opcode = USBC_CMD_WRITE_REQ;
+		req.cmd = ALTMODE_PAN_ACK;
+		req.arg = i;
+		(void)qcom_glink_send(ch, &req, sizeof(req));
+	}
+}
+
 static int
 pmic_glink_port_sysctl(SYSCTL_HANDLER_ARGS)
 {
 	static const char *const mux[] = { "none", "usb3", "dp", "usb3+dp",
 	    "tunneling" };
-	char buf[48];
+	char buf[64];
 	u_int port = arg2;
-	int o, m;
+	int hpd, o, m, pin;
 
 	mtx_lock(&pg.mtx);
 	o = pg.orientation[port];
 	m = pg.mux[port];
+	pin = pg.dp_pin[port];
+	hpd = pg.dp_hpd[port];
 	mtx_unlock(&pg.mtx);
 	snprintf(buf, sizeof(buf), "%s, %s",
 	    o == ORIENTATION_NORMAL ? "normal" :
 	    o == ORIENTATION_REVERSE ? "reversed" : "unplugged",
 	    m >= 0 && m < (int)nitems(mux) ? mux[m] : "unknown");
+	/* DisplayPort: pin assignment C, D, ... and the sink's HPD. */
+	if (pin > 0 && pin <= 6)
+		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
+		    ", dp pin %c, hpd %s", 'A' + pin - 1, hpd ? "high" : "low");
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
@@ -303,16 +360,19 @@ qcom_pmic_glink_modevent(module_t mod, int type, void *data)
 	case MOD_LOAD:
 		mtx_init(&pg.mtx, "qcom_pmic_glink", NULL, MTX_DEF);
 		for (i = 0; i < PMIC_GLINK_PORTS; i++)
-			pg.orientation[i] = pg.mux[i] = -1;
+			pg.orientation[i] = pg.mux[i] = pg.dp_pin[i] =
+			    pg.dp_hpd[i] = -1;
 		pg.tq = taskqueue_create("qcom_pmic_glink", M_WAITOK,
 		    taskqueue_thread_enqueue, &pg.tq);
 		taskqueue_start_threads(&pg.tq, 1, PWAIT, "qcom_pmic_glink");
 		TIMEOUT_TASK_INIT(pg.tq, &pg.start_task, 0, pmic_glink_start,
 		    NULL);
+		TASK_INIT(&pg.ack_task, 0, pmic_glink_ack, NULL);
 		taskqueue_enqueue_timeout(pg.tq, &pg.start_task, 0);
 		return (0);
 	case MOD_UNLOAD:
 		taskqueue_drain_timeout(pg.tq, &pg.start_task);
+		taskqueue_drain(pg.tq, &pg.ack_task);
 		taskqueue_free(pg.tq);
 		mtx_lock(&pg.mtx);
 		ch = pg.ch;
