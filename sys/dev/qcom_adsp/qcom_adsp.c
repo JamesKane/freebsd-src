@@ -72,6 +72,7 @@
 #include <dev/acpica/acpivar.h>
 
 #include <dev/qcom_glink/qcom_aoss.h>
+#include <dev/qcom_glink/qcom_glink.h>
 #include <dev/qcom_rpmh/qcom_rpmh.h>
 #include <dev/qcom_scm/qcom_scm.h>
 
@@ -87,6 +88,7 @@ struct qcom_adsp_board {
 	const char	*name;		/* adsp, cdsp */
 	const char	*desc;
 	const char	*firmware;	/* the path in linux-firmware */
+	const char	*edge;		/* its GLINK edge */
 	const char	*load_state;	/* the AOSS's name for it, if any */
 	const char	*rail;		/* an RPMh rail it needs, if any */
 	const char	*bcms[4];	/* its path to memory's BCMs */
@@ -103,6 +105,7 @@ static const struct qcom_adsp_board qcom_adsp_boards[] = {
 		.name = "adsp",
 		.desc = "Qualcomm audio DSP",
 		.firmware = "qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn",
+		.edge = "lpass",
 		.load_state = "adsp",
 		.pas_id = 1,
 		.mem = 0x86c00000,
@@ -116,6 +119,7 @@ static const struct qcom_adsp_board qcom_adsp_boards[] = {
 		.name = "cdsp",
 		.desc = "Qualcomm compute DSP",
 		.firmware = "qcom/sc8280xp/qccdsp8280.mbn",
+		.edge = "cdsp",
 		.rail = "nsp.lvl",
 		/* NSP-A NoC to the memory NoC; SH0 and MC0 are UEFI's. */
 		.bcms = { "NSA1", "NSA0" },
@@ -142,6 +146,9 @@ struct qcom_adsp_softc {
 	int				scm_wait; /* seconds left */
 	struct timeout_task		start_task;
 	eventhandler_tag		mountroot_tag;
+	bool				voted;	/* the boot votes held */
+	struct timeout_task		release_task;
+	int				release_wait; /* seconds left */
 };
 
 static char *qcom_adsp_acpi_ids[] = { "QCOM061B", "QCOM06B0", NULL };
@@ -197,6 +204,52 @@ qcom_adsp_loadable(const Elf32_Phdr *ph)
 }
 
 /* Load the image into the DSP's memory and start it. */
+/*
+ * The DSP's rail at its highest level and its path to memory at full peak,
+ * as Linux's proxy votes hold them while the DSP boots, or (on false) both
+ * let go, as Linux does once the DSP has taken over its own votes.
+ */
+static int
+qcom_adsp_votes(struct qcom_adsp_softc *sc, bool on)
+{
+	const struct qcom_adsp_board *b = sc->board;
+	int error, i;
+
+	if (b->rail != NULL) {
+		error = qcom_rpmh_arc_vote(b->rail, on ? QCOM_RPMH_ARC_MAX : 0);
+		if (error != 0) {
+			device_printf(sc->dev, "no vote for %s: %d\n", b->rail,
+			    error);
+			return (error);
+		}
+	}
+	for (i = 0; i < (int)nitems(b->bcms) && b->bcms[i] != NULL; i++) {
+		error = qcom_rpmh_bcm_vote(b->bcms[i], 0,
+		    on ? QCOM_RPMH_BCM_MAX : 0);
+		if (error != 0) {
+			device_printf(sc->dev, "no vote for %s: %d\n",
+			    b->bcms[i], error);
+			return (error);
+		}
+	}
+	sc->voted = on;
+	return (0);
+}
+
+/* By hand: 1 holds the boot votes, 0 lets them go. */
+static int
+qcom_adsp_votes_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct qcom_adsp_softc *sc = arg1;
+	int error, on;
+
+	on = sc->voted;
+	error = sysctl_handle_int(oidp, &on, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	return (qcom_adsp_votes(sc, on != 0));
+}
+
 static int
 qcom_adsp_boot(struct qcom_adsp_softc *sc, const struct firmware *fw)
 {
@@ -261,28 +314,9 @@ qcom_adsp_boot(struct qcom_adsp_softc *sc, const struct firmware *fw)
 			return (EFTYPE);
 	}
 
-	/*
-	 * The DSP's rail at its highest level, as Linux's proxy vote holds
-	 * it while the DSP boots.  Linux drops it once the DSP has taken
-	 * over its own votes; here it stays.
-	 */
-	if (b->rail != NULL) {
-		error = qcom_rpmh_arc_vote(b->rail, QCOM_RPMH_ARC_MAX);
-		if (error != 0) {
-			device_printf(sc->dev, "no vote for %s: %d\n", b->rail,
-			    error);
-			return (error);
-		}
-	}
-	/* And its path to memory, at full peak, as Linux's proxy vote. */
-	for (i = 0; i < (int)nitems(b->bcms) && b->bcms[i] != NULL; i++) {
-		error = qcom_rpmh_bcm_vote(b->bcms[i], 0, QCOM_RPMH_BCM_MAX);
-		if (error != 0) {
-			device_printf(sc->dev, "no vote for %s: %d\n",
-			    b->bcms[i], error);
-			return (error);
-		}
-	}
+	error = qcom_adsp_votes(sc, true);
+	if (error != 0)
+		return (error);
 
 	/*
 	 * Tell the AOSS the image is going in, as Linux does before loading
@@ -341,6 +375,29 @@ fail:
 	return (error);
 }
 
+/*
+ * Let the boot votes go once the DSP is up, as Linux drops its proxy votes
+ * at the DSP's handover: from then it votes for itself, through its own
+ * RPMh client, as its work needs.  The DSP's GLINK edge coming up, which
+ * follows the handover, says it has booted.
+ */
+static void
+qcom_adsp_release(void *arg, int pending __unused)
+{
+	struct qcom_adsp_softc *sc = arg;
+
+	if (!sc->voted)
+		return;
+	if (qcom_glink_up(sc->board->edge)) {
+		if (qcom_adsp_votes(sc, false) == 0 && bootverbose)
+			device_printf(sc->dev, "boot votes released\n");
+	} else if (--sc->release_wait > 0)
+		taskqueue_enqueue_timeout(taskqueue_thread, &sc->release_task,
+		    hz);
+	else
+		device_printf(sc->dev, "never came up: keeping its votes\n");
+}
+
 static void
 qcom_adsp_start(void *arg, int pending __unused)
 {
@@ -378,8 +435,15 @@ qcom_adsp_start(void *arg, int pending __unused)
 		error = qcom_adsp_boot(sc, fw);
 		firmware_put(fw, FIRMWARE_UNLOAD);
 	}
-	if (error == 0)
+	if (error == 0) {
 		device_printf(sc->dev, "running %s\n", sc->board->firmware);
+		if (sc->board->edge != NULL &&
+		    (sc->board->rail != NULL || sc->board->bcms[0] != NULL)) {
+			sc->release_wait = 60;
+			taskqueue_enqueue_timeout(taskqueue_thread,
+			    &sc->release_task, hz);
+		}
+	}
 
 	mtx_lock(&sc->mtx);
 	sc->state = error == 0 ? QCOM_ADSP_RUNNING : QCOM_ADSP_FAILED;
@@ -448,10 +512,18 @@ qcom_adsp_attach(device_t dev)
 	sc->scm_wait = 60;
 	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->start_task, 0,
 	    qcom_adsp_start, sc);
+	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->release_task, 0,
+	    qcom_adsp_release, sc);
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "state",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    qcom_adsp_state_sysctl, "A", "The DSP's state");
+	if (sc->board->rail != NULL || sc->board->bcms[0] != NULL)
+		SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+		    "votes", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+		    qcom_adsp_votes_sysctl, "I",
+		    "Hold the DSP's boot votes (rail, path to memory)");
 
 	/* The firmware is on the root filesystem. */
 	if (root_mounted())
@@ -476,6 +548,7 @@ qcom_adsp_detach(device_t dev)
 		sc->state = QCOM_ADSP_STOPPED;
 	mtx_unlock(&sc->mtx);
 	taskqueue_drain_timeout(taskqueue_thread, &sc->start_task);
+	taskqueue_drain_timeout(taskqueue_thread, &sc->release_task);
 	/*
 	 * A running DSP must first be asked to stop, through the stop state
 	 * in SMEM and its acknowledgement, which isn't done here: shutting it

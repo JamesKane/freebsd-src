@@ -63,4 +63,7 @@ void	qcom_glink_close(struct qcom_glink_chan *ch);
  */
 bool	qcom_glink_announced(const char *edge, const char *name);
 
+/* Whether the edge is up: the remote processor has booted and said so. */
+bool	qcom_glink_up(const char *edge);
+
 #endif /* _DEV_QCOM_GLINK_QCOM_GLINK_H_ */

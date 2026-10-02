@@ -1083,6 +1083,21 @@ out:
 }
 
 bool
+qcom_glink_up(const char *label)
+{
+	struct glink_edge *e;
+	bool up;
+
+	e = glink_edge_by_label(label);
+	if (e == NULL)
+		return (false);
+	mtx_lock(&e->mtx);
+	up = e->up && !e->dead;
+	mtx_unlock(&e->mtx);
+	return (up);
+}
+
+bool
 qcom_glink_announced(const char *label, const char *name)
 {
 	struct qcom_glink_chan *ch;
