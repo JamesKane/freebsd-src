@@ -34,12 +34,14 @@
 #include <sys/mount.h>
 #include <sys/sbuf.h>
 #include <sys/smp.h>
+#include <sys/sysctl.h>
 #include <sys/bus.h>
 #include <sys/pciio.h>
 
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcireg.h>
 
+#include <compat/linux/linux_mib.h>
 #include <compat/linux/linux_util.h>
 #include <fs/pseudofs/pseudofs.h>
 
@@ -494,6 +496,53 @@ out:
 }
 
 /*
+ * sys/devices/soc0: the SoC, from hw.soc, where a SoC driver describes it.
+ * compat.linux.soc_id overrides the ID Linux programs see, for runtimes
+ * that only know the SoC by another name (Qualcomm's QNN, built for parts
+ * other than SC8280XP, runs on its NPU told it is a QCS6490).
+ */
+static char linsysfs_soc_id[16];
+SYSCTL_STRING(_compat_linux, OID_AUTO, soc_id, CTLFLAG_RWTUN,
+    linsysfs_soc_id, sizeof(linsysfs_soc_id),
+    "SoC ID shown in /sys/devices/soc0/soc_id instead of hw.soc.soc_id");
+
+static int
+linsysfs_soc_attr(struct thread *td, const char *attr, char *buf,
+    size_t size)
+{
+	char name[32];
+
+	if (strcmp(attr, "soc_id") == 0 && linsysfs_soc_id[0] != '\0') {
+		strlcpy(buf, linsysfs_soc_id, size);
+		return (0);
+	}
+	snprintf(name, sizeof(name), "hw.soc.%s", attr);
+	return (kernel_sysctlbyname(td != NULL ? td : curthread, name, buf,
+	    &size, NULL, 0, NULL, 0));
+}
+
+static int
+linsysfs_soc_vis(PFS_VIS_ARGS)
+{
+	char buf[32];
+
+	return (linsysfs_soc_attr(td, pn->pn_type == pfstype_dir ? "soc_id" :
+	    pn->pn_name, buf, sizeof(buf)) == 0);
+}
+
+static int
+linsysfs_soc_fill(PFS_FILL_ARGS)
+{
+	char buf[32];
+	int error;
+
+	error = linsysfs_soc_attr(td, pn->pn_name, buf, sizeof(buf));
+	if (error == 0)
+		sbuf_printf(sb, "%s\n", buf);
+	return (error);
+}
+
+/*
  * Filler function for sys/devices/system/cpu/{online,possible,present}
  */
 static int
@@ -550,7 +599,7 @@ linsysfs_init(PFS_INIT_ARGS)
 {
 	struct pfs_node *root;
 	struct pfs_node *class;
-	struct pfs_node *dir, *sys, *cpu;
+	struct pfs_node *dir, *sys, *cpu, *soc;
 	struct pfs_node *drm;
 	struct pfs_node *pci;
 	struct pfs_node *scsi;
@@ -594,6 +643,17 @@ linsysfs_init(PFS_INIT_ARGS)
 	 */
 	dev = devclass_get_device(devclass, 0);
 	linsysfs_run_bus(dev, pci, scsi, chardev, drm, "/pci0000:00", "0000");
+
+	/* /sys/devices/soc0 */
+	pfs_create_dir(dir, &soc, "soc0", NULL, linsysfs_soc_vis, NULL, 0);
+	pfs_create_file(soc, NULL, "family", &linsysfs_soc_fill, NULL,
+	    linsysfs_soc_vis, NULL, PFS_RD);
+	pfs_create_file(soc, NULL, "machine", &linsysfs_soc_fill, NULL,
+	    linsysfs_soc_vis, NULL, PFS_RD);
+	pfs_create_file(soc, NULL, "soc_id", &linsysfs_soc_fill, NULL,
+	    linsysfs_soc_vis, NULL, PFS_RD);
+	pfs_create_file(soc, NULL, "revision", &linsysfs_soc_fill, NULL,
+	    linsysfs_soc_vis, NULL, PFS_RD);
 
 	/* /sys/devices/system */
 	pfs_create_dir(dir, &sys, "system", NULL, NULL, NULL, 0);
