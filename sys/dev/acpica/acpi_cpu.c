@@ -1455,9 +1455,14 @@ acpi_cpu_cx_lpi(struct acpi_cpu_softc *sc)
 	cx->min_res = leaf[i].min_res;
 	cx->trans_lat = leaf[i].wake_lat;
 	cx->psci_state = leaf[i].entry;
+	/*
+	 * Some firmware leaves the context-lost flag clear on states that
+	 * power the core down; the PSCI state's own type says so too.
+	 */
 	if (leaf[i].entry == LPI_PSCI_WFI)
 	    cx->type = ACPI_STATE_C1;
-	else if ((leaf[i].arch_flags & LPI_ARCH_CORE_LOST) == 0)
+	else if ((leaf[i].arch_flags & LPI_ARCH_CORE_LOST) == 0 &&
+	    !psci_power_state_powers_down(leaf[i].entry))
 	    cx->type = ACPI_STATE_C2;
 	else if (cpu_suspend_supported())
 	    cx->type = ACPI_STATE_C3;

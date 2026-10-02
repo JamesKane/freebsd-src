@@ -491,6 +491,27 @@ psci_cpu_suspend(uint32_t power_state, unsigned long entry,
 	return (psci_call(fnid, power_state, entry, context_id));
 }
 
+/*
+ * Whether a CPU_SUSPEND power state is a power-down state, in which the
+ * core loses its context, from its StateType bit: bit 16 in the original
+ * power_state format, bit 30 in the extended one, which the firmware
+ * reports in PSCI_FEATURES (PSCI 1.0 5.4.2, 5.15.2).
+ */
+bool
+psci_power_state_powers_down(uint32_t power_state)
+{
+	uint32_t fnid;
+	int32_t features;
+
+	fnid = PSCI_FNID_CPU_SUSPEND;
+	if (psci_softc != NULL)
+		fnid = psci_softc->psci_fnids[PSCI_FN_CPU_SUSPEND];
+	features = psci_features(fnid);
+	if (features >= 0 && (features & PSCI_FEAT_SUSPEND_EXT_ID) != 0)
+		return ((power_state & PSCI_EXT_STATE_TYPE_PD) != 0);
+	return ((power_state & PSCI_STATE_TYPE_PD) != 0);
+}
+
 int
 psci_cpu_off(void)
 {

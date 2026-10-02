@@ -41,6 +41,7 @@ extern bool psci_present;
 int	psci_cpu_on(unsigned long, unsigned long, unsigned long);
 int	psci_cpu_off(void);	/* Operates on caller. */
 int	psci_cpu_suspend(uint32_t, unsigned long, unsigned long);
+bool	psci_power_state_powers_down(uint32_t);
 void	psci_reset(void);
 int32_t	psci_features(uint32_t);
 int	psci_get_version(void);
@@ -70,6 +71,13 @@ psci_call(register_t a, register_t b, register_t c, register_t d)
 #define	PSCI_RETVAL_INTERNAL_FAILURE	-6
 #define	PSCI_RETVAL_NOT_PRESENT		-7
 #define	PSCI_RETVAL_DISABLED		-8
+
+/* CPU_SUSPEND power_state StateType: a power-down state. */
+#define	PSCI_STATE_TYPE_PD		(1u << 16)	/* original format */
+#define	PSCI_EXT_STATE_TYPE_PD		(1u << 30)	/* extended format */
+/* PSCI_FEATURES(CPU_SUSPEND): the extended power_state format is used. */
+#define	PSCI_FEAT_SUSPEND_EXT_ID	(1 << 1)
+
 /*
  * Used to signal PSCI is not available, e.g. to start a CPU.
  */
