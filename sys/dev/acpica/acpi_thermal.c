@@ -147,6 +147,7 @@ static void	acpi_tz_timeout(struct acpi_tz_softc *sc, int flags);
 static void	acpi_tz_power_profile(void *arg);
 static void	acpi_tz_thread(void *arg);
 static int	acpi_tz_cooling_is_available(struct acpi_tz_softc *sc);
+static device_t	acpi_tz_cooling_dev(struct acpi_tz_softc *sc, bool *domain);
 static int	acpi_tz_cooling_thread_start(struct acpi_tz_softc *sc);
 
 static device_method_t acpi_tz_methods[] = {
@@ -339,8 +340,9 @@ static void
 acpi_tz_startup(void *arg __unused)
 {
     struct acpi_tz_softc *sc;
-    device_t *devs;
-    int devcount, error, i;
+    device_t cooldev, *cooled, *devs;
+    int devcount, error, i, j, ncooled;
+    bool domain;
 
     devclass_get_devices(devclass_find("acpi_tz"), &devs, &devcount);
     if (devcount == 0) {
@@ -365,20 +367,37 @@ acpi_tz_startup(void *arg __unused)
      * with each other since cpufreq currently sets all CPUs to the
      * given frequency whereas it's possible for different thermal
      * zones to specify independent settings for multiple CPUs.
+     *
+     * Where each cpufreq driver sets a domain of CPUs of its own, a zone
+     * cools the domain of the processors its _PSL names, so every such
+     * zone is enabled, the first of each domain.
      */
+    cooled = malloc(sizeof(*cooled) * devcount, M_TEMP, M_WAITOK | M_ZERO);
+    ncooled = 0;
     for (i = 0; i < devcount; i++) {
 	sc = device_get_softc(devs[i]);
-	if (acpi_tz_cooling_is_available(sc)) {
-	    sc->tz_cooling_enabled = TRUE;
-	    error = acpi_tz_cooling_thread_start(sc);
-	    if (error != 0) {
-		sc->tz_cooling_enabled = FALSE;
-		break;
-	    }
-	    acpi_tz_cooling_unit = device_get_unit(devs[i]);
+	if (!acpi_tz_cooling_is_available(sc))
+	    continue;
+	cooldev = acpi_tz_cooling_dev(sc, &domain);
+	if (domain) {
+	    for (j = 0; j < ncooled; j++)
+		if (cooled[j] == cooldev)
+		    break;
+	    if (cooldev == NULL || j < ncooled)
+		continue;
+	    cooled[ncooled++] = cooldev;
+	}
+	sc->tz_cooling_enabled = TRUE;
+	error = acpi_tz_cooling_thread_start(sc);
+	if (error != 0) {
+	    sc->tz_cooling_enabled = FALSE;
 	    break;
 	}
+	acpi_tz_cooling_unit = device_get_unit(devs[i]);
+	if (!domain)
+	    break;
     }
+    free(cooled, M_TEMP);
     free(devs, M_TEMP);
 }
 SYSINIT(acpi_tz, SI_SUB_KICK_SCHEDULER, SI_ORDER_ANY, acpi_tz_startup, NULL);
@@ -794,7 +813,8 @@ acpi_tz_cooling_sysctl(SYSCTL_HANDLER_ARGS)
 	return (EINVAL);
 
     if (enabled) {
-	if (acpi_tz_cooling_is_available(sc))
+	if (acpi_tz_cooling_is_available(sc) &&
+	    acpi_tz_cooling_dev(sc, NULL) != NULL)
 	    error = acpi_tz_cooling_thread_start(sc);
 	else
 	    error = ENODEV;
@@ -1034,7 +1054,7 @@ acpi_tz_cpufreq_restore(struct acpi_tz_softc *sc)
 
     if (!sc->tz_cooling_updated)
 	return (0);
-    if ((dev = devclass_get_device(devclass_find("cpufreq"), 0)) == NULL)
+    if ((dev = acpi_tz_cooling_dev(sc, NULL)) == NULL)
 	return (ENXIO);
     ACPI_VPRINT(sc->tz_dev, acpi_device_get_parent_softc(sc->tz_dev),
 	"temperature %d.%dC: resuming previous clock speed (%d MHz)\n",
@@ -1056,11 +1076,8 @@ acpi_tz_cpufreq_update(struct acpi_tz_softc *sc, int req)
     if (levels == NULL)
 	return (ENOMEM);
 
-    /*
-     * Find the main device, cpufreq0.  We don't yet support independent
-     * CPU frequency control on SMP.
-     */
-    if ((dev = devclass_get_device(devclass_find("cpufreq"), 0)) == NULL) {
+    /* The main device, cpufreq0, or this zone's domain's. */
+    if ((dev = acpi_tz_cooling_dev(sc, NULL)) == NULL) {
 	error = ENXIO;
 	goto out;
     }
@@ -1203,9 +1220,46 @@ acpi_tz_cooling_thread(void *arg)
 }
 
 /*
- * TODO: We ignore _PSL (list of cooling devices) since cpufreq enumerates
- * all CPUs for us.  However, it's possible in the future _PSL will
- * reference non-CPU devices so we may want to support it then.
+ * The cpufreq device passive cooling sets.  A driver that sets every CPU
+ * gives cpufreq0, as cpufreq enumerates all CPUs for us, and _PSL is
+ * ignored.  Drivers that each set a domain of CPUs (CPUFREQ_FLAG_DOMAIN)
+ * give the device of the first processor in _PSL that has one: a domain's
+ * first processor, in a list that names whole domains.  A zone whose _PSL
+ * names none gets none, rather than slowing CPUs it does not cool.
+ */
+static device_t
+acpi_tz_cooling_dev(struct acpi_tz_softc *sc, bool *domain)
+{
+    ACPI_OBJECT *psl;
+    struct cf_level level;
+    device_t cpu, dev;
+    int i, type;
+
+    if (domain != NULL)
+	*domain = false;
+    dev = devclass_get_device(devclass_find("cpufreq"), 0);
+    if (dev == NULL || CPUFREQ_GET(dev, &level) != 0 ||
+	level.abs_set.dev == NULL ||
+	CPUFREQ_DRV_TYPE(level.abs_set.dev, &type) != 0 ||
+	(type & CPUFREQ_FLAG_DOMAIN) == 0)
+	return (dev);
+    if (domain != NULL)
+	*domain = true;
+    psl = sc->tz_zone.psl.Pointer;
+    if (psl == NULL || psl->Type != ACPI_TYPE_PACKAGE)
+	return (NULL);
+    for (i = 0; i < psl->Package.Count; i++) {
+	cpu = acpi_get_device(acpi_GetReference(NULL,
+	    &psl->Package.Elements[i]));
+	if (cpu != NULL &&
+	    (dev = device_find_child(cpu, "cpufreq", DEVICE_UNIT_ANY)) != NULL)
+	    return (dev);
+    }
+    return (NULL);
+}
+
+/*
+ * TODO: _PSL may in future reference non-CPU devices, which we ignore.
  */
 static int
 acpi_tz_cooling_is_available(struct acpi_tz_softc *sc)
