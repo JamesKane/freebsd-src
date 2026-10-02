@@ -763,6 +763,7 @@ dev/acpica/acpi_apei_bus.c	optional acpi
 dev/acpica/acpi_battery.c	optional acpi
 dev/acpica/acpi_button.c	optional acpi
 dev/acpica/acpi_cmbat.c		optional acpi
+dev/acpica/acpi_cppc.c		optional acpi
 dev/acpica/acpi_cpu.c		optional acpi
 dev/acpica/acpi_ec.c		optional acpi
 dev/acpica/acpi_ged.c		optional acpi_ged acpi
