@@ -31,6 +31,11 @@
  * but for the encoding of the command, so that Linux builds of the
  * FastRPC library, and what is built on it (Qualcomm's QNN), run as is.
  * The structures are Linux's already, and the same on both.
+ *
+ * The buffers qcom_fastrpc hands out are shared memory objects where
+ * Linux's are dma-bufs; of the dma-buf ioctls, QNN names its buffers
+ * (DMA_BUF_SET_NAME, for debugging on Linux), and gives up on a buffer it
+ * cannot name, so that is taken, on any shared memory object.
  */
 
 #include <sys/param.h>
@@ -60,6 +65,15 @@
 #define	FASTRPC_LINUX_MAX	0x52ff
 
 LINUX_IOCTL_SET(fastrpc, FASTRPC_LINUX_MIN, FASTRPC_LINUX_MAX);
+
+/* dma-buf's, type 'b': DMA_BUF_SET_NAME_A (a u32 pointer) and _B (u64). */
+#define	DMABUF_LINUX_MIN	0x6200
+#define	DMABUF_LINUX_MAX	0x62ff
+#define	DMABUF_SET_NAME_A	0x40046201
+#define	DMABUF_SET_NAME_B	0x40086201
+#define	DMABUF_NAME_LEN		32
+
+LINUX_IOCTL_SET(dmabuf, DMABUF_LINUX_MIN, DMABUF_LINUX_MAX);
 
 static bool
 fastrpc_linux_ours(struct thread *td, int fd)
@@ -107,6 +121,32 @@ fastrpc_linux_ioctl(struct thread *td, struct linux_ioctl_args *args)
 	ia.com = cmd;
 	ia.data = (caddr_t)(uintptr_t)args->arg;
 	return (sys_ioctl(td, &ia));
+}
+
+static int
+dmabuf_linux_ioctl(struct thread *td, struct linux_ioctl_args *args)
+{
+	cap_rights_t rights;
+	struct file *fp;
+	char name[DMABUF_NAME_LEN];
+	size_t len;
+	int error;
+
+	if (args->cmd != DMABUF_SET_NAME_A && args->cmd != DMABUF_SET_NAME_B)
+		return (ENOIOCTL);
+	error = fget(td, args->fd, cap_rights_init_one(&rights, CAP_IOCTL),
+	    &fp);
+	if (error != 0)
+		return (error);
+	if (fp->f_type != DTYPE_SHM) {
+		fdrop(fp, td);
+		return (ENOIOCTL);
+	}
+	fdrop(fp, td);
+	/* As Linux checks it; the name itself has no use here. */
+	error = copyinstr((void *)(uintptr_t)args->arg, name, sizeof(name),
+	    &len);
+	return (error == ENAMETOOLONG ? EINVAL : error);
 }
 
 static int
