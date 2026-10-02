@@ -226,6 +226,20 @@ pmic_glink_start(void *arg __unused, int pending __unused)
 		for (i = 0; i < PMIC_GLINK_PORTS; i++)
 			pg.phy[i] = pmap_mapdev(pg.soc->phy[i], QMP_SIZE);
 	}
+	/*
+	 * Only once the DSP's service has opened its end: before, each try
+	 * timed out and was closed, and a dozen such opens and closes of one
+	 * channel while the ADSP came up left it, on some boots, answering
+	 * nothing more on the edge (no audio).  Linux's client binds then.
+	 */
+	if (!qcom_glink_announced("lpass", "PMIC_RTR_ADSP_APPS")) {
+		if (++pg.start_tries < PMIC_GLINK_START_TRIES)
+			taskqueue_enqueue_timeout(pg.tq, &pg.start_task, hz);
+		else
+			printf("qcom_pmic_glink: the DSP's service never "
+			    "came\n");
+		return;
+	}
 	error = qcom_glink_open("lpass", "PMIC_RTR_ADSP_APPS",
 	    PMIC_GLINK_INTENT_SIZE, PMIC_GLINK_INTENTS, pmic_glink_rx, NULL,
 	    &ch);

@@ -56,4 +56,11 @@ int	qcom_glink_send(struct qcom_glink_chan *ch, const void *data,
 
 void	qcom_glink_close(struct qcom_glink_chan *ch);
 
+/*
+ * Whether the remote has opened the channel named name on the edge: as on
+ * Linux, where a client binds to a channel once the remote announces it,
+ * opening only then spares the remote opens it cannot answer yet.
+ */
+bool	qcom_glink_announced(const char *edge, const char *name);
+
 #endif /* _DEV_QCOM_GLINK_QCOM_GLINK_H_ */

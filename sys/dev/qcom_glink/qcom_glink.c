@@ -1082,6 +1082,23 @@ out:
 	return (error);
 }
 
+bool
+qcom_glink_announced(const char *label, const char *name)
+{
+	struct qcom_glink_chan *ch;
+	struct glink_edge *e;
+	bool announced;
+
+	e = glink_edge_by_label(label);
+	if (e == NULL)
+		return (false);
+	mtx_lock(&e->mtx);
+	ch = glink_chan_by_name(e, name);
+	announced = e->up && !e->dead && ch != NULL && ch->rcid != 0;
+	mtx_unlock(&e->mtx);
+	return (announced);
+}
+
 void
 qcom_glink_close(struct qcom_glink_chan *ch)
 {
