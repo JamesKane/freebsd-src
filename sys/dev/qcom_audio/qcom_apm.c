@@ -1181,7 +1181,7 @@ struct qcom_apm_play {
 	uint32_t		handle;		/* of its mapping */
 	qcom_apm_done_t		*done;
 	void			*arg;
-	bool			fe_open, be_open, started;
+	bool			codec_up, fe_open, be_open, started;
 };
 
 static void
@@ -1249,7 +1249,8 @@ apm_play_close(struct qcom_apm_play *p)
 		qcom_apps_smmu_unmap(apm.dom, p->iova, p->size);
 	apm_graph_fini(&p->fe);
 	apm_graph_fini(&p->be);
-	qcom_wcd938x_down();
+	if (p->codec_up)
+		qcom_wcd938x_down();
 	/* Nothing else talks to the APM; let the module unload. */
 	if (apm.port != NULL)
 		qcom_gpr_port_close(apm.port);
@@ -1319,6 +1320,7 @@ qcom_apm_play_open(vm_offset_t buf, size_t size, qcom_apm_done_t *done,
 	error = qcom_wcd938x_up();
 	if (error != 0)
 		goto fail;
+	p->codec_up = true;
 	/* Source graph first, then sink, as Linux does. */
 	error = apm_graph_open_cmd(&p->fe);
 	if (error != 0)
