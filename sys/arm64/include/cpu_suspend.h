@@ -57,6 +57,7 @@ struct cpu_suspend_ctx {
 	/* Restored in C once the core runs kernel code again. */
 	uint64_t	cs_cpacr;
 	uint64_t	cs_cntkctl;
+	uint64_t	cs_vtcr;
 	uint64_t	cs_icc_sre;
 	uint64_t	cs_icc_pmr;
 	uint64_t	cs_icc_bpr1;

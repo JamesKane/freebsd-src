@@ -922,6 +922,22 @@ sve_init(const void *dummy __unused)
 }
 SYSINIT(sve, SI_SUB_SMP, SI_ORDER_ANY, sve_init, NULL);
 
+/*
+ * Set up SVE on a core again after it lost its registers, as it does in a
+ * powered-down idle state: the vector length is the longest, set once at
+ * boot.  Leaves the FP unit trapped, as after vfp_discard().
+ */
+void
+sve_resume(void)
+{
+	if (sve_max_vector_len == 0)
+		return;
+	sve_enable();
+	WRITE_SPECIALREG(ZCR_EL1_REG, ZCR_LEN_MASK);
+	isb();
+	vfp_disable();
+}
+
 static bool
 get_arm64_sve(struct regset *rs, struct thread *td, void *buf,
     size_t *sizep)

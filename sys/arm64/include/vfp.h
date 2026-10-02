@@ -86,6 +86,7 @@ void	sve_to_vfp_sync(struct thread *);
 size_t	sve_max_buf_size(void);
 size_t	sve_buf_size(struct thread *);
 bool	sve_restore_state(struct thread *);
+void	sve_resume(void);
 
 struct fpu_kern_ctx;
 

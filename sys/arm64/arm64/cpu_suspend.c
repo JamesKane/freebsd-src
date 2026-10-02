@@ -76,10 +76,10 @@ static bool cpu_suspend_gicv3;
 static vm_paddr_t cpu_suspend_entry_pa;
 
 /*
- * Whether cpu_suspend_psci() can be used: PSCI is present, the kernel was
- * entered at EL1 (a core resuming at EL2 would lose the EL2 state set up
- * since boot, such as vmm(4)'s), and the core has no state this code does
- * not restore (SVE).
+ * Whether cpu_suspend_psci() can be used: PSCI is present, and the kernel
+ * runs at the EL it was entered at: EL1, or EL2 with VHE.  (Entered at
+ * EL2 without VHE, the kernel runs at EL1 above EL2 code, vmm(4)'s, that a
+ * resuming core would lose.)
  */
 bool
 cpu_suspend_supported(void)
@@ -88,8 +88,7 @@ cpu_suspend_supported(void)
 
 	if (cpu_suspend_entry_pa == 0) {
 		get_kernel_reg(ID_AA64PFR0_EL1, &pfr0);
-		cpu_suspend_ok = psci_present && !has_hyp() &&
-		    ID_AA64PFR0_SVE_VAL(pfr0) == ID_AA64PFR0_SVE_NONE;
+		cpu_suspend_ok = psci_present && (!has_hyp() || in_vhe());
 		/* Only when the GIC driver uses the system registers. */
 		cpu_suspend_gicv3 =
 		    ID_AA64PFR0_GIC_VAL(pfr0) != ID_AA64PFR0_GIC_CPUIF_NONE &&
@@ -123,6 +122,9 @@ cpu_suspend_psci(uint32_t power_state)
 	ctx = DPCPU_PTR(cpu_suspend_ctx);
 	ctx->cs_cpacr = READ_SPECIALREG(cpacr_el1);
 	ctx->cs_cntkctl = READ_SPECIALREG(cntkctl_el1);
+	/* With VHE, vmm(4) sets the stage 2 translation control at load. */
+	if (in_vhe())
+		ctx->cs_vtcr = READ_SPECIALREG(vtcr_el2);
 	if (cpu_suspend_gicv3) {
 		ctx->cs_icc_sre = READ_SPECIALREG(icc_sre_el1);
 		ctx->cs_icc_pmr = READ_SPECIALREG(icc_pmr_el1);
@@ -148,6 +150,9 @@ cpu_suspend_psci(uint32_t power_state)
 		    ".arch_extension nopan\n");
 	WRITE_SPECIALREG(cpacr_el1, ctx->cs_cpacr);
 	WRITE_SPECIALREG(cntkctl_el1, ctx->cs_cntkctl);
+	if (in_vhe())
+		WRITE_SPECIALREG(vtcr_el2, ctx->cs_vtcr);
+	sve_resume();
 	WRITE_SPECIALREG(oslar_el1, 0);
 	dbg_register_sync(NULL);
 	if (cpu_suspend_gicv3) {
