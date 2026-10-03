@@ -331,6 +331,12 @@ static int rebalance = 1;
 static int balance_interval = 128;	/* Default set in sched_initticks(). */
 static int __read_mostly affinity;
 static int __read_mostly steal_idle = 1;
+#ifdef HMP
+static int __read_mostly hmp_upmigrate = 1;
+static int __read_mostly hmp_busy_pct = 25;
+static int __read_mostly hmp_faster_pct = 25;
+static u_long hmp_upmigrations;
+#endif
 static int __read_mostly steal_thresh = 2;
 static int __read_mostly always_steal = 0;
 static int __read_mostly trysteal_limit = 2;
@@ -1632,6 +1638,55 @@ SCHED_STAT_DEFINE(pickcpu_lowest, "Selected lowest load");
 SCHED_STAT_DEFINE(pickcpu_local, "Migrated to current cpu");
 SCHED_STAT_DEFINE(pickcpu_migration, "Selection may have caused migration");
 
+#ifdef HMP
+/*
+ * Whether a thread is busy enough to want a faster core: its %CPU over the
+ * window sched_pctcpu_update() keeps is at least hmp_busy_pct.
+ */
+static bool
+sched_hmp_busy(const struct td_sched *ts)
+{
+	return ((uint64_t)SCHED_TICK_RUN_SHIFTED(ts) * 100 >=
+	    ((uint64_t)hmp_busy_pct * SCHED_TICK_LENGTH(ts) << SCHED_TICK_SHIFT));
+}
+
+/*
+ * An idle CPU of mask at least hmp_faster_pct faster than cpu (hmp(4)'s
+ * capacity is lower the faster the core), the fastest such, or -1: cores
+ * of about the same speed are not worth a thread's cache.  Linear in the
+ * number of CPUs.
+ */
+static int
+sched_hmp_faster_idle(int cpu, const cpuset_t *mask)
+{
+	hmp_capacity_t bcap, cap;
+	int best, c;
+
+	best = -1;
+	bcap = hmp_get_capacity(DPCPU_ID_PTR(cpu, hmp_pcpu), cpu) *
+	    100 / (100 + hmp_faster_pct);
+	CPU_FOREACH(c) {
+		if (c == cpu || !CPU_ISSET(c, mask))
+			continue;
+		cap = hmp_get_capacity(DPCPU_ID_PTR(c, hmp_pcpu), c);
+		if (cap >= bcap ||
+		    atomic_load_char(&TDQ_CPU(c)->tdq_lowpri) < PRI_MIN_IDLE)
+			continue;
+		best = c;
+		bcap = cap;
+	}
+	return (best);
+}
+
+/* Whether a busy thread on cpu should move up to a faster idle core. */
+static bool
+sched_hmp_misfit(struct thread *td, int cpu)
+{
+	return (hmp_upmigrate != 0 && sched_hmp_busy(td_get_sched(td)) &&
+	    sched_hmp_faster_idle(cpu, &td->td_cpuset->cs_mask) >= 0);
+}
+#endif
+
 static int
 sched_pickcpu(struct thread *td, int flags)
 {
@@ -1678,6 +1733,10 @@ sched_pickcpu(struct thread *td, int flags)
 	 */
 	if (THREAD_CAN_SCHED(td, ts->ts_cpu) &&
 	    atomic_load_char(&tdq->tdq_lowpri) >= PRI_MIN_IDLE &&
+#ifdef HMP
+	    /* Not back to a slower core while a faster one is idle. */
+	    !sched_hmp_misfit(td, ts->ts_cpu) &&
+#endif
 	    SCHED_AFFINITY(ts, CG_SHARE_L2)) {
 		if (cg->cg_flags & CG_FLAG_THREAD) {
 			/* Check all SMT threads for being idle. */
@@ -2993,6 +3052,19 @@ sched_ule_clock(struct thread *td, int cnt)
 	}
 	ts = td_get_sched(td);
 	sched_pctcpu_update(ts, 1);
+#ifdef HMP
+	/*
+	 * A busy thread on a slower core while a faster one idles picks its
+	 * CPU again at its next switch, as sched_balance() has threads do.
+	 */
+	if (smp_started != 0 && !TD_IS_IDLETHREAD(td) &&
+	    (td->td_flags & TDF_PICKCPU) == 0 && THREAD_CAN_MIGRATE(td) &&
+	    sched_hmp_misfit(td, PCPU_GET(cpuid))) {
+		td->td_flags |= TDF_PICKCPU;
+		ast_sched_locked(td, TDA_SCHED);
+		atomic_add_long(&hmp_upmigrations, 1);
+	}
+#endif
 	if ((td->td_pri_class & PRI_FIFO_BIT) || TD_IS_IDLETHREAD(td))
 		return;
 
@@ -3777,6 +3849,20 @@ SYSCTL_INT(_kern_sched_ule, OID_AUTO, balance_interval, CTLFLAG_RW,
 SYSCTL_INT(_kern_sched_ule, OID_AUTO, steal_idle, CTLFLAG_RWTUN,
     &steal_idle, 0,
     "Attempts to steal work from other cores before idling");
+#ifdef HMP
+SYSCTL_INT(_kern_sched_ule, OID_AUTO, hmp_upmigrate, CTLFLAG_RWTUN,
+    &hmp_upmigrate, 0,
+    "Move busy threads from slower cores to idle faster ones");
+SYSCTL_INT(_kern_sched_ule, OID_AUTO, hmp_busy_pct, CTLFLAG_RWTUN,
+    &hmp_busy_pct, 0,
+    "%CPU above which a thread is busy enough to move to a faster core");
+SYSCTL_INT(_kern_sched_ule, OID_AUTO, hmp_faster_pct, CTLFLAG_RWTUN,
+    &hmp_faster_pct, 0,
+    "How much faster (%) a core must be for a busy thread to move to it");
+SYSCTL_ULONG(_kern_sched_ule, OID_AUTO, hmp_upmigrations, CTLFLAG_RD,
+    &hmp_upmigrations, 0,
+    "Busy threads told to move to a faster core");
+#endif
 SYSCTL_INT(_kern_sched_ule, OID_AUTO, steal_thresh, CTLFLAG_RWTUN,
     &steal_thresh, 0,
     "Minimum load on remote CPU before we'll steal");
