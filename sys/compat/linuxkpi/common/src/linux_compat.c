@@ -532,7 +532,8 @@ linux_cdev_pager_populate(vm_object_t vm_obj, vm_pindex_t pidx, int fault_type,
 		/* fill out VM fault structure */
 		vmf.virtual_address = (void *)(uintptr_t)IDX_TO_OFF(pidx);
 		vmf.flags = (fault_type & VM_PROT_WRITE) ? FAULT_FLAG_WRITE : 0;
-		vmf.pgoff = 0;
+		/* The page's offset in the file, as Linux's. */
+		vmf.pgoff = vmap->vm_pgoff + pidx;
 		vmf.page = NULL;
 		vmf.vma = vmap;
 
