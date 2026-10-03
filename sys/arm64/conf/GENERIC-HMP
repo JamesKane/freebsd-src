@@ -1,6 +1,7 @@
 #
 # GENERIC-HMP -- GENERIC with hmp(4), the scheduler's view of heterogeneous
-# cores, and coreindex(4) to set their capacities and scores by hand.
+# cores.  ACPI's _CPC (acpi_cppc) provides the cores' capacities; add
+# coreindex(4) to set them by hand instead.
 #
 
 include		GENERIC
@@ -8,4 +9,3 @@ include		GENERIC
 ident		GENERIC-HMP
 
 options 	HMP
-device		coreindex

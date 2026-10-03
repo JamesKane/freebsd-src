@@ -153,6 +153,9 @@ struct hmp_score_provider {
 };
 
 void	hmp_capacity_provider_register(struct hmp_capacity_provider *p);
+int	hmp_capacity_set(const uint32_t *perf);
+int	hmp_capacity_update(struct hmp_capacity_provider *p,
+	    const uint32_t *perf);
 void	hmp_score_provider_register(struct hmp_score_provider *p);
 
 #define	HMP_CAPACITY_PROVIDER_DECLARE(name, provider)			\

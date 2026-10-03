@@ -51,6 +51,9 @@
 #include <sys/bus.h>
 #include <sys/cpu.h>
 #include <sys/cpuset.h>
+#ifdef HMP
+#include <sys/hmp.h>
+#endif
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
@@ -530,6 +533,131 @@ acpi_cppc_add_desired(struct acpi_cppc_softc *sc, int cpu)
 	return (0);
 }
 
+#ifdef HMP
+/*
+ * hmp(4)'s capacities and scores, from each CPU's highest performance: on
+ * one scale for all CPUs, so it measures what a core can do at its fastest,
+ * work per clock included, and is what Linux sets its CPU capacities from.
+ * The scores are static: performance in proportion to the highest
+ * performance, efficiency in inverse proportion.  The CPUs' frequency
+ * domains attach before hmp(4) chooses its providers (SI_SUB_SMP); were one
+ * to attach later, the CPUs start equal and get their values with the last.
+ * coreindex(4), which sets them by hand, takes precedence.
+ */
+static uint32_t acpi_cppc_hmp_perf[MAXCPU];
+static int acpi_cppc_hmp_ncpus;
+
+static struct hmp_capacity_provider acpi_cppc_hmp_cap;
+static struct hmp_score_provider acpi_cppc_hmp_score;
+
+static bool
+acpi_cppc_hmp_known(void)
+{
+	return (acpi_cppc_hmp_ncpus == mp_ncpus);
+}
+
+static int
+acpi_cppc_hmp_probe(void)
+{
+	return (0);
+}
+
+static int
+acpi_cppc_hmp_cap_init(void)
+{
+	struct hmp_pcpu *hp;
+	int cpu;
+
+	if (acpi_cppc_hmp_known())
+		return (hmp_capacity_set(acpi_cppc_hmp_perf));
+	CPU_FOREACH(cpu) {
+		hp = DPCPU_ID_PTR(cpu, hmp_pcpu);
+		hp->capacity = HMP_CAPACITY_DEFAULT;
+	}
+	return (0);
+}
+
+static void
+acpi_cppc_hmp_set_scores(void)
+{
+	struct hmp_pcpu *hp;
+	uint32_t max, min;
+	int cpu;
+
+	max = 0;
+	min = UINT32_MAX;
+	CPU_FOREACH(cpu) {
+		max = MAX(max, acpi_cppc_hmp_perf[cpu]);
+		min = MIN(min, acpi_cppc_hmp_perf[cpu]);
+	}
+	CPU_FOREACH(cpu) {
+		hp = DPCPU_ID_PTR(cpu, hmp_pcpu);
+		hmp_set_score(hp, HMP_SCORE_PERF,
+		    (uint64_t)acpi_cppc_hmp_perf[cpu] * HMP_SCORE_MAX / max);
+		hmp_set_score(hp, HMP_SCORE_EFF,
+		    (uint64_t)min * HMP_SCORE_MAX / acpi_cppc_hmp_perf[cpu]);
+	}
+}
+
+static int
+acpi_cppc_hmp_score_init(void)
+{
+	struct hmp_pcpu *hp;
+	int cpu;
+
+	if (acpi_cppc_hmp_known()) {
+		acpi_cppc_hmp_set_scores();
+		return (0);
+	}
+	CPU_FOREACH(cpu) {
+		hp = DPCPU_ID_PTR(cpu, hmp_pcpu);
+		hmp_set_score(hp, HMP_SCORE_PERF, HMP_SCORE_DEFAULT);
+		hmp_set_score(hp, HMP_SCORE_EFF, HMP_SCORE_DEFAULT);
+	}
+	return (0);
+}
+
+static struct hmp_capacity_provider acpi_cppc_hmp_cap = {
+	.name		= "acpi_cppc",
+	.priority	= 5,
+	.probe		= acpi_cppc_hmp_probe,
+	.init		= acpi_cppc_hmp_cap_init,
+};
+HMP_CAPACITY_PROVIDER_DECLARE(acpi_cppc, acpi_cppc_hmp_cap);
+
+static struct hmp_score_provider acpi_cppc_hmp_score = {
+	.name		= "acpi_cppc",
+	.priority	= 5,
+	.probe		= acpi_cppc_hmp_probe,
+	.init		= acpi_cppc_hmp_score_init,
+};
+HMP_SCORE_PROVIDER_DECLARE(acpi_cppc, acpi_cppc_hmp_score);
+
+/* Record a domain's CPUs' highest performance. */
+static void
+acpi_cppc_hmp_add(struct acpi_cppc_softc *sc)
+{
+	int cpu, error;
+
+	CPU_FOREACH_ISSET(cpu, &sc->cpus) {
+		if (acpi_cppc_hmp_perf[cpu] == 0)
+			acpi_cppc_hmp_ncpus++;
+		acpi_cppc_hmp_perf[cpu] = sc->highest;
+	}
+	if (!acpi_cppc_hmp_known())
+		return;
+	if (bootverbose)
+		device_printf(sc->dev, "hmp(4) capacities known\n");
+	/* After hmp(4) chose its providers: update them now. */
+	error = hmp_capacity_update(&acpi_cppc_hmp_cap, acpi_cppc_hmp_perf);
+	if (error != 0 && error != EPERM)
+		device_printf(sc->dev, "cannot set hmp(4) capacities: %d\n",
+		    error);
+	if (acpi_cppc_hmp_score.active)
+		acpi_cppc_hmp_set_scores();
+}
+#endif
+
 static int
 acpi_cppc_attach(device_t dev)
 {
@@ -612,6 +740,9 @@ acpi_cppc_attach(device_t dev)
 		    "nominal %u\n", CPU_COUNT(&sc->cpus), sc->lowest_mhz,
 		    max_mhz, sc->lowest, sc->highest, sc->nominal);
 	cpufreq_register(dev);
+#ifdef HMP
+	acpi_cppc_hmp_add(sc);
+#endif
 	error = 0;
 out:
 	AcpiOsFree(buf.Pointer);

@@ -58,6 +58,45 @@ hmp_score_provider_register(struct hmp_score_provider *p)
 }
 
 /*
+ * Set the CPUs' capacities from perf[cpu], each CPU's relative throughput,
+ * higher for faster, on one scale for all CPUs: for a capacity provider's
+ * init().  The scheduler sees each CPU's new capacity as it is stored.
+ */
+int
+hmp_capacity_set(const uint32_t *perf)
+{
+	struct hmp_pcpu *hp;
+	uint32_t min;
+	int cpu;
+
+	min = UINT32_MAX;
+	CPU_FOREACH(cpu) {
+		if (perf[cpu] == 0)
+			return (EINVAL);
+		min = MIN(min, perf[cpu]);
+	}
+	/* hmp(4)'s capacity: HMP_CAPACITY_SCALE for the slowest CPU. */
+	CPU_FOREACH(cpu) {
+		hp = DPCPU_ID_PTR(cpu, hmp_pcpu);
+		atomic_store_rel_32(&hp->capacity,
+		    (uint64_t)min * HMP_CAPACITY_SCALE / perf[cpu]);
+	}
+	return (0);
+}
+
+/*
+ * The same, later, for a provider that learns the capacities after hmp(4)
+ * chose it: only the active capacity provider may.
+ */
+int
+hmp_capacity_update(struct hmp_capacity_provider *p, const uint32_t *perf)
+{
+	if (!p->active)
+		return (EPERM);
+	return (hmp_capacity_set(perf));
+}
+
+/*
  * Default capacity provider.
  *
  * Always wins if nothing else probes: every CPU gets HMP_CAPACITY_DEFAULT,
