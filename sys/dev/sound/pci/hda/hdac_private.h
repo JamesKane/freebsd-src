@@ -35,19 +35,22 @@
  ****************************************************************************/
 #define HDAC_CODEC_MAX		16
 
+/* Quirks (softc quirks_on/quirks_off) */
+#define HDAC_QUIRK_64BIT	(1 << 0)
+#define HDAC_QUIRK_DMAPOS	(1 << 1)
+#define HDAC_QUIRK_MSI		(1 << 2)
+
 /****************************************************************************
  * Helper Macros
  ****************************************************************************/
-#define HDAC_READ_1(mem, offset)					\
-	bus_space_read_1((mem)->mem_tag, (mem)->mem_handle, (offset))
-#define HDAC_READ_2(mem, offset)					\
-	bus_space_read_2((mem)->mem_tag, (mem)->mem_handle, (offset))
+#define HDAC_READ_1(mem, offset)	hdac_read_sub((mem), (offset), 1)
+#define HDAC_READ_2(mem, offset)	hdac_read_sub((mem), (offset), 2)
 #define HDAC_READ_4(mem, offset)					\
 	bus_space_read_4((mem)->mem_tag, (mem)->mem_handle, (offset))
 #define HDAC_WRITE_1(mem, offset, value)				\
-	bus_space_write_1((mem)->mem_tag, (mem)->mem_handle, (offset), (value))
+	hdac_write_sub((mem), (offset), (value), 1)
 #define HDAC_WRITE_2(mem, offset, value)				\
-	bus_space_write_2((mem)->mem_tag, (mem)->mem_handle, (offset), (value))
+	hdac_write_sub((mem), (offset), (value), 2)
 #define HDAC_WRITE_4(mem, offset, value)				\
 	bus_space_write_4((mem)->mem_tag, (mem)->mem_handle, (offset), (value))
 
@@ -95,7 +98,50 @@ struct hdac_mem {
 	int			mem_rid;
 	bus_space_tag_t		mem_tag;
 	bus_space_handle_t	mem_handle;
+	bool			mem_aligned;	/* 32-bit accesses only */
 };
+
+/*
+ * Byte and halfword register accesses: as such, or, on controllers that take
+ * only 32-bit accesses, within the aligned word.
+ */
+static __inline uint32_t
+hdac_read_sub(struct hdac_mem *mem, bus_size_t offset, int size)
+{
+	uint32_t v;
+	int shift;
+
+	if (!mem->mem_aligned)
+		return (size == 1 ?
+		    bus_space_read_1(mem->mem_tag, mem->mem_handle, offset) :
+		    bus_space_read_2(mem->mem_tag, mem->mem_handle, offset));
+	shift = (offset & 3) * 8;
+	v = bus_space_read_4(mem->mem_tag, mem->mem_handle, offset & ~3);
+	return ((v >> shift) & (size == 1 ? 0xff : 0xffff));
+}
+
+static __inline void
+hdac_write_sub(struct hdac_mem *mem, bus_size_t offset, uint32_t value,
+    int size)
+{
+	uint32_t mask, v;
+	int shift;
+
+	if (!mem->mem_aligned) {
+		if (size == 1)
+			bus_space_write_1(mem->mem_tag, mem->mem_handle, offset,
+			    value);
+		else
+			bus_space_write_2(mem->mem_tag, mem->mem_handle, offset,
+			    value);
+		return;
+	}
+	shift = (offset & 3) * 8;
+	mask = (size == 1 ? 0xff : 0xffff) << shift;
+	v = bus_space_read_4(mem->mem_tag, mem->mem_handle, offset & ~3);
+	v = (v & ~mask) | ((value << shift) & mask);
+	bus_space_write_4(mem->mem_tag, mem->mem_handle, offset & ~3, v);
+}
 
 /****************************************************************************
  * struct hdac_irq
@@ -173,6 +219,14 @@ struct hdac_softc {
 	uint32_t	quirks_off;
 	uint32_t	flags;
 #define HDAC_F_DMA_NOCACHE	0x00000001
+#define HDAC_F_NOT_PCI		0x00000002	/* a platform front end's */
+
+	/* Set by a platform front end before hdac_attach_common(). */
+	bus_dma_tag_t	dma_parent;	/* or the bus's */
+	const uint32_t	*init_verbs;	/* for codec 0, before probing it */
+	int		init_nverbs;
+	uint16_t	subvendor;
+	uint16_t	subdevice;
 
 	int		num_iss;
 	int		num_oss;
@@ -223,5 +277,10 @@ struct hdac_softc {
 		int		sdi_bw_used;
 	} codecs[HDAC_CODEC_MAX];
 };
+
+/* Bus front ends (hdac.c is PCI's). */
+extern driver_t	hdac_driver;
+int	hdac_attach_common(device_t dev);
+int	hdac_detach(device_t dev);
 
 #endif

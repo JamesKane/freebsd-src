@@ -55,9 +55,6 @@
 #define hdac_unlock(sc)		mtx_unlock(&(sc)->lock)
 #define hdac_lockassert(sc)	mtx_assert(&(sc)->lock, MA_OWNED)
 
-#define HDAC_QUIRK_64BIT	(1 << 0)
-#define HDAC_QUIRK_DMAPOS	(1 << 1)
-#define HDAC_QUIRK_MSI		(1 << 2)
 
 static const struct {
 	const char *key;
@@ -258,7 +255,6 @@ static uint32_t	hdac_send_command(struct hdac_softc *, nid_t, uint32_t);
 
 static int	hdac_probe(device_t);
 static int	hdac_attach(device_t);
-static int	hdac_detach(device_t);
 static int	hdac_suspend(device_t);
 static int	hdac_resume(device_t);
 
@@ -607,6 +603,14 @@ hdac_dma_cb(void *callback_arg, bus_dma_segment_t *segs, int nseg, int error)
  * This function allocate and setup a dma region (struct hdac_dma).
  * It must be freed by a corresponding hdac_dma_free.
  ****************************************************************************/
+/* The bus's DMA tag, or a platform front end's. */
+static bus_dma_tag_t
+hdac_dma_parent(struct hdac_softc *sc)
+{
+	return (sc->dma_parent != NULL ? sc->dma_parent :
+	    bus_get_dma_tag(sc->dev));
+}
+
 static int
 hdac_dma_alloc(struct hdac_softc *sc, struct hdac_dma *dma, bus_size_t size)
 {
@@ -620,7 +624,7 @@ hdac_dma_alloc(struct hdac_softc *sc, struct hdac_dma *dma, bus_size_t size)
 	 * Create a DMA tag
 	 */
 	result = bus_dma_tag_create(
-	    bus_get_dma_tag(sc->dev),		/* parent */
+	    hdac_dma_parent(sc),		/* parent */
 	    HDA_DMA_ALIGNMENT,			/* alignment */
 	    0,					/* boundary */
 	    (sc->support_64bit) ? BUS_SPACE_MAXADDR :
@@ -722,7 +726,7 @@ hdac_mem_alloc(struct hdac_softc *sc)
 	struct hdac_mem *mem;
 
 	mem = &sc->mem;
-	mem->mem_rid = PCIR_BAR(0);
+	mem->mem_rid = (sc->flags & HDAC_F_NOT_PCI) != 0 ? 0 : PCIR_BAR(0);
 	mem->mem_res = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY,
 	    &mem->mem_rid, RF_ACTIVE);
 	if (mem->mem_res == NULL) {
@@ -767,7 +771,8 @@ hdac_irq_alloc(struct hdac_softc *sc)
 	irq = &sc->irq;
 	irq->irq_rid = 0x0;
 
-	if ((sc->quirks_off & HDAC_QUIRK_MSI) == 0 &&
+	if ((sc->flags & HDAC_F_NOT_PCI) == 0 &&
+	    (sc->quirks_off & HDAC_QUIRK_MSI) == 0 &&
 	    (result = pci_msi_count(sc->dev)) == 1 &&
 	    pci_alloc_msi(sc->dev, &result) == 0)
 		irq->irq_rid = 0x1;
@@ -1144,7 +1149,6 @@ static int
 hdac_attach(device_t dev)
 {
 	struct hdac_softc *sc;
-	int result;
 	int i, devid = -1;
 	uint32_t model;
 	uint16_t class, subclass;
@@ -1152,6 +1156,8 @@ hdac_attach(device_t dev)
 	uint8_t v;
 
 	sc = device_get_softc(dev);
+	sc->subvendor = pci_get_subvendor(dev);
+	sc->subdevice = pci_get_subdevice(dev);
 	HDA_BOOTVERBOSE(
 		device_printf(dev, "PCI card vendor: 0x%04x, device: 0x%04x\n",
 		    pci_get_subvendor(dev), pci_get_subdevice(dev));
@@ -1177,13 +1183,6 @@ hdac_attach(device_t dev)
 		}
 	}
 
-	mtx_init(&sc->lock, device_get_nameunit(dev), "HDA driver mutex",
-	    MTX_DEF);
-	sc->dev = dev;
-	TASK_INIT(&sc->unsolq_task, 0, hdac_unsolq_task, sc);
-	callout_init(&sc->poll_callout, 1);
-	for (i = 0; i < HDAC_CODEC_MAX; i++)
-		sc->codecs[i].dev = NULL;
 	if (devid >= 0) {
 		sc->quirks_on = hdac_devices[devid].quirks_on;
 		sc->quirks_off = hdac_devices[devid].quirks_off;
@@ -1200,19 +1199,6 @@ hdac_attach(device_t dev)
 			sc->quirks_off |= ~HDAC_QUIRK_MSI;
 		}
 	}
-	hdac_config_fetch(sc, &sc->quirks_on, &sc->quirks_off);
-	HDA_BOOTVERBOSE(
-		device_printf(sc->dev,
-		    "Config options: on=0x%08x off=0x%08x\n",
-		    sc->quirks_on, sc->quirks_off);
-	);
-	sc->poll_ival = hz;
-	if (resource_int_value(device_get_name(dev),
-	    device_get_unit(dev), "polling", &i) == 0 && i != 0)
-		sc->polling = 1;
-	else
-		sc->polling = 0;
-
 	pci_enable_busmaster(dev);
 
 	vendor = pci_get_vendor(dev);
@@ -1281,6 +1267,39 @@ hdac_attach(device_t dev)
 		    "Uncacheable" : "PCIe snoop", vendor);
 	);
 
+	return (hdac_attach_common(dev));
+}
+
+/*
+ * The attachment common to every bus: a front end has set the softc's
+ * quirks, flags and platform fields.
+ */
+int
+hdac_attach_common(device_t dev)
+{
+	struct hdac_softc *sc;
+	int result;
+	int i;
+
+	sc = device_get_softc(dev);
+	mtx_init(&sc->lock, device_get_nameunit(dev), "HDA driver mutex",
+	    MTX_DEF);
+	sc->dev = dev;
+	TASK_INIT(&sc->unsolq_task, 0, hdac_unsolq_task, sc);
+	callout_init(&sc->poll_callout, 1);
+	for (i = 0; i < HDAC_CODEC_MAX; i++)
+		sc->codecs[i].dev = NULL;
+	hdac_config_fetch(sc, &sc->quirks_on, &sc->quirks_off);
+	HDA_BOOTVERBOSE(
+		device_printf(sc->dev,
+		    "Config options: on=0x%08x off=0x%08x\n",
+		    sc->quirks_on, sc->quirks_off);
+	);
+	sc->poll_ival = hz;
+	if (resource_int_value(device_get_name(dev),
+	    device_get_unit(dev), "polling", &i) == 0 && i != 0)
+		sc->polling = 1;
+
 	/* Allocate resources */
 	result = hdac_mem_alloc(sc);
 	if (result != 0)
@@ -1327,7 +1346,7 @@ hdac_attach(device_t dev)
 	}
 
 	result = bus_dma_tag_create(
-	    bus_get_dma_tag(sc->dev),		/* parent */
+	    hdac_dma_parent(sc),		/* parent */
 	    HDA_DMA_ALIGNMENT,			/* alignment */
 	    0,					/* boundary */
 	    (sc->support_64bit) ? BUS_SPACE_MAXADDR :
@@ -1596,6 +1615,17 @@ hdac_attach2(void *arg)
 	}
 	DELAY(1000);
 
+	/* A platform's configuration of codec 0 (pins, vendor settings). */
+	if (sc->init_nverbs > 0 && HDAC_STATESTS_SDIWAKE(statests, 0)) {
+		HDA_BOOTVERBOSE(
+			device_printf(sc->dev,
+			    "Sending %d codec configuration verbs\n",
+			    sc->init_nverbs);
+		);
+		for (i = 0; i < sc->init_nverbs; i++)
+			hdac_send_command(sc, 0, sc->init_verbs[i]);
+	}
+
 	HDA_BOOTHVERBOSE(
 		device_printf(sc->dev, "Scanning HDA codecs ...\n");
 	);
@@ -1759,7 +1789,9 @@ hdac_resume(device_t dev)
 	);
 	HDAC_WRITE_4(&sc->mem, HDAC_GCTL, HDAC_READ_4(&sc->mem, HDAC_GCTL) |
 	    HDAC_GCTL_UNSOL);
-	HDAC_WRITE_4(&sc->mem, HDAC_INTCTL, HDAC_INTCTL_CIE | HDAC_INTCTL_GIE);
+	if (sc->polling == 0)
+		HDAC_WRITE_4(&sc->mem, HDAC_INTCTL,
+		    HDAC_INTCTL_CIE | HDAC_INTCTL_GIE);
 	DELAY(1000);
 	hdac_poll_reinit(sc);
 	hdac_unlock(sc);
@@ -1776,7 +1808,7 @@ hdac_resume(device_t dev)
  *
  * Detach and free up resources utilized by the hdac device.
  ****************************************************************************/
-static int
+int
 hdac_detach(device_t dev)
 {
 	struct hdac_softc *sc = device_get_softc(dev);
@@ -1873,10 +1905,10 @@ hdac_read_ivar(device_t dev, device_t child, int which, uintptr_t *result)
 		*result = sc->codecs[cad].stepping_id;
 		break;
 	case HDA_IVAR_SUBVENDOR_ID:
-		*result = pci_get_subvendor(dev);
+		*result = sc->subvendor;
 		break;
 	case HDA_IVAR_SUBDEVICE_ID:
-		*result = pci_get_subdevice(dev);
+		*result = sc->subdevice;
 		break;
 	case HDA_IVAR_DMA_NOCACHE:
 		*result = (sc->flags & HDAC_F_DMA_NOCACHE) != 0;
@@ -2209,7 +2241,7 @@ static device_method_t hdac_methods[] = {
 	DEVMETHOD_END
 };
 
-static driver_t hdac_driver = {
+driver_t hdac_driver = {
 	"hdac",
 	hdac_methods,
 	sizeof(struct hdac_softc),
