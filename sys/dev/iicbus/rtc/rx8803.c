@@ -94,6 +94,45 @@ static char *rx8803_acpi_ids[] = {
 };
 #endif
 
+
+/*
+ * Register reads and writes at the device's bus address: ACPI gives it as
+ * 7 bits (acpi_iicbus), devicetree as the 8 FreeBSD's I2C drivers take.
+ */
+static uint16_t
+rx8803_slave(device_t dev)
+{
+#ifdef DEV_ACPI
+	if (acpi_get_handle(dev) != NULL)
+		return (iicbus_get_addr(dev) << 1);
+#endif
+	return (iicbus_get_addr(dev));
+}
+
+static int
+rx8803_readfrom(device_t dev, uint8_t reg, void *buf, uint16_t len)
+{
+	struct iic_msg msgs[2] = {
+		{ rx8803_slave(dev), IIC_M_WR | IIC_M_NOSTOP, 1, &reg },
+		{ rx8803_slave(dev), IIC_M_RD, len, buf },
+	};
+
+	return (iicbus_transfer_excl(dev, msgs, nitems(msgs), IIC_WAIT));
+}
+
+static int
+rx8803_writeto(device_t dev, uint8_t reg, const void *buf, uint16_t len)
+{
+	uint8_t data[1 + 16];
+	struct iic_msg msg = { rx8803_slave(dev), IIC_M_WR, len + 1, data };
+
+	if (len > sizeof(data) - 1)
+		return (IIC_EOVERFLOW);
+	data[0] = reg;
+	memcpy(&data[1], buf, len);
+	return (iicbus_transfer_excl(dev, &msg, 1, IIC_WAIT));
+}
+
 static int rx8803_probe(device_t dev);
 static int rx8803_attach(device_t dev);
 static int rx8803_detach(device_t dev);
@@ -109,7 +148,7 @@ rx8803_check_status(device_t dev)
 	uint8_t flags;
 	int rc;
 
-	rc = iicdev_readfrom(dev, RX8803_FLAGS, &flags, 1, IIC_WAIT);
+	rc = rx8803_readfrom(dev, RX8803_FLAGS, &flags, 1);
 	if (rc != 0)
 		return (rc);
 
@@ -132,10 +171,9 @@ rx8803_gettime(device_t dev, struct timespec *ts)
 	if (rc != 0)
 		return (rc);
 
-	rc = iicdev_readfrom(dev,
+	rc = rx8803_readfrom(dev,
 	    RX8803_TIME,
-	    &data, sizeof(struct rx8803_time),
-	    IIC_WAIT);
+	    &data, sizeof(struct rx8803_time));
 	if (rc != 0)
 		return (rc);
 
@@ -178,37 +216,36 @@ rx8803_settime(device_t dev, struct timespec *ts)
 		data.sec++;
 
 	/* First disable clock. */
-	rc = iicdev_readfrom(dev, RX8803_CTRL, &reg, sizeof(uint8_t), IIC_WAIT);
+	rc = rx8803_readfrom(dev, RX8803_CTRL, &reg, sizeof(uint8_t));
 	if (rc != 0)
 		return (rc);
 
 	reg |= RX8803_CTRL_DISABLE;
 
-	rc = iicdev_writeto(dev, RX8803_CTRL, &reg, sizeof(uint8_t), IIC_WAIT);
+	rc = rx8803_writeto(dev, RX8803_CTRL, &reg, sizeof(uint8_t));
 	if (rc != 0)
 		return (rc);
 
 	/* Update the date. */
-	rc = iicdev_writeto(dev,
+	rc = rx8803_writeto(dev,
 	    RX8803_TIME,
-	    &data, sizeof(struct rx8803_time),
-	    IIC_WAIT);
+	    &data, sizeof(struct rx8803_time));
 	if (rc != 0)
 		return (rc);
 
 	/* Now restart it. */
 	reg &= ~RX8803_CTRL_DISABLE;
-	rc = iicdev_writeto(dev, RX8803_CTRL, &reg, sizeof(uint8_t), IIC_WAIT);
+	rc = rx8803_writeto(dev, RX8803_CTRL, &reg, sizeof(uint8_t));
 	if (rc != 0)
 		return (rc);
 
 	/* Clear low voltage flags, as we have just updated the clock. */
-	rc = iicdev_readfrom(dev, RX8803_FLAGS, &reg, sizeof(uint8_t), IIC_WAIT);
+	rc = rx8803_readfrom(dev, RX8803_FLAGS, &reg, sizeof(uint8_t));
 	if (rc != 0)
 		return (rc);
 
 	reg &= ~(RX8803_FLAGS_V1F | RX8803_FLAGS_V2F);
-	rc = iicdev_writeto(dev, RX8803_FLAGS, &reg, sizeof(uint8_t), IIC_WAIT);
+	rc = rx8803_writeto(dev, RX8803_FLAGS, &reg, sizeof(uint8_t));
 	return (rc);
 }
 

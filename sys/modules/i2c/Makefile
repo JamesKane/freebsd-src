@@ -41,4 +41,8 @@ SUBDIR += hym8563 \
 SUBDIR += iichid
 .endif
 
+.if ${MACHINE_CPUARCH} == "aarch64"
+SUBDIR += rts5453
+.endif
+
 .include <bsd.subdir.mk>
