@@ -2161,12 +2161,20 @@ linux_dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
 	op = (attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0 ? 0 :
 	    lkpi_dma_dir_op(direction, true);
 
-	DMA_PRIV_LOCK(priv);
+	/*
+	 * Create the maps before taking the lock: the first map of a tag that
+	 * may bounce sets up its bounce zone, which sleeps.
+	 */
 	for_each_sg(sgl, sg, nents, i) {
 		if (bus_dmamap_create(priv->dmat, 0, &sg->dma_map) != 0) {
 			sg->dma_map = NULL;
-			goto fail;
+			lkpi_dma_unload_sg(priv, sgl, i, 0);
+			return (0);
 		}
+	}
+
+	DMA_PRIV_LOCK(priv);
+	for_each_sg(sgl, sg, nents, i) {
 		nseg = -1;
 		if (_bus_dmamap_load_phys(priv->dmat, sg->dma_map,
 		    sg_phys(sg), sg->length, BUS_DMA_NOWAIT,
@@ -2188,7 +2196,8 @@ linux_dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
 	return (nents);
 
 fail:
-	lkpi_dma_unload_sg(priv, sgl, i, 0);
+	/* Unloading a map never loaded is harmless. */
+	lkpi_dma_unload_sg(priv, sgl, nents, 0);
 	DMA_PRIV_UNLOCK(priv);
 	return (0);
 }
