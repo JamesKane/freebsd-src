@@ -48,6 +48,7 @@
 #include <sys/file.h>
 #include <sys/filio.h>
 #include <sys/rwlock.h>
+#include <sys/sbuf.h>
 #include <sys/mman.h>
 #include <sys/stack.h>
 #include <sys/stdarg.h>
@@ -463,6 +464,30 @@ cdev_alloc(void)
 	kobject_init(&cdev->kobj, &linux_cdev_ktype);
 	cdev->refs = 1;
 	return (cdev);
+}
+
+int
+lkpi_dev_printf(const struct device *dev, const char *fmt, ...)
+{
+	char buf[128];
+	struct sbuf sb;
+	va_list ap;
+	size_t len, retval;
+
+	retval = 0;
+	sbuf_new(&sb, buf, sizeof(buf), SBUF_FIXEDLEN);
+	sbuf_set_drain(&sb, sbuf_printf_drain, &retval);
+	if (dev != NULL && dev->bsddev != NULL)
+		sbuf_printf(&sb, "%s: ", device_get_nameunit(dev->bsddev));
+	va_start(ap, fmt);
+	sbuf_vprintf(&sb, fmt, ap);
+	va_end(ap);
+	len = strlen(fmt);
+	if (len == 0 || fmt[len - 1] != '\n')
+		sbuf_putc(&sb, '\n');
+	sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (retval);
 }
 
 static int
