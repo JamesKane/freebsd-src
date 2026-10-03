@@ -170,7 +170,7 @@ kmalloc_node(size_t size, gfp_t flags, int node)
     kmalloc(sizeof(typeof(_p)), default_gfp(__VA_ARGS__))
 
 #define	kmalloc_objs(_p, _n, ...)					\
-    kmalloc(size_mul((_n) * sizeof(typeof(_p))), default_gfp(__VA_ARGS__))
+    kmalloc(size_mul((_n), sizeof(typeof(_p))), default_gfp(__VA_ARGS__))
 
 static inline void *
 krealloc(const void *ptr, size_t size, gfp_t flags)
