@@ -103,8 +103,14 @@ lkpi_irq_handler(void *ent)
 	if (linux_set_current_flags(curthread, M_NOWAIT))
 		return;
 
+	/*
+	 * Without a primary handler, Linux's default one wakes the thread.
+	 * Here the interrupt thread runs it, with the interrupt masked until
+	 * it returns, as with IRQF_ONESHOT.
+	 */
 	irqe = ent;
-	if (irqe->handler(irqe->irq, irqe->arg) == IRQ_WAKE_THREAD &&
+	if ((irqe->handler == NULL ||
+	    irqe->handler(irqe->irq, irqe->arg) == IRQ_WAKE_THREAD) &&
 	    irqe->thread_handler != NULL) {
 		THREAD_SLEEPING_OK();
 		irqe->thread_handler(irqe->irq, irqe->arg);
