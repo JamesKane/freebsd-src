@@ -32,6 +32,9 @@
  * in Chapter 20.
  */
 
+#include "opt_acpi.h"
+#include "opt_platform.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
@@ -48,9 +51,19 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#ifdef FDT
 #include <dev/fdt/fdt_common.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#endif
+
+#ifdef DEV_ACPI
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
+#ifdef __aarch64__
+#include <arm64/cix/sky1_scmi.h>
+#endif
+#endif
 
 #include <dev/clk/clk.h>
 
@@ -70,6 +83,7 @@
 #endif
 #define HWTYPE_CDNS_R1P14	2
 
+#ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 #if 0
 	{"cdns,i2c-r1p10",		HWTYPE_CDNS_R1P10},
@@ -77,6 +91,7 @@ static struct ofw_compat_data compat_data[] = {
 	{"cdns,i2c-r1p14",		HWTYPE_CDNS_R1P14},
 	{NULL,				0}
 };
+#endif
 
 struct cdnc_i2c_softc {
 	device_t		dev;
@@ -520,6 +535,10 @@ cdnc_i2c_add_sysctls(device_t dev)
 }
 
 
+static int cdnc_i2c_detach(device_t);
+static int cdnc_i2c_attach_common(device_t);
+
+#ifdef FDT
 static int
 cdnc_i2c_probe(device_t dev)
 {
@@ -535,14 +554,11 @@ cdnc_i2c_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
-
-static int cdnc_i2c_detach(device_t);
-
 static int
 cdnc_i2c_attach(device_t dev)
 {
 	struct cdnc_i2c_softc *sc;
-	int rid, err;
+	int err;
 	phandle_t node;
 	pcell_t cell;
 	uint64_t freq;
@@ -550,8 +566,6 @@ cdnc_i2c_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 	sc->hwtype = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
-
-	I2C_SC_LOCK_INIT(sc);
 
 	/* Get ref-clock and i2c-clock properties. */
 	node = ofw_bus_get_node(dev);
@@ -575,6 +589,102 @@ cdnc_i2c_attach(device_t dev)
 		sc->i2c_clock_freq = fdt32_to_cpu(cell);
 	else
 		sc->i2c_clock_freq = CDNC_I2C_DEFAULT_I2C_CLOCK;
+
+	return (cdnc_i2c_attach_common(dev));
+}
+#endif /* FDT */
+
+#ifdef DEV_ACPI
+static char *cdnc_i2c_acpi_ids[] = {
+	"CIXH200B",		/* CIX Sky1 */
+	NULL
+};
+
+static int
+cdnc_i2c_acpi_probe(device_t dev)
+{
+	int rv;
+
+	if (acpi_disabled("cdnc_i2c"))
+		return (ENXIO);
+	rv = ACPI_ID_PROBE(device_get_parent(dev), dev, cdnc_i2c_acpi_ids,
+	    NULL);
+	if (rv <= 0)
+		device_set_desc(dev, "Cadence I2C Controller");
+	return (rv);
+}
+
+/*
+ * The reference clock's rate: _DSD ref-clock, or, on CIX Sky1, the SCMI
+ * clock its CLKT table names (packages of SCMI id, name, device).
+ */
+static int
+cdnc_i2c_acpi_ref_clock(device_t dev, uint32_t *freq)
+{
+#ifdef __aarch64__
+	ACPI_BUFFER buf;
+	ACPI_OBJECT *pkg, *e;
+	uint64_t hz;
+	uint32_t id;
+	int error;
+#endif
+
+	if (device_get_property(dev, "ref-clock", freq, sizeof(*freq),
+	    DEVICE_PROP_UINT32) > 0)
+		return (0);
+#ifdef __aarch64__
+	buf.Pointer = NULL;
+	buf.Length = ACPI_ALLOCATE_BUFFER;
+	if (ACPI_FAILURE(AcpiEvaluateObject(acpi_get_handle(dev), "CLKT",
+	    NULL, &buf)))
+		return (ENXIO);
+	pkg = buf.Pointer;
+	error = ENXIO;
+	if (pkg->Type == ACPI_TYPE_PACKAGE && pkg->Package.Count > 0) {
+		e = &pkg->Package.Elements[0];
+		if (e->Type == ACPI_TYPE_PACKAGE && e->Package.Count > 0 &&
+		    e->Package.Elements[0].Type == ACPI_TYPE_INTEGER) {
+			id = e->Package.Elements[0].Integer.Value;
+			if ((error = sky1_scmi_clk_enable(id, true)) == 0 &&
+			    (error = sky1_scmi_clk_get_rate(id, &hz)) == 0)
+				*freq = hz;
+		}
+	}
+	AcpiOsFree(buf.Pointer);
+	return (error);
+#else
+	return (ENXIO);
+#endif
+}
+
+static int
+cdnc_i2c_acpi_attach(device_t dev)
+{
+	struct cdnc_i2c_softc *sc;
+
+	sc = device_get_softc(dev);
+	sc->dev = dev;
+	sc->hwtype = HWTYPE_CDNS_R1P14;
+	if (cdnc_i2c_acpi_ref_clock(dev, &sc->ref_clock_freq) != 0) {
+		device_printf(dev, "no reference clock\n");
+		return (ENXIO);
+	}
+	if (device_get_property(dev, "clock-frequency", &sc->i2c_clock_freq,
+	    sizeof(sc->i2c_clock_freq), DEVICE_PROP_UINT32) <= 0)
+		sc->i2c_clock_freq = CDNC_I2C_DEFAULT_I2C_CLOCK;
+	return (cdnc_i2c_attach_common(dev));
+}
+#endif /* DEV_ACPI */
+
+/* Resources, the hardware and the bus, for either attachment. */
+static int
+cdnc_i2c_attach_common(device_t dev)
+{
+	struct cdnc_i2c_softc *sc;
+	int rid, err;
+
+	sc = device_get_softc(dev);
+	I2C_SC_LOCK_INIT(sc);
 
 	/* Get memory resource. */
 	rid = 0;
@@ -665,6 +775,7 @@ cdnc_i2c_detach(device_t dev)
 }
 
 
+#ifdef FDT
 static phandle_t
 cdnc_i2c_get_node(device_t bus, device_t dev)
 {
@@ -697,6 +808,36 @@ static driver_t cdnc_i2c_driver = {
 
 DRIVER_MODULE(cdnc_i2c, simplebus, cdnc_i2c_driver, NULL, NULL);
 DRIVER_MODULE(ofw_iicbus, cdnc_i2c, ofw_iicbus_driver, NULL, NULL);
-MODULE_DEPEND(cdnc_i2c, iicbus, 1, 1, 1);
 MODULE_DEPEND(cdnc_i2c, ofw_iicbus, 1, 1, 1);
 SIMPLEBUS_PNP_INFO(compat_data);
+#endif /* FDT */
+
+#ifdef DEV_ACPI
+static device_method_t cdnc_i2c_acpi_methods[] = {
+	/* Device interface */
+	DEVMETHOD(device_probe,			cdnc_i2c_acpi_probe),
+	DEVMETHOD(device_attach,		cdnc_i2c_acpi_attach),
+	DEVMETHOD(device_detach,		cdnc_i2c_detach),
+
+	/* iicbus methods */
+	DEVMETHOD(iicbus_callback,              iicbus_null_callback),
+	DEVMETHOD(iicbus_reset,			cdnc_i2c_reset),
+	DEVMETHOD(iicbus_transfer,		cdnc_i2c_transfer),
+
+	DEVMETHOD_END
+};
+
+static driver_t cdnc_i2c_acpi_driver = {
+	"cdnc_i2c",
+	cdnc_i2c_acpi_methods,
+	sizeof(struct cdnc_i2c_softc),
+};
+
+DRIVER_MODULE(cdnc_i2c, acpi, cdnc_i2c_acpi_driver, NULL, NULL);
+DRIVER_MODULE(acpi_iicbus, cdnc_i2c, acpi_iicbus_driver, NULL, NULL);
+MODULE_DEPEND(cdnc_i2c, acpi, 1, 1, 1);
+ACPI_PNP_INFO(cdnc_i2c_acpi_ids);
+#endif /* DEV_ACPI */
+
+DRIVER_MODULE(iicbus, cdnc_i2c, iicbus_driver, NULL, NULL);
+MODULE_DEPEND(cdnc_i2c, iicbus, 1, 1, 1);
