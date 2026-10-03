@@ -110,6 +110,20 @@ struct cdnc_i2c_softc {
 	int			hwtype;
 	int			hold;
 
+	int			xfer_size_max;	/* a transfer's bytes */
+
+	/*
+	 * A read, which the interrupt handler takes as it comes: its buffer,
+	 * the bytes left to read, those left of what the transfer size
+	 * register has been given, whether it ends holding the bus, and
+	 * whether it is done.
+	 */
+	uint8_t			*rx_buf;
+	int			rx_left;
+	int			rx_curr;
+	bool			rx_nostop;
+	bool			rx_done;
+
 	/* sysctls */
 	unsigned int		i2c_clk_real_freq;
 	unsigned int		interrupts;
@@ -311,6 +325,65 @@ cdnc_i2c_reset(device_t dev, u_char speed, u_char addr, u_char *oldaddr)
 	return (error ? IIC_ENOTSUPP : IIC_NOERR);
 }
 
+/*
+ * A read's data, taken as it comes, the FIFO overflowing otherwise.  As
+ * Linux does: the controller ends a read (NACKs the slave) when its
+ * transfer size reaches zero, the HOLD bit notwithstanding, so a read
+ * longer than the transfer size register takes is given more while some
+ * remains: with a FIFO's worth and one left of what it was given, once the
+ * register is down to one.  HOLD is cleared once the rest fits in the FIFO,
+ * for a stop at its end.
+ */
+static void
+cdnc_i2c_clear_hold(struct cdnc_i2c_softc *sc)
+{
+	if (sc->hold && !sc->rx_nostop) {
+		sc->cfg_reg_shadow &= ~CDNC_I2C_CR_HOLD;
+		WR2(sc, CDNC_I2C_CR, sc->cfg_reg_shadow);
+		sc->hold = 0;
+	}
+}
+
+static void
+cdnc_i2c_intr_rx(struct cdnc_i2c_softc *sc, uint16_t status)
+{
+	bool more;
+	int i;
+
+	more = sc->rx_left > sc->rx_curr;
+	while (RD2(sc, CDNC_I2C_SR) & CDNC_I2C_SR_RX_VALID) {
+		if (sc->rx_left == 0) {
+			/* More than asked for: the size register rolled over. */
+			sc->istat |= CDNC_I2C_ISR_XFER_TMOUT;
+			break;
+		}
+		*sc->rx_buf++ = RD2(sc, CDNC_I2C_DATA);
+		sc->rx_left--;
+		sc->rx_curr--;
+		if (sc->rx_left <= CDNC_I2C_FIFO_SIZE)
+			cdnc_i2c_clear_hold(sc);
+		if (more && sc->rx_curr == CDNC_I2C_FIFO_SIZE + 1)
+			break;
+	}
+	if (more && sc->rx_curr == CDNC_I2C_FIFO_SIZE + 1) {
+		for (i = 0; i < 100000 && RD1(sc, CDNC_I2C_TRANS_SIZE) !=
+		    sc->rx_curr - CDNC_I2C_FIFO_SIZE; i++)
+			DELAY(1);
+		if (sc->rx_left - CDNC_I2C_FIFO_SIZE > sc->xfer_size_max) {
+			WR1(sc, CDNC_I2C_TRANS_SIZE, sc->xfer_size_max);
+			sc->rx_curr = sc->xfer_size_max + CDNC_I2C_FIFO_SIZE;
+		} else {
+			WR1(sc, CDNC_I2C_TRANS_SIZE,
+			    sc->rx_left - CDNC_I2C_FIFO_SIZE);
+			sc->rx_curr = sc->rx_left;
+		}
+	}
+	if ((status & CDNC_I2C_ISR_XFER_DONE) && sc->rx_left == 0) {
+		cdnc_i2c_clear_hold(sc);
+		sc->rx_done = true;
+	}
+}
+
 static void
 cdnc_i2c_intr(void *arg)
 {
@@ -332,6 +405,10 @@ cdnc_i2c_intr(void *arg)
 
 	sc->istat |= status;
 
+	if (sc->rx_buf != NULL &&
+	    (status & (CDNC_I2C_ISR_XFER_DATA | CDNC_I2C_ISR_XFER_DONE)))
+		cdnc_i2c_intr_rx(sc, status);
+
 	if (status)
 		wakeup(sc);
 
@@ -344,8 +421,7 @@ cdnc_i2c_xfer_rd(struct cdnc_i2c_softc *sc, struct iic_msg *msg)
 	int error = IIC_NOERR;
 	uint16_t flags = msg->flags;
 	uint16_t len = msg->len;
-	int idx = 0, nbytes, last, first = 1;
-	uint16_t statr;
+	int deadline;
 
 	DPRINTF("%s: flags=0x%x len=%d\n", __func__, flags, len);
 
@@ -363,61 +439,48 @@ cdnc_i2c_xfer_rd(struct cdnc_i2c_softc *sc, struct iic_msg *msg)
 	WR2(sc, CDNC_I2C_CR, sc->cfg_reg_shadow | CDNC_I2C_CR_CLR_FIFO);
 	sc->hold = 1;
 
-	while (len > 0) {
-		nbytes = MIN(CDNC_I2C_FIFO_SIZE - 2, len);
-		WR1(sc, CDNC_I2C_TRANS_SIZE, nbytes);
+	/* The read, for the interrupt handler (see cdnc_i2c_intr_rx()). */
+	sc->rx_buf = msg->buf;
+	sc->rx_left = len;
+	sc->rx_curr = MIN(len, sc->xfer_size_max);
+	sc->rx_nostop = (flags & IIC_M_NOSTOP) != 0;
+	sc->rx_done = false;
 
-		last = nbytes == len && !(flags & IIC_M_NOSTOP);
-		if (last) {
-			/* Clear HOLD bit on last transfer. */
-			sc->cfg_reg_shadow &= ~CDNC_I2C_CR_HOLD;
-			WR2(sc, CDNC_I2C_CR, sc->cfg_reg_shadow);
-			sc->hold = 0;
-		}
+	/* Status left from before (an address write's) would wake us early. */
+	WR2(sc, CDNC_I2C_ISR, CDNC_I2C_ISR_ALL);
+	WR1(sc, CDNC_I2C_TRANS_SIZE, sc->rx_curr);
+	WR2(sc, CDNC_I2C_IER, CDNC_I2C_ISR_XFER_DATA | CDNC_I2C_ISR_XFER_DONE |
+	    CDNC_I2C_ISR_ERRS);
 
-		/* Writing slv address for a start or repeated start. */
-		if (first && !(flags & IIC_M_NOSTART))
-			WR2(sc, CDNC_I2C_ADDR, msg->slave >> 1);
-		first = 0;
+	/* Writing slv address for a start or repeated start. */
+	if (!(flags & IIC_M_NOSTART))
+		WR2(sc, CDNC_I2C_ADDR, msg->slave >> 1);
+	if (len <= CDNC_I2C_FIFO_SIZE)
+		cdnc_i2c_clear_hold(sc);
 
-		/*
-		 * Enable FIFO interrupts and wait.  A chunk short of the
-		 * whole read completes, holding the bus, rather than raising
-		 * the data interrupt on some controllers (CIX Sky1's): wait
-		 * for either.
-		 */
-		if (last)
-			WR2(sc, CDNC_I2C_IER, CDNC_I2C_ISR_XFER_DONE |
-			    CDNC_I2C_ISR_ERRS);
-		else
-			WR2(sc, CDNC_I2C_IER, CDNC_I2C_ISR_XFER_DATA |
-			    CDNC_I2C_ISR_XFER_DONE | CDNC_I2C_ISR_ERRS);
-
-		error = mtx_sleep(sc, &sc->sc_mtx, 0, "cdi2c", hz);
-
-		/* Disable FIFO interrupts. */
-		WR2(sc, CDNC_I2C_IDR, CDNC_I2C_ISR_XFER_DATA |
-		    CDNC_I2C_ISR_XFER_DONE | CDNC_I2C_ISR_ERRS);
-
-		if (error == EWOULDBLOCK)
-			error = cdnc_i2c_errs(sc, CDNC_I2C_ISR_XFER_TMOUT);
-		else if (sc->istat & CDNC_I2C_ISR_ERRS)
+	deadline = ticks + hz;
+	while (!sc->rx_done) {
+		error = mtx_sleep(sc, &sc->sc_mtx, 0, "cdi2c",
+		    MAX(1, deadline - ticks));
+		if (sc->istat & CDNC_I2C_ISR_ERRS)
 			error = cdnc_i2c_errs(sc, sc->istat);
+		else if (error == EWOULDBLOCK && ticks - deadline >= 0)
+			error = cdnc_i2c_errs(sc, CDNC_I2C_ISR_XFER_TMOUT);
+		else
+			error = IIC_NOERR;
 		sc->istat = 0;
-
 		if (error != IIC_NOERR)
 			break;
+	}
+	WR2(sc, CDNC_I2C_IDR, CDNC_I2C_ISR_XFER_DATA | CDNC_I2C_ISR_XFER_DONE |
+	    CDNC_I2C_ISR_ERRS);
+	sc->rx_buf = NULL;
 
-		/* Read nbytes from FIFO. */
-		while (nbytes-- > 0) {
-			statr = RD2(sc, CDNC_I2C_SR);
-			if (!(statr & CDNC_I2C_SR_RX_VALID)) {
-				printf("%s: RX FIFO underflow?\n", __func__);
-				break;
-			}
-			msg->buf[idx++] = RD2(sc, CDNC_I2C_DATA);
-			len--;
-		}
+	/* The last chunk's stop sent (the bus free), as a second at most. */
+	if (error == IIC_NOERR && !sc->hold) {
+		for (deadline = 0; deadline < 100000 &&
+		    (RD2(sc, CDNC_I2C_SR) & CDNC_I2C_SR_BUS_ACTIVE); deadline++)
+			DELAY(10);
 	}
 
 	return (error);
@@ -532,6 +595,9 @@ cdnc_i2c_add_sysctls(device_t dev)
 
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "i2c_clk_real_freq", CTLFLAG_RD,
 	    &sc->i2c_clk_real_freq, 0, "i2c clock real frequency");
+
+	SYSCTL_ADD_INT(ctx, child, OID_AUTO, "xfer_size_max", CTLFLAG_RD,
+	    &sc->xfer_size_max, 0, "largest transfer (bytes)");
 
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_interrupts", CTLFLAG_RD,
 	    &sc->interrupts, 0, "interrupt calls");
@@ -719,6 +785,20 @@ cdnc_i2c_attach_common(device_t dev)
 		cdnc_i2c_detach(dev);
 		return (err);
 	}
+
+	/*
+	 * The transfer size register's width: written with all ones, it reads
+	 * back its largest value.
+	 */
+	WR1(sc, CDNC_I2C_TRANS_SIZE, 0xff);
+	sc->xfer_size_max = RD1(sc, CDNC_I2C_TRANS_SIZE);
+	WR1(sc, CDNC_I2C_TRANS_SIZE, 0);
+	if (sc->xfer_size_max > 3)
+		sc->xfer_size_max -= 3;
+	else
+		sc->xfer_size_max = CDNC_I2C_FIFO_SIZE - 2;
+	if (bootverbose)
+		device_printf(dev, "%d-byte transfers\n", sc->xfer_size_max);
 
 	/* Configure the device. */
 	err = cdnc_i2c_init_hw(sc);
