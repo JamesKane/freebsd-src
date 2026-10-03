@@ -66,6 +66,7 @@ typedef uint32_t hmp_score_t;
  */
 struct hmp {
 	bool		has_scores;		/* Runtime updates available */
+	u_int		capacity_gen;		/* Changes with the capacities */
 };
 extern struct hmp hmp_state;
 

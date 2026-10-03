@@ -81,6 +81,7 @@ hmp_capacity_set(const uint32_t *perf)
 		atomic_store_rel_32(&hp->capacity,
 		    (uint64_t)min * HMP_CAPACITY_SCALE / perf[cpu]);
 	}
+	atomic_add_rel_int(&hmp_state.capacity_gen, 1);
 	return (0);
 }
 
@@ -239,6 +240,8 @@ hmp_init(void *arg __unused)
 {
 	hmp_init_capacity();
 	hmp_init_scores();
+	/* For those who derived data from the capacities before. */
+	atomic_add_rel_int(&hmp_state.capacity_gen, 1);
 }
 SYSINIT(hmp, SI_SUB_SMP + 1, SI_ORDER_ANY, hmp_init, NULL);
 

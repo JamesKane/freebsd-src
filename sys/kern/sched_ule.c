@@ -296,6 +296,11 @@ struct tdq {
 	 */
 	u_char		tdq_ts_ticks;
 	int		tdq_id;		/* (c) cpuid. */
+#ifdef HMP
+	bool		tdq_hmp_has_faster; /* CPUs hmp_faster_pct faster... */
+	cpuset_t	tdq_hmp_faster;	/* ...exist, and are these. */
+	int		tdq_hmp_next;	/* Where the search for them goes on. */
+#endif
 	struct runq	tdq_runq;	/* (t) Run queue. */
 	char		tdq_name[TDQ_NAME_LEN];
 #ifdef KTR
@@ -336,6 +341,9 @@ static int __read_mostly steal_idle = 1;
 static int __read_mostly hmp_upmigrate = 1;
 static int __read_mostly hmp_busy_pct = 25;
 static int __read_mostly hmp_faster_pct = 25;
+static u_int hmp_faster_pct_gen;	/* Changes with hmp_faster_pct. */
+static u_int hmp_faster_gen = UINT_MAX;	/* What tdq_hmp_faster were made for. */
+#define	HMP_SCAN_MAX	8	/* Faster CPUs looked at per search. */
 static u_long hmp_upmigrations;
 #endif
 static int __read_mostly steal_thresh = 2;
@@ -1661,31 +1669,73 @@ sched_hmp_busy(const struct td_sched *ts)
 }
 
 /*
- * An idle CPU of mask at least hmp_faster_pct faster than cpu (hmp(4)'s
- * capacity is lower the faster the core), the fastest such, or -1: cores
- * of about the same speed are not worth a thread's cache.  Linear in the
- * number of CPUs.
+ * Each CPU's set of CPUs at least hmp_faster_pct faster (hmp(4)'s capacity
+ * is lower the faster the core): made again when the capacities or the
+ * margin change.  Quadratic in the number of CPUs, but that is rare.
  */
-static int
+static void
+sched_hmp_make_faster(void)
+{
+	struct hmp_pcpu *hp;
+	struct tdq *tdq;
+	uint64_t lim;
+	int c, d;
+
+	CPU_FOREACH(c) {
+		tdq = TDQ_CPU(c);
+		hp = DPCPU_ID_PTR(c, hmp_pcpu);
+		lim = (uint64_t)hmp_get_capacity(hp, c) * 100 /
+		    (100 + hmp_faster_pct);
+		CPU_ZERO(&tdq->tdq_hmp_faster);
+		CPU_FOREACH(d) {
+			hp = DPCPU_ID_PTR(d, hmp_pcpu);
+			if (hmp_get_capacity(hp, d) < lim)
+				CPU_SET(d, &tdq->tdq_hmp_faster);
+		}
+		tdq->tdq_hmp_has_faster = !CPU_EMPTY(&tdq->tdq_hmp_faster);
+	}
+}
+
+/*
+ * Whether an idle CPU of mask is at least hmp_faster_pct faster than cpu:
+ * cores of about the same speed are not worth a thread's cache.  Only
+ * whether there is one: sched_pickcpu()'s search chooses it.  Nothing to
+ * do on the fastest cores; on others, at most HMP_SCAN_MAX of the faster
+ * CPUs are looked at, going on where the last search stopped, so the cost
+ * does not grow with the number of CPUs.
+ */
+static bool
 sched_hmp_faster_idle(int cpu, const cpuset_t *mask)
 {
-	hmp_capacity_t bcap, cap;
-	int best, c;
+	struct tdq *tdq;
+	u_int gen;
+	int c, n;
 
-	best = -1;
-	bcap = hmp_get_capacity(DPCPU_ID_PTR(cpu, hmp_pcpu), cpu) *
-	    100 / (100 + hmp_faster_pct);
-	CPU_FOREACH(c) {
-		if (c == cpu || !CPU_ISSET(c, mask))
-			continue;
-		cap = hmp_get_capacity(DPCPU_ID_PTR(c, hmp_pcpu), c);
-		if (cap >= bcap ||
-		    atomic_load_char(&TDQ_CPU(c)->tdq_lowpri) < PRI_MIN_IDLE)
-			continue;
-		best = c;
-		bcap = cap;
+	gen = atomic_load_acq_int(&hmp_state.capacity_gen) +
+	    atomic_load_int(&hmp_faster_pct_gen);
+	if (__predict_false(gen != hmp_faster_gen)) {
+		sched_hmp_make_faster();
+		hmp_faster_gen = gen;
 	}
-	return (best);
+	tdq = TDQ_CPU(cpu);
+	if (!tdq->tdq_hmp_has_faster)
+		return (false);
+	c = tdq->tdq_hmp_next;
+	for (n = 0; n < HMP_SCAN_MAX; n++) {
+		c = BIT_FFS_AT(CPU_SETSIZE, &tdq->tdq_hmp_faster, c);
+		if (c == 0)
+			c = BIT_FFS(CPU_SETSIZE, &tdq->tdq_hmp_faster);
+		if (c-- == 0)
+			return (false);
+		if (CPU_ISSET(c, mask) &&
+		    atomic_load_char(&TDQ_CPU(c)->tdq_lowpri) >= PRI_MIN_IDLE) {
+			tdq->tdq_hmp_next = c;
+			return (true);
+		}
+		c = (c + 1) % CPU_SETSIZE;
+	}
+	tdq->tdq_hmp_next = c;
+	return (false);
 }
 
 /* Whether a busy thread on cpu should move up to a faster idle core. */
@@ -1693,7 +1743,7 @@ static bool
 sched_hmp_misfit(struct thread *td, int cpu)
 {
 	return (hmp_upmigrate != 0 && sched_hmp_busy(td_get_sched(td)) &&
-	    sched_hmp_faster_idle(cpu, &td->td_cpuset->cs_mask) >= 0);
+	    sched_hmp_faster_idle(cpu, &td->td_cpuset->cs_mask));
 }
 #endif
 
@@ -3866,8 +3916,24 @@ SYSCTL_INT(_kern_sched_ule, OID_AUTO, hmp_upmigrate, CTLFLAG_RWTUN,
 SYSCTL_INT(_kern_sched_ule, OID_AUTO, hmp_busy_pct, CTLFLAG_RWTUN,
     &hmp_busy_pct, 0,
     "%CPU above which a thread is busy enough to move to a faster core");
-SYSCTL_INT(_kern_sched_ule, OID_AUTO, hmp_faster_pct, CTLFLAG_RWTUN,
-    &hmp_faster_pct, 0,
+static int
+sysctl_kern_hmp_faster_pct(SYSCTL_HANDLER_ARGS)
+{
+	int error, val;
+
+	val = hmp_faster_pct;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val < 0)
+		return (EINVAL);
+	hmp_faster_pct = val;
+	atomic_add_int(&hmp_faster_pct_gen, 1);
+	return (0);
+}
+SYSCTL_PROC(_kern_sched_ule, OID_AUTO, hmp_faster_pct,
+    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_kern_hmp_faster_pct, "I",
     "How much faster (%) a core must be for a busy thread to move to it");
 SYSCTL_ULONG(_kern_sched_ule, OID_AUTO, hmp_upmigrations, CTLFLAG_RD,
     &hmp_upmigrations, 0,
