@@ -348,6 +348,11 @@ hdac_one_intr(struct hdac_softc *sc, uint32_t intsts)
 
 		/* Get as many responses that we can */
 		rirbsts = HDAC_READ_1(&sc->mem, HDAC_RIRBSTS);
+		if (sc->flags & HDAC_F_RINTFL_STUCK) {
+			/* Its status never clears: whatever has arrived. */
+			hdac_rirb_flush(sc);
+			rirbsts = 0;
+		}
 		while (rirbsts & HDAC_RIRBSTS_RINTFL) {
 			HDAC_WRITE_1(&sc->mem,
 			    HDAC_RIRBSTS, HDAC_RIRBSTS_RINTFL);
@@ -399,6 +404,12 @@ hdac_intr_handler(void *context)
 	intsts = HDAC_READ_4(&sc->mem, HDAC_INTSTS);
 	while (intsts != 0xffffffff && (intsts & HDAC_INTSTS_GIS) != 0) {
 		hdac_one_intr(sc, intsts);
+		/*
+		 * With a response status that never clears, the controller's
+		 * status stays set: one pass (it runs polled).
+		 */
+		if (sc->flags & HDAC_F_RINTFL_STUCK)
+			break;
 		intsts = HDAC_READ_4(&sc->mem, HDAC_INTSTS);
 	}
 	hdac_unlock(sc);
@@ -835,6 +846,7 @@ hdac_corb_init(struct hdac_softc *sc)
 {
 	uint8_t corbsize;
 	uint64_t corbpaddr;
+	int i;
 
 	/* Setup the CORB size. */
 	switch (sc->corb_size) {
@@ -862,12 +874,25 @@ hdac_corb_init(struct hdac_softc *sc)
 	HDAC_WRITE_2(&sc->mem, HDAC_CORBWP, sc->corb_wp);
 	HDAC_WRITE_2(&sc->mem, HDAC_CORBRP, HDAC_CORBRP_CORBRPRST);
 	/*
-	 * The HDA specification indicates that the CORBRPRST bit will always
-	 * read as zero. Unfortunately, it seems that at least the 82801G
-	 * doesn't reset the bit to zero, which stalls the corb engine.
-	 * manually reset the bit to zero before continuing.
+	 * The HDA specification has software read the CORBRPRST bit back as
+	 * set, then clear it and read it back as clear.  Some controllers
+	 * need the handshake (CIX Sky1's), while others never read it back
+	 * set (it seems that at least the 82801G doesn't reset the bit to
+	 * zero, which stalls the corb engine), so wait a bounded time for
+	 * each.
 	 */
+	for (i = 0; i < 1000; i++) {
+		if (HDAC_READ_2(&sc->mem, HDAC_CORBRP) & HDAC_CORBRP_CORBRPRST)
+			break;
+		DELAY(1);
+	}
 	HDAC_WRITE_2(&sc->mem, HDAC_CORBRP, 0x0);
+	for (i = 0; i < 1000; i++) {
+		if ((HDAC_READ_2(&sc->mem, HDAC_CORBRP) &
+		    HDAC_CORBRP_CORBRPRST) == 0)
+			break;
+		DELAY(1);
+	}
 
 	/* Enable CORB error reporting */
 #if 0
@@ -920,7 +945,12 @@ hdac_rirb_init(struct hdac_softc *sc)
 	HDAC_WRITE_1(&sc->mem, HDAC_RIRBCTL,
 	    HDAC_RIRBCTL_RIRBOIC | HDAC_RIRBCTL_RINTCTL);
 #else
-	HDAC_WRITE_1(&sc->mem, HDAC_RIRBCTL, HDAC_RIRBCTL_RINTCTL);
+	/*
+	 * Polled, responses are not interrupts (CIX Sky1's response interrupt
+	 * status does not clear).
+	 */
+	HDAC_WRITE_1(&sc->mem, HDAC_RIRBCTL,
+	    sc->polling ? 0 : HDAC_RIRBCTL_RINTCTL);
 #endif
 
 	/*
@@ -1065,8 +1095,10 @@ hdac_send_command(struct hdac_softc *sc, nid_t cad, uint32_t verb)
 	} while (sc->codecs[cad].pending != 0 && --timeout);
 
 	if (sc->codecs[cad].pending != 0) {
-		device_printf(sc->dev, "Command 0x%08x timeout on address %d\n",
-		    verb, cad);
+		device_printf(sc->dev, "Command 0x%08x timeout on address %d "
+		    "(CORBRP %#x, RIRBWP %#x)\n", verb, cad,
+		    HDAC_READ_2(&sc->mem, HDAC_CORBRP),
+		    HDAC_READ_2(&sc->mem, HDAC_RIRBWP));
 		sc->codecs[cad].pending = 0;
 	}
 

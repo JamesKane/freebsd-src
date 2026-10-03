@@ -220,6 +220,7 @@ struct hdac_softc {
 	uint32_t	flags;
 #define HDAC_F_DMA_NOCACHE	0x00000001
 #define HDAC_F_NOT_PCI		0x00000002	/* a platform front end's */
+#define HDAC_F_RINTFL_STUCK	0x00000004	/* RIRBSTS.RINTFL won't clear */
 
 	/* Set by a platform front end before hdac_attach_common(). */
 	bus_dma_tag_t	dma_parent;	/* or the bus's */

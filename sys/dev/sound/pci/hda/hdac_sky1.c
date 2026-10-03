@@ -138,7 +138,7 @@ hdac_sky1_attach(device_t dev)
 	if (error != 0)
 		return (error);
 
-	sc->flags |= HDAC_F_NOT_PCI;
+	sc->flags |= HDAC_F_NOT_PCI | HDAC_F_RINTFL_STUCK;
 	sc->quirks_off |= HDAC_QUIRK_MSI | HDAC_QUIRK_DMAPOS;
 	sc->mem.mem_aligned = true;
 	sc->polling = 1;
