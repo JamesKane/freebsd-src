@@ -112,6 +112,18 @@ lkpi_irq_handler(void *ent)
 	}
 }
 
+/*
+ * Interrupt handlers run in the network epoch, which forbids sleeping, except
+ * those with a threaded handler: that may sleep, as on Linux.
+ */
+static inline int
+lkpi_irq_flags(struct irq_ent *irqe)
+{
+	if (irqe->thread_handler != NULL)
+		return (INTR_TYPE_MISC | INTR_MPSAFE);
+	return (INTR_TYPE_NET | INTR_MPSAFE);
+}
+
 static inline void
 lkpi_irq_release(struct device *dev, struct irq_ent *irqe)
 {
@@ -175,9 +187,8 @@ lkpi_request_irq(struct device *xdev, unsigned int irq,
 
 	/* With IRQF_NO_AUTOEN, the handler is set up by enable_irq(). */
 	if ((flags & IRQF_NO_AUTOEN) == 0) {
-		error = bus_setup_intr(dev->bsddev, res,
-		    INTR_TYPE_NET | INTR_MPSAFE, NULL, lkpi_irq_handler, irqe,
-		    &irqe->tag);
+		error = bus_setup_intr(dev->bsddev, res, lkpi_irq_flags(irqe),
+		    NULL, lkpi_irq_handler, irqe, &irqe->tag);
 		if (error)
 			goto errout;
 	}
@@ -208,7 +219,7 @@ lkpi_enable_irq(unsigned int irq)
 	irqe = lkpi_irq_ent(dev, irq);
 	if (irqe == NULL || irqe->tag != NULL)
 		return -EINVAL;
-	return -bus_setup_intr(dev->bsddev, irqe->res, INTR_TYPE_NET | INTR_MPSAFE,
+	return -bus_setup_intr(dev->bsddev, irqe->res, lkpi_irq_flags(irqe),
 	    NULL, lkpi_irq_handler, irqe, &irqe->tag);
 }
 
