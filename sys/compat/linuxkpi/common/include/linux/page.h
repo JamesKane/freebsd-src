@@ -80,8 +80,19 @@ pgprot2cachemode(pgprot_t prot)
 #define	page_to_virt(page)	linux_page_address(page)
 #define	nth_page(page,n)	pfn_to_page(page_to_pfn(page) + (n))
 
+#if defined(__aarch64__)
+/*
+ * As Linux on arm64: device memory, for registers.  Normal non-cacheable
+ * memory is write-combining's, and a mapping of device registers so may
+ * be read speculatively or merged, which some interconnects reject (CIX
+ * Sky1's GPU hangs the system).
+ */
+#define	pgprot_noncached(prot)		\
+	(((prot) & VM_PROT_ALL) | cachemode2protval(VM_MEMATTR_DEVICE_nGnRnE))
+#else
 #define	pgprot_noncached(prot)		\
 	(((prot) & VM_PROT_ALL) | cachemode2protval(VM_MEMATTR_UNCACHEABLE))
+#endif
 #ifdef VM_MEMATTR_WRITE_COMBINING
 #define	pgprot_writecombine(prot)	\
 	(((prot) & VM_PROT_ALL) | cachemode2protval(VM_MEMATTR_WRITE_COMBINING))
