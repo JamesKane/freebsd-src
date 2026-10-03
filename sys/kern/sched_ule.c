@@ -332,6 +332,7 @@ static int balance_interval = 128;	/* Default set in sched_initticks(). */
 static int __read_mostly affinity;
 static int __read_mostly steal_idle = 1;
 #ifdef HMP
+#define	HMP_LOAD_SHIFT	4	/* see cpu_search_lowest() */
 static int __read_mostly hmp_upmigrate = 1;
 static int __read_mostly hmp_busy_pct = 25;
 static int __read_mostly hmp_faster_pct = 25;
@@ -869,7 +870,8 @@ cpu_search_lowest(const struct cpu_group *cg, const struct cpu_search *s,
 			if (__predict_false(s->cs_running) &&
 			    (cg->cg_child[c].cg_flags & CG_FLAG_THREAD) &&
 			    lr.csr_task > 0 && lr.csr_preferred != -1)
-				load += (((lr.csr_capacity / lr.csr_core) >> 2) * core * 2);
+				load += (((lr.csr_capacity / lr.csr_core) >> 2) *
+				    core * 2) << HMP_LOAD_SHIFT;
 #else
 			if (__predict_false(s->cs_running) &&
 			    (cg->cg_child[c].cg_flags & CG_FLAG_THREAD) &&
@@ -918,7 +920,15 @@ cpu_search_lowest(const struct cpu_group *cg, const struct cpu_search *s,
 		hp = DPCPU_ID_PTR(c, hmp_pcpu);
 		cap = hmp_get_capacity(hp, c) >> 2;
 
-		load = l * cap;
+		/*
+		 * Scaled so that a thread queued on even the fastest core (cap
+		 * 79 on the CIX Sky1) outweighs the score, preference and
+		 * random terms below (at most 767): those choose among CPUs of
+		 * equal load, as the 128 of the preference and the random term
+		 * do without hmp(4), instead of making a busy CPU beat an idle
+		 * one.
+		 */
+		load = (l * cap) << HMP_LOAD_SHIFT;
 		r->csr_task += l;
 		r->csr_core++;
 		r->csr_capacity += cap;
