@@ -380,13 +380,18 @@ cdnc_i2c_xfer_rd(struct cdnc_i2c_softc *sc, struct iic_msg *msg)
 			WR2(sc, CDNC_I2C_ADDR, msg->slave >> 1);
 		first = 0;
 
-		/* Enable FIFO interrupts and wait. */
+		/*
+		 * Enable FIFO interrupts and wait.  A chunk short of the
+		 * whole read completes, holding the bus, rather than raising
+		 * the data interrupt on some controllers (CIX Sky1's): wait
+		 * for either.
+		 */
 		if (last)
 			WR2(sc, CDNC_I2C_IER, CDNC_I2C_ISR_XFER_DONE |
 			    CDNC_I2C_ISR_ERRS);
 		else
 			WR2(sc, CDNC_I2C_IER, CDNC_I2C_ISR_XFER_DATA |
-			    CDNC_I2C_ISR_ERRS);
+			    CDNC_I2C_ISR_XFER_DONE | CDNC_I2C_ISR_ERRS);
 
 		error = mtx_sleep(sc, &sc->sc_mtx, 0, "cdi2c", hz);
 

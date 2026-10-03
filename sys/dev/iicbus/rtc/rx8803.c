@@ -28,6 +28,9 @@
 #include <sys/cdefs.h>
 #include "opt_platform.h"
 
+#include "opt_acpi.h"
+#include "opt_platform.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
@@ -36,8 +39,15 @@
 #include <sys/lock.h>
 #include <sys/module.h>
 
+#ifdef FDT
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#endif
+
+#ifdef DEV_ACPI
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
+#endif
 
 #include <dev/iicbus/iiconf.h>
 #include <dev/iicbus/iicbus.h>
@@ -69,10 +79,20 @@ struct rx8803_time {
 	uint8_t year;
 };
 
+#ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 	{"epson,rx8803", 1},
 	{NULL,           0},
 };
+#endif
+
+#ifdef DEV_ACPI
+/* The RX8900 keeps time in the same registers. */
+static char *rx8803_acpi_ids[] = {
+	"RX008900",		/* CIX Sky1 boards */
+	NULL
+};
+#endif
 
 static int rx8803_probe(device_t dev);
 static int rx8803_attach(device_t dev);
@@ -195,16 +215,29 @@ rx8803_settime(device_t dev, struct timespec *ts)
 static int
 rx8803_probe(device_t dev)
 {
+#ifdef DEV_ACPI
+	ACPI_HANDLE handle;
+	int i;
+#endif
 
-	if (!ofw_bus_status_okay(dev))
-		return (ENXIO);
-
-	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
-		return (ENXIO);
-
-	device_set_desc(dev, "Epson RX8803 Real Time Clock");
-
-	return (BUS_PROBE_GENERIC);
+#ifdef FDT
+	if (ofw_bus_status_okay(dev) &&
+	    ofw_bus_search_compatible(dev, compat_data)->ocd_data != 0) {
+		device_set_desc(dev, "Epson RX8803 Real Time Clock");
+		return (BUS_PROBE_GENERIC);
+	}
+#endif
+#ifdef DEV_ACPI
+	if ((handle = acpi_get_handle(dev)) != NULL) {
+		for (i = 0; rx8803_acpi_ids[i] != NULL; i++) {
+			if (!acpi_MatchHid(handle, rx8803_acpi_ids[i]))
+				continue;
+			device_set_desc(dev, "Epson RX8900 Real Time Clock");
+			return (BUS_PROBE_DEFAULT);
+		}
+	}
+#endif
+	return (ENXIO);
 }
 
 static int
@@ -248,4 +281,9 @@ static driver_t rx8803_driver = {
 DRIVER_MODULE(rx8803, iicbus, rx8803_driver, NULL, NULL);
 MODULE_VERSION(rx8803, 1);
 MODULE_DEPEND(rx8803, iicbus, IICBUS_MINVER, IICBUS_PREFVER, IICBUS_MAXVER);
+#ifdef FDT
 IICBUS_FDT_PNP_INFO(compat_data);
+#endif
+#ifdef DEV_ACPI
+IICBUS_ACPI_PNP_INFO(rx8803_acpi_ids);
+#endif
