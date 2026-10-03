@@ -642,7 +642,11 @@ DEBUG_REDZONE		opt_vm.h
 # Standard SMP options
 EARLY_AP_STARTUP	opt_global.h
 SMP			opt_global.h
+HMP			opt_global.h
 NUMA			opt_global.h
+
+# CPU core performance/efficiency/capacity manual setting driver for HMP(4)
+COREINDEX		opt_coreindex.h
 
 # Size of the kernel message buffer
 MSGBUF_SIZE		opt_msgbuf.h

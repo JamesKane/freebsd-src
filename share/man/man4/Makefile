@@ -128,6 +128,7 @@ MAN=	aac.4 \
 	${_chvgpio.4} \
 	ciss.4 \
 	coreboot.4 \
+	coreindex.4 \
 	${_coretemp.4} \
 	cp2112.4 \
 	${_cpuctl.4} \
@@ -218,6 +219,7 @@ MAN=	aac.4 \
 	hidraw.4 \
 	hidwacom.4 \
 	hkbd.4 \
+	hmp.4 \
 	hms.4 \
 	hmt.4 \
 	hpen.4 \

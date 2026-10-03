@@ -89,6 +89,7 @@ SUBDIR=	\
 	${_chromebook_platform} \
 	${_ciss} \
 	${_coreboot} \
+	coreindex \
 	${_coretemp} \
 	${_cpsw} \
 	${_cpuctl} \

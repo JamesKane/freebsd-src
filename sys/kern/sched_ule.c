@@ -72,6 +72,12 @@
 #include <dev/hwt/hwt_hook.h>
 #endif
 
+#ifdef HMP
+#include <sys/hmp.h>
+
+DPCPU_DECLARE(struct hmp_pcpu, hmp_pcpu);
+#endif
+
 #include <machine/cpu.h>
 #include <machine/smp.h>
 
@@ -738,6 +744,12 @@ struct cpu_search {
 struct cpu_search_res {
 	int	csr_cpu;	/* The best CPU found. */
 	int	csr_load;	/* The load of csr_cpu. */
+#ifdef HMP
+	int csr_task;	/* The tasks of CPU group */
+	int csr_preferred;	/* Presence preferred CPU within the group */
+	int csr_core;	/* The number of cores used to calculate the return value */
+	int csr_capacity;	/* Sum of the capacity value of each core */
+#endif
 };
 
 /*
@@ -754,15 +766,78 @@ cpu_search_lowest(const struct cpu_group *cg, const struct cpu_search *s,
 	struct cpu_search_res lr;
 	struct tdq *tdq;
 	int c, bload, l, load, p, total;
+#ifdef HMP
+	int core, rate, cap, score;
+	struct hmp_pcpu *hp;
+#endif
 
 	total = 0;
 	bload = INT_MAX;
 	r->csr_cpu = -1;
+#ifdef HMP
+	core = 0;
+	r->csr_task = 0;
+	r->csr_preferred = -1;
+	r->csr_core = 0;
+	r->csr_capacity = 0;
+#endif
 
 	/* Loop through children CPU groups if there are any. */
 	if (cg->cg_children > 0) {
 		for (c = cg->cg_children - 1; c >= 0; c--) {
 			load = cpu_search_lowest(&cg->cg_child[c], s, &lr);
+#ifdef HMP
+			/*
+			 * The number of cores in the acquired CPU group and the number of cores in the
+			 * CPU group acquired one loop earlier are examined, and the "load" and "bload"
+			 * values are scaled to values corresponding to the same number of cores before
+			 * comparing the load.
+			 *
+			 * This allows comparison even when CPU groups have different core counts, such as
+			 * an SMT group with 2 cores and an E-core group with 4 cores.
+			 *
+			 * Ideally, the least common multiple (LCM) of the core counts in both CPU groups
+			 * should be calculated, but to avoid computational complexity, the comparison is
+			 * based solely on whether the two core counts are divisible.
+			 *  - If they are divisible, the larger number is used
+			 *  - Otherwise, the two core counts are simply cross-referenced and multiplied
+			 *    to obtain the common multiple (not the smallest), and the comparison is
+			 *    performed based on that.
+			 */
+			rate = 1;
+			if (lr.csr_core > 0) {
+				if (core > 0) {
+					if (lr.csr_core > core) {
+						if ((lr.csr_core % core) != 0) {
+							rate = lr.csr_core;
+							load *= core;
+							core *= lr.csr_core;
+						} else {
+							rate = lr.csr_core / core;
+							core = lr.csr_core;
+						}
+
+						total *= rate;
+						bload = ((bload < INT_MAX) ? (bload * rate) : INT_MAX);
+
+					} else if (lr.csr_core < core) {
+						if ((core % lr.csr_core) != 0) {
+							rate = lr.csr_core;
+							total *= rate;
+							bload = ((bload < INT_MAX) ? (bload * rate) : INT_MAX);
+							load *= core;
+							core *= lr.csr_core;
+						} else
+							load *= (core / lr.csr_core);
+					}
+				} else
+					core = lr.csr_core;
+
+				r->csr_capacity = (r->csr_capacity * rate)
+									 + ((lr.csr_capacity / lr.csr_core) * core);
+			}
+			r->csr_core += core;
+#endif
 			total += load;
 
 			/*
@@ -770,10 +845,31 @@ cpu_search_lowest(const struct cpu_group *cg, const struct cpu_search *s,
 			 * It allows round-robin between SMT groups with equal
 			 * load within parent group for more fair scheduling.
 			 */
+#ifdef HMP
+			/*
+			 * When hmp(4) is disabled, 256 is added to the task count.
+			 * Then, half of that, 128 (a binary value), was used to determine whether
+			 * a "prefer" setting was present and to check the task count.
+			 * However, this method is no longer usable because the capacity value is
+			 * used for the added value. Therefore, this is replaced by adding a member
+			 * to the 'cpu_search_res' structure.
+			 *
+			 * Also, the penalty value of 128 is added to the SMT group, resulting in 64
+			 * for each SMT logical core. Since this value is one-quarter of 256, here it
+			 * is calculated by multiplying one-quarter of the capacity value per core
+			 * by the number of cores. Furthermore, since we need to add two cores for
+			 * the SMT group, we multiply by 2 at the end.
+			 */
+			if (__predict_false(s->cs_running) &&
+			    (cg->cg_child[c].cg_flags & CG_FLAG_THREAD) &&
+			    lr.csr_task > 0 && lr.csr_preferred != -1)
+				load += (((lr.csr_capacity / lr.csr_core) >> 2) * core * 2);
+#else
 			if (__predict_false(s->cs_running) &&
 			    (cg->cg_child[c].cg_flags & CG_FLAG_THREAD) &&
 			    load >= 128 && (load & 128) != 0)
 				load += 128;
+#endif
 
 			if (lr.csr_cpu >= 0 && (load < bload ||
 			    (load == bload && lr.csr_load < r->csr_load))) {
@@ -797,7 +893,42 @@ cpu_search_lowest(const struct cpu_group *cg, const struct cpu_search *s,
 			p = 128;
 		} else
 			p = 0;
+
+#ifdef HMP
+		/*
+		 * The "capacity" value of hmp(4) is used as an adjustment coefficient and
+		 * is right-shifted by 2 bits so that the maximum value is 256.
+		 * The "capacity" value is set to 1024 for the slowest core and stored as the
+		 * value divided by the ratio of processing speed to that core.
+		 * As a result, a core that is twice as fast as the slowest core will have a
+		 * load of 512>>2=128, and a core that is four times as fast will have a load
+		 * of 256>>2=64.
+		 * The l obtained from TDQ_LOAD(tdq) is the number of run queues for each CPU core,
+		 * so for example, if there is one task in the run queue of the slowest core and
+		 * two tasks in the run queue of a core that is twice as fast, the load value will
+		 * be 512 in both cases, allowing for performance evaluation that takes capacity
+		 * into account.
+		 */
+		hp = DPCPU_ID_PTR(c, hmp_pcpu);
+		cap = hmp_get_capacity(hp, c) >> 2;
+
+		load = l * cap;
+		r->csr_task += l;
+		r->csr_core++;
+		r->csr_capacity += cap;
+
+		/*
+		 * The score of hmp(4) indicates which cores the hardware should utilize,
+		 * and is therefore subtracted from the calculated "load" value.
+		 * It is also reflected in the "total" value, which represents the total load
+		 * for the CPU group, and is taken into consideration when determining the load
+		 * for each CPU group.
+		 */
+		score = hmp_get_score(hp, HMP_SCORE_PERF) >> 2;
+		p += score;
+#else
 		load = l * 256;
+#endif
 		total += load - p;
 
 		/*
@@ -819,11 +950,22 @@ cpu_search_lowest(const struct cpu_group *cg, const struct cpu_search *s,
 		if (__predict_false(s->cs_running) && l > 0)
 			p = 0;
 
+#ifdef HMP
+		if (score == 0)
+			score = 128;
+
+		load -= sched_random() % score;
+#else
 		load -= sched_random() % 128;
+#endif
 		if (bload > load - p) {
 			bload = load - p;
 			r->csr_cpu = c;
 			r->csr_load = load;
+#ifdef HMP
+			if (c == s->cs_prefer)
+				r->csr_preferred = c;
+#endif
 		}
 	}
 	return (total);
@@ -836,15 +978,70 @@ cpu_search_highest(const struct cpu_group *cg, const struct cpu_search *s,
 	struct cpu_search_res lr;
 	struct tdq *tdq;
 	int c, bload, l, load, total;
+#ifdef HMP
+	int core, rate, cap;
+	struct hmp_pcpu *hp;
+#endif
 
 	total = 0;
 	bload = INT_MIN;
 	r->csr_cpu = -1;
+#ifdef HMP
+	core = 0;
+	r->csr_core = 0;
+#endif
 
 	/* Loop through children CPU groups if there are any. */
 	if (cg->cg_children > 0) {
 		for (c = cg->cg_children - 1; c >= 0; c--) {
 			load = cpu_search_highest(&cg->cg_child[c], s, &lr);
+#ifdef HMP
+			/*
+			 * The number of cores in the acquired CPU group and the number of cores in the
+			 * CPU group acquired one loop earlier are examined, and the "load" and "bload"
+			 * values are scaled to values corresponding to the same number of cores before
+			 * comparing the load.
+			 *
+			 * This allows comparison even when CPU groups have different core counts, such as
+			 * an SMT group with 2 cores and an E-core group with 4 cores.
+			 *
+			 * Ideally, the least common multiple (LCM) of the core counts in both CPU groups
+			 * should be calculated, but to avoid computational complexity, the comparison is
+			 * based solely on whether the two core counts are divisible.
+			 *  - If they are divisible, the larger number is used
+			 *  - Otherwise, the two core counts are simply cross-referenced and multiplied
+			 *    to obtain the common multiple (not the smallest), and the comparison is
+			 *    performed based on that.
+			 */
+			if (lr.csr_core > 0) {
+				if (core > 0) {
+					if (lr.csr_core > core) {
+						if ((lr.csr_core % core) != 0) {
+							rate = lr.csr_core;
+							load *= core;
+							core *= lr.csr_core;
+						} else {
+							rate = lr.csr_core / core;
+							core = lr.csr_core;
+						}
+
+						total *= rate;
+						bload = ((bload > INT_MIN) ? (bload * rate) : INT_MIN);
+
+					} else if (lr.csr_core < core) {
+						if ((core % lr.csr_core) != 0) {
+							total *= lr.csr_core;
+							bload = ((bload > INT_MIN) ? (bload * lr.csr_core) : INT_MIN);
+							load *= core;
+							core *= lr.csr_core;
+						} else
+							load *= (core / lr.csr_core);
+					}
+				} else
+					core = lr.csr_core;
+			}
+			r->csr_core += core;
+#endif
 			total += load;
 			if (lr.csr_cpu >= 0 && (load > bload ||
 			    (load == bload && lr.csr_load > r->csr_load))) {
@@ -862,7 +1059,36 @@ cpu_search_highest(const struct cpu_group *cg, const struct cpu_search *s,
 			continue;
 		tdq = TDQ_CPU(c);
 		l = TDQ_LOAD(tdq);
+#ifdef HMP
+		/*
+		 * The "capacity" value of hmp(4) is used as an adjustment coefficient and
+		 * is right-shifted by 2 bits so that the maximum value is 256.
+		 * The "capacity" value is set to 1024 for the slowest core and stored as the
+		 * value divided by the ratio of processing speed to that core.
+		 * As a result, a core that is twice as fast as the slowest core will have a
+		 * load of 512>>2=128, and a core that is four times as fast will have a load
+		 * of 256>>2=64.
+		 * The l obtained from TDQ_LOAD(tdq) is the number of run queues for each CPU core,
+		 * so for example, if there is one task in the run queue of the slowest core and
+		 * two tasks in the run queue of a core that is twice as fast, the load value will
+		 * be 512 in both cases, allowing for performance evaluation that takes capacity
+		 * into account.
+		 */
+		hp = DPCPU_ID_PTR(c, hmp_pcpu);
+		cap = hmp_get_capacity(hp, c) >> 2;
+		/*
+		 * Immediately after startup, hmp(4) is not initialized, so it may be zero,
+		 * resulting in a division by zero error during subsequent random number distribution.
+		 * As a countermeasure, if it is zero, it falls back to 256.
+		 */
+		if (cap == 0)
+			cap = 256;
+
+		load = l * cap;
+		r->csr_core++;
+#else
 		load = l * 256;
+#endif
 		total += load;
 
 		/*
@@ -872,7 +1098,17 @@ cpu_search_highest(const struct cpu_group *cg, const struct cpu_search *s,
 		    !CPU_ISSET(c, s->cs_mask))
 			continue;
 
+#ifdef HMP
+		/*
+		 * In the original version, where hmp(4) is disabled, random number distribution
+		 * is performed within a range of adjustment coefficient 256, but this version
+		 * requires distribution to be performed within the range of the target core's
+		 * capacity value.
+		 */
+		load -= sched_random() % cap;
+#else
 		load -= sched_random() % 256;
+#endif
 		if (load > bload) {
 			bload = load;
 			r->csr_cpu = c;

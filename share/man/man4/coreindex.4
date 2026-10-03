@@ -1,0 +1,186 @@
+.\"
+.\" Copyright (c) 2026 Koine Yuusuke
+.\"
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.Dd Jul 2, 2026
+.Dt COREINDEX 4
+.Os
+.Sh NAME
+.Nm coreindex
+.Nd CPU core performance/efficiency/capacity manual setting driver
+.Sh SYNOPSIS
+To compile this driver into the kernel,
+place the following line in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device coreindex"
+.Ed
+.Pp
+Alternatively, to load the driver as a
+module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+coreindex_load="YES"
+.Ed
+.Pp
+Do not both compile the driver into the kernel and
+load it as a module at boot time.
+.Pp
+This driver can also cooperate with
+.Xr hmp 4
+to pass internal performance metrics to the ULE scheduler.
+To enable this capability, add the following line to
+your kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "options HMP"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver allows for the manual configuration of 'capacity',
+'performance', and 'efficiency' scores for each CPU core
+managed by the heterogeneous multi-core module hmp(4).
+By using this driver to set appropriate values based on
+actual CPU core performance, it becomes possible to have
+.Xr sched_ule 4
+perform scheduling that accounts for per-core performance
+characteristics in scenarios such as the following:
+.Bl -bullet
+.It
+Heterogeneous multi-core environments where hardware-level
+retrieval of per-core performance values is not supported
+.It
+Environments where no hmp(4) provider driver is available.
+.It
+Heterogeneous multi-core environments that support
+hardware-level performance reporting, but where manual
+configuration of per-core performance values is preferred
+.It
+Debugging within virtualized environments
+.El
+
+Per-core 'capacity', 'performance', and 'efficiency' values
+are configured via the sysctl interface and
+.Xr loader.conf 5
+, as described below.
+
+Note that this driver does not support dynamic loading via
+the
+.Xr kldload 8
+command.
+
+.Sh SYSCTL VARIABLES AND LOADER TUNABLES
+
+The behavior of
+.Nm
+is influenced by the following
+.Xr sysctl 8
+and
+.Xr loader.conf 5
+tunables:
+.Bl -tag -width indent
+.It Va hw.coreindex.%d.capacity
+Set a value representing the relative throughput of the target
+CPU core. This value should account for both IPC (Instructions
+Per Cycle) and maximum clock frequency, rather than simply
+reflecting the clock speed ratio.
+
+The value range is 1 to 1024, with higher values indicating
+higher performance. No normalization is required if the value
+falls within this 1 to 1024 range.
+
+If no 'capacity' value is set, the 'capacity' value for all CPU
+cores will be set to 1024. If even one 'capacity' value is set,
+the 'capacity' values for the remaining unset CPU cores will be
+set to the midpoint between the maximum and minimum values
+manually set.
+
+This value can only be set at boot time via
+.Xr loader.conf 5
+\&. After the system has booted, the value can only be viewed via
+.Xr sysctl 5
+; it cannot be modified.
+.It Va hw.coreindex.%d.performance
+This is a dynamic value representing the current processing
+capability of a given CPU core. A higher value is assigned to
+CPU cores capable of delivering higher performance at a given
+moment, taking thermal and power constraints into account.
+This value reflects current conditions rather than intrinsic
+capabilities such as IPC or maximum clock frequency. For
+instance, when using a driver like
+.Xr intelhfi 4
+, the value is dynamically updated based on data provided by
+the CPU itself.
+
+However, when using
+.Xr coreindex 4
+, it is not possible to monitor real-time thermal or power
+conditions and manually update the value accordingly.
+Therefore, the standard approach is to assign higher values
+to the CPU cores you wish to prioritize for active use.
+
+The value must be set within the range of 0 to 1024; no
+normalization is required.
+
+Values can be configured in advance via
+.Xr loader.conf 5
+or set after system startup using
+.Xr sysctl 8
+\&. Dynamic updates via
+.Xr sysctl 8
+are also supported.
+
+CPU cores for which no value is specified default to the
+maximum value of 1024.
+.It Va hw.coreindex.%d.efficiency
+This is a dynamic value representing the current power-saving
+metric of the target CPU core. A higher value is assigned to
+a CPU core that can operate in a power-saving mode at that
+specific moment, based on thermal and power considerations.
+This value reflects the conditions at that particular time
+and does not represent the target CPU core's base clock
+frequency or similar specifications. For instance, when using
+a driver like
+.Xr intelhfi 4
+, the value is dynamically updated based on data provided by
+the CPU itself.
+
+However, when using
+.Xr coreindex 4
+, it is not possible to monitor CPU thermal or power
+conditions and manually update the settings in real-time
+based on that information.
+Therefore, the standard approach is to assign higher values
+to the CPU cores you wish to prioritize for active use, while
+operating under the general premise of conserving power.
+
+The value must be set within the range of 0 to 1024; no
+normalization is required.
+
+Values can be configured in advance via
+.Xr loader.conf 5
+or set after system startup using
+.Xr sysctl 8
+\&. Dynamic updates via
+.Xr sysctl 8
+are also supported.
+
+CPU cores for which no value is specified default to the
+maximum value of 1024.
+.Sh SEE ALSO
+.Xr hmp 4 ,
+.Xr sched_ule 4 ,
+.Xr intelhfi 4 ,
+.Xr loader.conf 5 ,
+.Xr sysctl 8
+.Sh HISTORY
+The
+.Nm
+driver first appeared in FreeBSD 16.0.
+.Sh AUTHORS
+.An -nosplit
+The
+.Nm
+driver was written by
+.An Koine Yuusuke Aq Mt koinec@yahoo.co.jp .

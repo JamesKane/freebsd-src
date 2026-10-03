@@ -1449,6 +1449,7 @@ dev/cxgbe/cudbg/fastlz.c	optional cxgbe \
 	compile-with "${NORMAL_C} -I$S/dev/cxgbe"
 dev/cxgbe/cudbg/fastlz_api.c	optional cxgbe \
 	compile-with "${NORMAL_C} -I$S/dev/cxgbe"
+dev/coreindex/coreindex.c	optional coreindex
 t4fw_cfg.c		optional cxgbe					\
 	compile-with	"${AWK} -f $S/tools/fw_stub.awk t4fw_cfg.fw:t4fw_cfg t4fw_cfg_uwire.fw:t4fw_cfg_uwire t4fw.fw:t4fw -mt4fw_cfg -c${.TARGET}" \
 	no-ctfconvert no-implicit-rule before-depend local		\
@@ -4009,6 +4010,7 @@ kern/subr_filter.c		standard
 kern/subr_gtaskqueue.c		standard
 kern/subr_hash.c		standard
 kern/subr_hints.c		standard
+kern/subr_hmp.c			optional hmp
 kern/subr_kdb.c			standard
 kern/subr_kobj.c		standard
 kern/subr_lock.c		standard
