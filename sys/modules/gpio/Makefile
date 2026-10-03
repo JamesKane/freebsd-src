@@ -30,6 +30,10 @@ SUBDIR = gpiobus gpioiic gpioled gpiospi gpioths
 SUBDIR += gpiokeys gpiopps
 .endif
 
+.if ${MACHINE_CPUARCH} == "aarch64"
+SUBDIR += cdns_gpio
+.endif
+
 .if ${MACHINE_CPUARCH} == "aarch64" || ${MACHINE_CPUARCH} == "amd64" || ${MACHINE_CPUARCH} == "i386"
 SUBDIR += gpioaei
 .endif
