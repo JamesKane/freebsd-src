@@ -33,6 +33,7 @@
  * SUCH DAMAGE.
  */
 
+#include "opt_acpi.h"
 #include "opt_platform.h"
 
 #include <sys/param.h>
@@ -58,6 +59,11 @@
 #include <dev/fdt/fdt_common.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#endif
+
+#ifdef DEV_ACPI
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
 #endif
 
 #include "iommu.h"
@@ -330,6 +336,53 @@ iommu_get_ctx_ofw(device_t dev, int channel)
 }
 #endif
 
+#ifdef DEV_ACPI
+static ACPI_STATUS
+iommu_reserve_pci_window(ACPI_RESOURCE *res, void *arg)
+{
+	struct iommu_domain *iodom;
+	ACPI_RESOURCE_ADDRESS64 a;
+
+	iodom = arg;
+	if (ACPI_FAILURE(AcpiResourceToAddress64(res, &a)) ||
+	    a.ResourceType != ACPI_MEMORY_RANGE ||
+	    a.Address.AddressLength == 0)
+		return (AE_OK);
+	/* At its bus addresses, those of DMA. */
+	if (iommu_gas_reserve_region_extend(iodom,
+	    trunc_page(a.Address.Minimum),
+	    round_page(a.Address.Maximum + 1)) != 0)
+		printf("iommu: cannot reserve PCI window %#jx-%#jx\n",
+		    (uintmax_t)a.Address.Minimum,
+		    (uintmax_t)a.Address.Maximum);
+	return (AE_OK);
+}
+
+/*
+ * Keep a PCI device's DMA addresses out of its host bridge's windows, as
+ * Linux does: the fabric routes a request to one of them to the device
+ * there (peer to peer), not upstream to the IOMMU and memory.
+ */
+static void
+iommu_reserve_pci_windows(struct iommu_domain *iodom, device_t dev)
+{
+	devclass_t acpi_dc;
+	device_t parent;
+	ACPI_HANDLE h;
+
+	if (device_get_devclass(device_get_parent(dev)) !=
+	    devclass_find("pci"))
+		return;
+	acpi_dc = devclass_find("acpi");
+	while ((parent = device_get_parent(dev)) != NULL &&
+	    device_get_devclass(parent) != acpi_dc)
+		dev = parent;
+	if (parent == NULL || (h = acpi_get_handle(dev)) == NULL)
+		return;
+	(void)AcpiWalkResources(h, "_CRS", iommu_reserve_pci_window, iodom);
+}
+#endif
+
 struct iommu_ctx *
 iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
     uint16_t rid, bool disabled, bool rmrr)
@@ -355,6 +408,9 @@ iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
 	iodom = iommu_domain_alloc(iommu);
 	if (iodom == NULL)
 		return (NULL);
+#ifdef DEV_ACPI
+	iommu_reserve_pci_windows(iodom, requester);
+#endif
 
 	ioctx = iommu_ctx_alloc(requester, iodom, disabled);
 	if (ioctx == NULL) {
