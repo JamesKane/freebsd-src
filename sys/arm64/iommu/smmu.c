@@ -1646,11 +1646,13 @@ smmu_asid_free(struct smmu_softc *sc, int asid)
 /*
  * Device interface.
  */
+static int smmu_init_bypass_sids(struct smmu_softc *sc);
+
 int
 smmu_attach(device_t dev)
 {
 	struct smmu_softc *sc;
-	int error;
+	int enable, error;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
@@ -1686,12 +1688,67 @@ smmu_attach(device_t dev)
 		return (ENXIO);
 	}
 
+	error = smmu_init_bypass_sids(sc);
+	if (error)
+		return (ENXIO);
+
+	/*
+	 * Without DMA translation (hw.iommu.dma), no device gets a context
+	 * and stream table entry: enabled, the SMMU would fault all their
+	 * traffic.  Leave it as the firmware did.
+	 */
+	enable = 0;
+	TUNABLE_INT_FETCH("hw.iommu.dma", &enable);
+	if (!enable) {
+		device_printf(dev, "left disabled: DMA translation is off "
+		    "(hw.iommu.dma)\n");
+		return (0);
+	}
+
 	error = smmu_reset(sc);
 	if (error) {
 		device_printf(dev, "Couldn't reset SMMU.\n");
 		return (ENXIO);
 	}
 
+	return (0);
+}
+
+/*
+ * Bypass the streams that must keep reaching memory from before the OS
+ * (IORT RMR: a firmware framebuffer, say), before the SMMU is enabled, so
+ * their traffic goes on untranslated rather than faulting.  The SMMU is
+ * still disabled: the entries are written directly, the reset that follows
+ * invalidating any cached configuration.
+ */
+static int
+smmu_init_bypass_sids(struct smmu_softc *sc)
+{
+	uint64_t *ste;
+	u_int i, sid;
+	int error;
+
+	for (i = 0; i < sc->nbypass_sids; i++) {
+		sid = sc->bypass_sids[i];
+		if ((uint64_t)sid >= (1ul << sc->sid_bits)) {
+			device_printf(sc->dev, "reserved stream %#x out of "
+			    "range\n", sid);
+			continue;
+		}
+		if (sc->features & SMMU_FEATURE_2_LVL_STREAM_TABLE) {
+			error = smmu_init_l1_entry(sc, sid);
+			if (error)
+				return (error);
+		}
+		ste = smmu_get_ste_addr(sc, sid);
+		ste[1] = STE1_SHCFG_INCOMING | STE1_EATS_FULLATS;
+		ste[2] = ste[3] = ste[4] = ste[5] = ste[6] = ste[7] = 0;
+		ste[0] = STE0_VALID | STE0_CONFIG_BYPASS;
+		if (bootverbose)
+			device_printf(sc->dev, "stream %#x bypassed "
+			    "(reserved memory)\n", sid);
+	}
+	dsb(sy);
 	return (0);
 }
 

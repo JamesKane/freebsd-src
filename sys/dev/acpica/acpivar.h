@@ -640,6 +640,11 @@ int	acpi_iort_map_named_msi(const char *devname, u_int rid, u_int *xref,
 	    u_int *devid);
 int	acpi_iort_map_named_smmuv3(const char *devname, u_int rid,
 	    uint64_t *xref, u_int *devid);
+int	acpi_iort_named_foreach_sid(uint64_t smmu_base,
+	    void (*cb)(void *arg, u_int sid, const char *name), void *arg);
+int	acpi_iort_rmr_foreach(uint64_t smmu_base,
+	    void (*cb)(void *arg, u_int sid, uint64_t base, uint64_t length,
+	    bool remap), void *arg);
 int	acpi_iort_named_smmu(ACPI_HANDLE dev, u_int index, uint64_t *base,
 	    bool *shared, u_int *sids, u_int *nsids);
 int	acpi_iort_lookup_its_from_iwb(device_t dev, int *its_id);

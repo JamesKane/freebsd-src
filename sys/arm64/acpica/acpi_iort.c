@@ -83,6 +83,17 @@ struct iort_named_component
 	char                    DeviceName[32]; /* Path of namespace object */
 };
 
+/*
+ * A reserved memory range node (RMR): memory its streams (its mappings)
+ * use from before the OS, which they must keep reaching.
+ */
+struct iort_rmr
+{
+	UINT32			Flags;
+	u_int			ndesc;
+	ACPI_IORT_RMR_DESC	*desc;
+};
+
 struct iort_iwb
 {
     UINT64 BaseAddress;
@@ -115,6 +126,7 @@ struct iort_node {
 		ACPI_IORT_SMMU_V3		smmu_v3;
 		struct iort_named_component	named_comp;
 		struct iort_iwb			iwb;
+		struct iort_rmr			rmr;
 	} data;
 };
 
@@ -124,6 +136,7 @@ static TAILQ_HEAD(, iort_node) smmu_nodes = TAILQ_HEAD_INITIALIZER(smmu_nodes);
 static TAILQ_HEAD(, iort_node) its_groups = TAILQ_HEAD_INITIALIZER(its_groups);
 static TAILQ_HEAD(, iort_node) named_nodes = TAILQ_HEAD_INITIALIZER(named_nodes);
 static TAILQ_HEAD(, iort_node) iwb_nodes = TAILQ_HEAD_INITIALIZER(iwb_nodes);
+static TAILQ_HEAD(, iort_node) rmr_nodes = TAILQ_HEAD_INITIALIZER(rmr_nodes);
 
 static int
 iort_entry_get_id_mapping_index(struct iort_node *node)
@@ -338,6 +351,7 @@ iort_add_nodes(ACPI_IORT_NODE *node_entry, u_int node_offset)
 	ACPI_IORT_NAMED_COMPONENT *named_comp;
 	struct iort_node *node;
 	ACPI_IORT_IWB *iwb;
+	ACPI_IORT_RMR *rmr;
 
 	node = malloc(sizeof(*node), M_DEVBUF, M_WAITOK | M_ZERO);
 	node->type =  node_entry->Type;
@@ -393,6 +407,18 @@ iort_add_nodes(ACPI_IORT_NODE *node_entry, u_int node_offset)
 
 		iort_copy_data(node, node_entry);
 		TAILQ_INSERT_TAIL(&iwb_nodes, node, next);
+		break;
+	case ACPI_IORT_NODE_RMR:
+		rmr = (ACPI_IORT_RMR *)node_entry->NodeData;
+		node->data.rmr.Flags = rmr->Flags;
+		node->data.rmr.ndesc = rmr->RmrCount;
+		node->data.rmr.desc = malloc(sizeof(ACPI_IORT_RMR_DESC) *
+		    rmr->RmrCount, M_DEVBUF, M_WAITOK | M_ZERO);
+		memcpy(node->data.rmr.desc,
+		    ACPI_ADD_PTR(ACPI_IORT_RMR_DESC, node_entry, rmr->RmrOffset),
+		    sizeof(ACPI_IORT_RMR_DESC) * rmr->RmrCount);
+		iort_copy_data(node, node_entry);
+		TAILQ_INSERT_TAIL(&rmr_nodes, node, next);
 		break;
 	default:
 		printf("ACPI: IORT: Dropping unhandled type %u\n",
@@ -458,6 +484,9 @@ iort_post_process_mappings(void)
 	TAILQ_FOREACH(node, &iwb_nodes, next)
 		for (i = 0; i < node->nentries; i++)
 			iort_resolve_node(&node->entries.mappings[i], FALSE);
+	TAILQ_FOREACH(node, &rmr_nodes, next)
+		for (i = 0; i < node->nentries; i++)
+			iort_resolve_node(&node->entries.mappings[i], TRUE);
 }
 
 /*
@@ -745,6 +774,81 @@ acpi_iort_map_named_smmuv3(const char *devname, u_int rid, uint64_t *xref,
  * The named component node for an ACPI device.  Names are compared as
  * handles: IORT paths are not padded like ACPICA's full names.
  */
+/*
+ * The streams of named components (ACPI devices) behind the SMMUv3 at
+ * smmu_base, through cb.  Returns how many.
+ */
+int
+acpi_iort_named_foreach_sid(uint64_t smmu_base,
+    void (*cb)(void *arg, u_int sid, const char *name), void *arg)
+{
+	struct iort_map_entry *entry;
+	struct iort_node *node;
+	u_int i, sid, last;
+	int n;
+
+	n = 0;
+	TAILQ_FOREACH(node, &named_nodes, next) {
+		for (i = 0; i < node->nentries; i++) {
+			entry = &node->entries.mappings[i];
+			if (entry->out_node == NULL ||
+			    entry->out_node->type != ACPI_IORT_NODE_SMMU_V3 ||
+			    entry->out_node->data.smmu_v3.BaseAddress !=
+			    smmu_base)
+				continue;
+			last = entry->outbase;
+			if ((entry->flags & ACPI_IORT_ID_SINGLE_MAPPING) == 0)
+				last += entry->end - entry->base;
+			for (sid = entry->outbase; sid <= last; sid++) {
+				cb(arg, sid, node->data.named_comp.DeviceName);
+				n++;
+			}
+		}
+	}
+	return (n);
+}
+
+/*
+ * The reserved memory ranges (IORT RMR) of the SMMUv3 at smmu_base: each
+ * range with each stream ID it is for, through cb.  Returns how many.
+ */
+int
+acpi_iort_rmr_foreach(uint64_t smmu_base,
+    void (*cb)(void *arg, u_int sid, uint64_t base, uint64_t length,
+    bool remap), void *arg)
+{
+	struct iort_map_entry *entry;
+	struct iort_node *node;
+	u_int d, i, sid, last;
+	int n;
+
+	n = 0;
+	TAILQ_FOREACH(node, &rmr_nodes, next) {
+		for (i = 0; i < node->nentries; i++) {
+			entry = &node->entries.mappings[i];
+			if (entry->out_node == NULL ||
+			    entry->out_node->type != ACPI_IORT_NODE_SMMU_V3 ||
+			    entry->out_node->data.smmu_v3.BaseAddress !=
+			    smmu_base)
+				continue;
+			last = entry->outbase;
+			if ((entry->flags & ACPI_IORT_ID_SINGLE_MAPPING) == 0)
+				last += entry->end - entry->base;
+			for (sid = entry->outbase; sid <= last; sid++) {
+				for (d = 0; d < node->data.rmr.ndesc; d++) {
+					cb(arg, sid,
+					    node->data.rmr.desc[d].BaseAddress,
+					    node->data.rmr.desc[d].Length,
+					    (node->data.rmr.Flags &
+					    ACPI_IORT_RMR_REMAP_PERMITTED) != 0);
+					n++;
+				}
+			}
+		}
+	}
+	return (n);
+}
+
 static struct iort_node *
 iort_named_comp_lookup(ACPI_HANDLE dev)
 {

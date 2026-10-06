@@ -164,6 +164,13 @@ struct smmu_softc {
 	uint32_t		options;
 #define	SMMU_OPT_MSIPOLL			(1 << 0)
 
+	/*
+	 * Streams that must keep reaching memory from before the OS
+	 * (IORT RMR): bypassed from the start.
+	 */
+	u_int			*bypass_sids;
+	u_int			nbypass_sids;
+
 	struct smmu_queue cmdq;
 	struct smmu_queue evtq;
 	struct smmu_queue priq;

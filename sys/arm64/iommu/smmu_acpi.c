@@ -39,6 +39,7 @@
 #include <sys/kernel.h>
 #include <sys/rman.h>
 #include <sys/tree.h>
+#include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
@@ -182,6 +183,61 @@ smmu_acpi_probe(device_t dev)
 	return (BUS_PROBE_NOWILDCARD);
 }
 
+/*
+ * Named components' (ACPI devices') streams bypass the SMMU until their
+ * drivers take them (hw.smmu.bypass_named, default 1): no driver for an
+ * ACPI device asks for IOMMU translation yet, and their traffic (a display
+ * controller's scanout, say) would fault otherwise.
+ */
+static int smmu_acpi_bypass_named = 1;
+SYSCTL_NODE(_hw, OID_AUTO, smmu, CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "SMMU");
+SYSCTL_INT(_hw_smmu, OID_AUTO, bypass_named, CTLFLAG_RDTUN,
+    &smmu_acpi_bypass_named, 0,
+    "ACPI devices' streams bypass the SMMU (no translation)");
+
+static void
+smmu_acpi_bypass_sid(struct smmu_softc *sc, u_int sid)
+{
+	u_int *sids;
+	u_int i;
+
+	for (i = 0; i < sc->nbypass_sids; i++)
+		if (sc->bypass_sids[i] == sid)
+			return;
+	sids = malloc(sizeof(*sids) * (sc->nbypass_sids + 1), M_DEVBUF,
+	    M_WAITOK);
+	if (sc->nbypass_sids > 0)
+		memcpy(sids, sc->bypass_sids, sizeof(*sids) * sc->nbypass_sids);
+	sids[sc->nbypass_sids] = sid;
+	free(sc->bypass_sids, M_DEVBUF);
+	sc->bypass_sids = sids;
+	sc->nbypass_sids++;
+}
+
+static void
+smmu_acpi_named_sid(void *arg, u_int sid, const char *name)
+{
+	struct smmu_softc *sc = arg;
+
+	smmu_acpi_bypass_sid(sc, sid);
+	if (bootverbose)
+		device_printf(sc->dev, "stream %#x: %s\n", sid, name);
+}
+
+/* A stream with reserved memory. */
+static void
+smmu_acpi_rmr_sid(void *arg, u_int sid, uint64_t base, uint64_t length,
+    bool remap)
+{
+	struct smmu_softc *sc = arg;
+
+	smmu_acpi_bypass_sid(sc, sid);
+	if (bootverbose)
+		device_printf(sc->dev, "stream %#x: reserved %#jx-%#jx%s\n",
+		    sid, (uintmax_t)base, (uintmax_t)(base + length - 1),
+		    remap ? "" : " (no remapping)");
+}
+
 static int
 smmu_acpi_attach(device_t dev)
 {
@@ -239,6 +295,17 @@ smmu_acpi_attach(device_t dev)
 		err = ENXIO;
 		goto error;
 	}
+
+	/* Streams with reserved memory (IORT RMR), bypassed from the start. */
+	acpi_iort_rmr_foreach(bus_get_resource_start(dev, SYS_RES_MEMORY, 0),
+	    smmu_acpi_rmr_sid, sc);
+	if (smmu_acpi_bypass_named)
+		acpi_iort_named_foreach_sid(bus_get_resource_start(dev,
+		    SYS_RES_MEMORY, 0), smmu_acpi_named_sid, sc);
+	if (sc->nbypass_sids > 0)
+		device_printf(dev, "%u streams bypassed (reserved memory%s)\n",
+		    sc->nbypass_sids, smmu_acpi_bypass_named ?
+		    ", ACPI devices" : "");
 
 	err = smmu_attach(dev);
 	if (err != 0)
