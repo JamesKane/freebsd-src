@@ -922,6 +922,46 @@ acpi_iort_named_smmu(ACPI_HANDLE dev, u_int index, uint64_t *base,
 	return (total > cap ? E2BIG : 0);
 }
 
+/*
+ * The stream IDs a named component uses on the SMMUv3 at smmu_base.  On entry
+ * *nsids is the size of sids; on return it is the number of stream IDs, which
+ * may be larger (E2BIG).  ENOENT: the component maps none to that SMMU.
+ */
+int
+acpi_iort_named_smmuv3(ACPI_HANDLE dev, uint64_t smmu_base, u_int *sids,
+    u_int *nsids)
+{
+	struct iort_map_entry *e;
+	struct iort_node *node;
+	u_int cap, i, sid, last, total;
+
+	node = iort_named_comp_lookup(dev);
+	if (node == NULL)
+		return (ENOENT);
+	cap = *nsids;
+	total = 0;
+	for (i = 0; i < node->nentries; i++) {
+		e = &node->entries.mappings[i];
+		if (e->out_node == NULL ||
+		    e->out_node->type != ACPI_IORT_NODE_SMMU_V3 ||
+		    e->out_node->data.smmu_v3.BaseAddress != smmu_base)
+			continue;
+		last = e->outbase;
+		if ((e->flags & ACPI_IORT_ID_SINGLE_MAPPING) == 0)
+			last += e->end - e->base;
+		for (sid = e->outbase; sid <= last && sid >= e->outbase;
+		    sid++) {
+			if (total < cap)
+				sids[total] = sid;
+			total++;
+		}
+	}
+	*nsids = total;
+	if (total == 0)
+		return (ENOENT);
+	return (total > cap ? E2BIG : 0);
+}
+
 static struct iort_node *
 acpi_iort_lookup_iwb_node(device_t bus, device_t child)
 {

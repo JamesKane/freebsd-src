@@ -647,6 +647,8 @@ int	acpi_iort_rmr_foreach(uint64_t smmu_base,
 	    bool remap), void *arg);
 int	acpi_iort_named_smmu(ACPI_HANDLE dev, u_int index, uint64_t *base,
 	    bool *shared, u_int *sids, u_int *nsids);
+int	acpi_iort_named_smmuv3(ACPI_HANDLE dev, uint64_t smmu_base,
+	    u_int *sids, u_int *nsids);
 int	acpi_iort_lookup_its_from_iwb(device_t dev, int *its_id);
 device_t	acpi_iort_get_iwb_dev(int iwb_id);
 int	acpi_iort_lookup_pci_id(device_t bus, device_t child, uintptr_t *devid);
