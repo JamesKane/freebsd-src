@@ -39,5 +39,7 @@
 int iommu_unregister(struct iommu_unit *unit);
 int iommu_register(struct iommu_unit *unit);
 struct iommu_ctx * iommu_get_ctx_ofw(device_t dev, int channel);
+int iommu_map_identity(struct iommu_domain *iodom, vm_paddr_t base,
+    vm_size_t size);
 
 #endif /* _ARM64_IOMMU_IOMMU_H_ */

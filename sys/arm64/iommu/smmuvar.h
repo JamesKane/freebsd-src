@@ -59,13 +59,17 @@ struct smmu_domain {
 	uint16_t			asid;
 };
 
+#define	SMMU_CTX_MAXSIDS	8
+
 struct smmu_ctx {
 	struct iommu_ctx		ioctx;
 	struct smmu_domain		*domain;
 	LIST_ENTRY(smmu_ctx)		next;
 	device_t			dev;
 	bool				bypass;
-	int				sid;
+	int				sid;	/* The first of sids */
+	u_int				nsids;
+	u_int				sids[SMMU_CTX_MAXSIDS];
 	uint16_t			vendor;
 	uint16_t			device;
 };
@@ -191,6 +195,8 @@ int smmu_attach(device_t dev);
 int smmu_detach(device_t dev);
 
 struct smmu_ctx *smmu_ctx_lookup_by_sid(device_t dev, u_int sid);
+int smmu_acpi_named_sids(device_t dev, device_t child, u_int *sids,
+    u_int *nsids);
 bool smmu_quirks_check(device_t dev, u_int sid, uint8_t event_id,
     uintptr_t input_addr);
 

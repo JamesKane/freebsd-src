@@ -48,6 +48,7 @@
 #include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <vm/vm.h>
+#include <vm/vm_page.h>
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -339,6 +340,38 @@ iommu_get_ctx_ofw(device_t dev, int channel)
 	return (ioctx);
 }
 #endif
+
+/*
+ * Map [base, base + size) at its own address, as memory a device used before
+ * the OS (IORT RMR) must stay where it is: before the device is translated.
+ */
+int
+iommu_map_identity(struct iommu_domain *iodom, vm_paddr_t base,
+    vm_size_t size)
+{
+	struct iommu_map_entry *entry;
+	vm_page_t *ma;
+	u_int i, n;
+	int error;
+
+	entry = iommu_gas_alloc_entry(iodom, IOMMU_PGF_WAITOK);
+	entry->start = trunc_page(base);
+	entry->end = round_page(base + size);
+	n = atop(entry->end - entry->start);
+	ma = malloc(sizeof(*ma) * n, M_TEMP, M_WAITOK);
+	for (i = 0; i < n; i++)
+		ma[i] = vm_page_getfake(entry->start + PAGE_SIZE * i,
+		    VM_MEMATTR_DEFAULT);
+	error = iommu_gas_map_region(iodom, entry,
+	    IOMMU_MAP_ENTRY_READ | IOMMU_MAP_ENTRY_WRITE,
+	    IOMMU_MF_CANWAIT | IOMMU_MF_RMRR, ma);
+	for (i = 0; i < n; i++)
+		vm_page_putfake(ma[i]);
+	free(ma, M_TEMP);
+	if (error != 0)
+		iommu_gas_free_entry(entry);
+	return (error);
+}
 
 #ifdef DEV_ACPI
 static ACPI_STATUS

@@ -253,19 +253,29 @@ iommu_instantiate_ctx(struct iommu_unit *unit, device_t dev, bool rmrr)
 	uint16_t rid;
 
 	error = iommu_get_requester(dev, &requester, &rid);
-	if (error != 0)
+	if (error == ENOTTY) {
+		/*
+		 * Not a PCI device, yet in an IOMMU's scope (iommu_find()):
+		 * a device the firmware tables name, as ACPI IORT's named
+		 * components on arm64.  It is its own requester, translated
+		 * if its IOMMU found it.
+		 */
+		requester = dev;
+		disabled = false;
+	} else if (error != 0)
 		return (NULL);
-
-	/*
-	 * If the user requested the IOMMU disabled for the device, we
-	 * cannot disable the IOMMU unit, due to possibility of other
-	 * devices on the same IOMMU unit still requiring translation.
-	 * Instead provide the identity mapping for the device
-	 * context.
-	 */
-	disabled = iommu_bus_dma_is_dev_disabled(pci_get_domain(requester),
-	    pci_get_bus(requester), pci_get_slot(requester), 
-	    pci_get_function(requester));
+	else {
+		/*
+		 * If the user requested the IOMMU disabled for the device,
+		 * we cannot disable the IOMMU unit, due to possibility of
+		 * other devices on the same IOMMU unit still requiring
+		 * translation.  Instead provide the identity mapping for
+		 * the device context.
+		 */
+		disabled = iommu_bus_dma_is_dev_disabled(
+		    pci_get_domain(requester), pci_get_bus(requester),
+		    pci_get_slot(requester), pci_get_function(requester));
+	}
 	ctx = iommu_get_ctx(unit, requester, rid, disabled, rmrr);
 	if (ctx == NULL)
 		return (NULL);

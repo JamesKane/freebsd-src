@@ -1975,6 +1975,66 @@ smmu_ctx_alloc(device_t dev, struct iommu_domain *iodom, device_t child,
 	return (&ctx->ioctx);
 }
 
+#ifdef DEV_ACPI
+struct smmu_rmr_arg {
+	struct smmu_ctx		*ctx;
+	uint64_t		mapped[8];
+	u_int			nmapped;
+	int			error;
+};
+
+static void
+smmu_ctx_rmr(void *arg, u_int sid, uint64_t base, uint64_t length,
+    bool remap __unused)
+{
+	struct smmu_rmr_arg *a;
+	u_int i;
+	int error;
+
+	a = arg;
+	for (i = 0; i < a->ctx->nsids && a->ctx->sids[i] != sid; i++)
+		;
+	if (i == a->ctx->nsids || a->error != 0)
+		return;
+	/* A region several of its streams share is mapped once. */
+	for (i = 0; i < a->nmapped && a->mapped[i] != base; i++)
+		;
+	if (i < a->nmapped)
+		return;
+	if (a->nmapped == nitems(a->mapped)) {
+		a->error = E2BIG;
+		return;
+	}
+	error = iommu_map_identity(&a->ctx->domain->iodom, base, length);
+	if (error != 0) {
+		a->error = error;
+		return;
+	}
+	a->mapped[a->nmapped++] = base;
+	if (bootverbose)
+		printf("%s: reserved %#jx-%#jx mapped at its address\n",
+		    device_get_nameunit(a->ctx->dev), (uintmax_t)base,
+		    (uintmax_t)(base + length - 1));
+}
+
+/*
+ * Map the reserved memory (IORT RMR) of the context's streams at its own
+ * address, before they are translated: a display controller still scans
+ * out the firmware's framebuffer.
+ */
+static int
+smmu_ctx_map_rmr(device_t dev, struct smmu_ctx *ctx)
+{
+	struct smmu_rmr_arg a;
+
+	memset(&a, 0, sizeof(a));
+	a.ctx = ctx;
+	acpi_iort_rmr_foreach(bus_get_resource_start(dev, SYS_RES_MEMORY, 0),
+	    smmu_ctx_rmr, &a);
+	return (a.error);
+}
+#endif
+
 static int
 smmu_ctx_init(device_t dev, struct iommu_ctx *ioctx)
 {
@@ -1982,7 +2042,7 @@ smmu_ctx_init(device_t dev, struct iommu_ctx *ioctx)
 	struct iommu_domain *iodom;
 	struct smmu_softc *sc;
 	struct smmu_ctx *ctx;
-	u_int sid;
+	u_int i, sid;
 	int err;
 
 	ctx = (struct smmu_ctx *)ioctx;
@@ -2002,11 +2062,28 @@ smmu_ctx_init(device_t dev, struct iommu_ctx *ioctx)
 		ctx->vendor = pci_get_vendor(ctx->dev);
 		ctx->device = pci_get_device(ctx->dev);
 	}
-
-	if (sc->features & SMMU_FEATURE_2_LVL_STREAM_TABLE) {
-		err = smmu_init_l1_entry(sc, ctx->sid);
-		if (err)
+#ifdef DEV_ACPI
+	else {
+		/* An ACPI device: its streams, and its reserved memory. */
+		ctx->nsids = nitems(ctx->sids);
+		err = smmu_acpi_named_sids(dev, ctx->dev, ctx->sids,
+		    &ctx->nsids);
+		if (err == 0) {
+			ctx->sid = ctx->sids[0];
+			err = smmu_ctx_map_rmr(dev, ctx);
+		} else if (err == ENOENT)
+			ctx->nsids = 0;	/* FDT's: iommu_get_ctx_ofw() */
+		if (err != 0 && err != ENOENT) {
+			device_printf(dev, "%s: streams: error %d\n",
+			    device_get_nameunit(ctx->dev), err);
+			ctx->nsids = 0;
 			return (err);
+		}
+	}
+#endif
+	if (ctx->nsids == 0) {
+		ctx->sids[0] = ctx->sid;
+		ctx->nsids = 1;
 	}
 
 	/*
@@ -2016,7 +2093,14 @@ smmu_ctx_init(device_t dev, struct iommu_ctx *ioctx)
 	 * 0x600 sata
 	 */
 
-	smmu_init_ste(sc, domain->cd, ctx->sid, ctx->bypass);
+	for (i = 0; i < ctx->nsids; i++) {
+		if (sc->features & SMMU_FEATURE_2_LVL_STREAM_TABLE) {
+			err = smmu_init_l1_entry(sc, ctx->sids[i]);
+			if (err)
+				return (err);
+		}
+		smmu_init_ste(sc, domain->cd, ctx->sids[i], ctx->bypass);
+	}
 
 	if (is_pci_device((ctx->dev)))
 		if (iommu_is_buswide_ctx(iodom->iommu, pci_get_bus(ctx->dev)))
@@ -2030,13 +2114,23 @@ smmu_ctx_free(device_t dev, struct iommu_ctx *ioctx)
 {
 	struct smmu_softc *sc;
 	struct smmu_ctx *ctx;
+	u_int i, j;
 
 	IOMMU_ASSERT_LOCKED(ioctx->domain->iommu);
 
 	sc = device_get_softc(dev);
 	ctx = (struct smmu_ctx *)ioctx;
 
-	smmu_deinit_ste(sc, ctx->sid);
+	/* A reserved stream goes back to bypassing, as at attach. */
+	for (i = 0; i < ctx->nsids; i++) {
+		for (j = 0; j < sc->nbypass_sids &&
+		    sc->bypass_sids[j] != ctx->sids[i]; j++)
+			;
+		if (j < sc->nbypass_sids)
+			smmu_init_ste(sc, NULL, ctx->sids[i], true);
+		else
+			smmu_deinit_ste(sc, ctx->sids[i]);
+	}
 
 	LIST_REMOVE(ctx, next);
 
@@ -2050,6 +2144,7 @@ smmu_ctx_lookup_by_sid(device_t dev, u_int sid)
 	struct smmu_domain *domain;
 	struct smmu_unit *unit;
 	struct smmu_ctx *ctx;
+	u_int i;
 
 	sc = device_get_softc(dev);
 
@@ -2057,8 +2152,9 @@ smmu_ctx_lookup_by_sid(device_t dev, u_int sid)
 
 	LIST_FOREACH(domain, &unit->domain_list, next) {
 		LIST_FOREACH(ctx, &domain->ctx_list, next) {
-			if (ctx->sid == sid)
-				return (ctx);
+			for (i = 0; i < ctx->nsids; i++)
+				if (ctx->sids[i] == sid)
+					return (ctx);
 		}
 	}
 
@@ -2103,6 +2199,19 @@ smmu_find(device_t dev, device_t child)
 	int err;
 
 	sc = device_get_softc(dev);
+
+	if (!is_pci_device(child)) {
+#ifdef DEV_ACPI
+		u_int nsids;
+
+		/* An ACPI device with streams here (sizing only). */
+		nsids = 0;
+		err = smmu_acpi_named_sids(dev, child, NULL, &nsids);
+		return (err == 0 || err == E2BIG ? 0 : ENOENT);
+#else
+		return (ENOENT);
+#endif
+	}
 
 	err = smmu_pci_get_sid(child, &xref, NULL);
 	if (err)

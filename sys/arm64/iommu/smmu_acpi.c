@@ -195,6 +195,22 @@ SYSCTL_INT(_hw_smmu, OID_AUTO, bypass_named, CTLFLAG_RDTUN,
     &smmu_acpi_bypass_named, 0,
     "ACPI devices' streams bypass the SMMU (no translation)");
 
+/*
+ * The stream IDs of an ACPI device (IORT named component) on the SMMU dev,
+ * as smmu_find() and smmu_ctx_init() take it: ENOENT if its streams bypass
+ * the SMMU (hw.smmu.bypass_named) or it has none there.
+ */
+int
+smmu_acpi_named_sids(device_t dev, device_t child, u_int *sids, u_int *nsids)
+{
+	ACPI_HANDLE h;
+
+	if (smmu_acpi_bypass_named || (h = acpi_get_handle(child)) == NULL)
+		return (ENOENT);
+	return (acpi_iort_named_smmuv3(h,
+	    bus_get_resource_start(dev, SYS_RES_MEMORY, 0), sids, nsids));
+}
+
 static void
 smmu_acpi_bypass_sid(struct smmu_softc *sc, u_int sid)
 {

@@ -33,6 +33,7 @@
 
 #include <sys/cdefs.h>
 #include "opt_acpi.h"
+#include "opt_iommu.h"
 
 #include <sys/param.h>
 #include <sys/eventhandler.h>
@@ -77,6 +78,9 @@
 #include <dev/acpica/acpiio.h>
 
 #include <dev/pci/pcivar.h>
+#if defined(IOMMU) && defined(__aarch64__)
+#include <dev/iommu/iommu.h>
+#endif
 
 #include <vm/vm_param.h>
 
@@ -134,6 +138,9 @@ static bus_child_deleted_t	acpi_child_deleted;
 static bus_read_ivar_t		acpi_read_ivar;
 static bus_write_ivar_t		acpi_write_ivar;
 static bus_get_resource_list_t	acpi_get_rlist;
+#if defined(IOMMU) && defined(__aarch64__)
+static bus_get_dma_tag_t	acpi_get_dma_tag;
+#endif
 static bus_get_rman_t		acpi_get_rman;
 static bus_set_resource_t	acpi_set_resource;
 static bus_alloc_resource_t	acpi_alloc_resource;
@@ -223,6 +230,9 @@ static device_method_t acpi_methods[] = {
     DEVMETHOD(bus_read_ivar,		acpi_read_ivar),
     DEVMETHOD(bus_write_ivar,		acpi_write_ivar),
     DEVMETHOD(bus_get_resource_list,	acpi_get_rlist),
+#if defined(IOMMU) && defined(__aarch64__)
+    DEVMETHOD(bus_get_dma_tag,		acpi_get_dma_tag),
+#endif
     DEVMETHOD(bus_get_rman,		acpi_get_rman),
     DEVMETHOD(bus_set_resource,		acpi_set_resource),
     DEVMETHOD(bus_get_resource,		bus_generic_rl_get_resource),
@@ -1269,6 +1279,24 @@ acpi_write_ivar(device_t dev, device_t child, int index, uintptr_t value)
 
     return (0);
 }
+
+#if defined(IOMMU) && defined(__aarch64__)
+/*
+ * A device the IORT maps to an SMMU (a named component) does DMA through
+ * it, translated when DMA translation is on (hw.iommu.dma) and its streams
+ * do not bypass the SMMU (hw.smmu.bypass_named).
+ */
+static bus_dma_tag_t
+acpi_get_dma_tag(device_t bus, device_t child)
+{
+	bus_dma_tag_t tag;
+
+	if (device_get_parent(child) == bus &&
+	    (tag = iommu_get_dma_tag(bus, child)) != NULL)
+		return (tag);
+	return (bus_generic_get_dma_tag(bus, child));
+}
+#endif
 
 /*
  * Handle child resource allocation/removal
