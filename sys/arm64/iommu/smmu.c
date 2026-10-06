@@ -548,7 +548,12 @@ smmu_cmdq_enqueue_cmd(struct smmu_softc *sc, struct smmu_cmdq_entry *entry)
 	    Q_IDX(cmdq, cmdq->lc.prod) * CMDQ_ENTRY_DWORDS * 8);
 	memcpy(entry_addr, cmd, CMDQ_ENTRY_DWORDS * 8);
 
-	/* Increment prod index. */
+	/*
+	 * Increment prod index.  The command must be visible to the SMMU
+	 * before the index publishes it: else it may read the slot's old
+	 * command, from the queue's last lap, in its place.
+	 */
+	wmb();
 	cmdq->lc.prod = smmu_q_inc_prod(cmdq);
 	bus_write_4(sc->res[0], cmdq->prod_off, cmdq->lc.prod);
 
@@ -567,82 +572,106 @@ smmu_poll_until_consumed(struct smmu_softc *sc, struct smmu_queue *q)
 	}
 }
 
+/*
+ * Wait for the CMD_SYNC that made the producer index prod to be consumed,
+ * polling the consumer index (into a copy of the queue's indices: other
+ * CPUs use the queue meanwhile).
+ */
 static void
-smmu_sync_wait_poll(struct smmu_softc *sc, struct smmu_queue *q)
+smmu_sync_wait_poll(struct smmu_softc *sc, struct smmu_queue *q,
+    uint32_t prod)
 {
+	struct smmu_queue lq;
 	sbintime_t start;
-	int prod;
 
-	prod = q->lc.prod;
-
+	lq = *q;
 	start = getsbinuptime();
 	do {
-		if (smmu_q_consumed(q, prod))
+		lq.lc.cons = bus_read_4(sc->res[0], q->cons_off);
+		if (smmu_q_consumed(&lq, prod))
 			return;
 		if ((sc->features & SMMU_FEATURE_SEV) != 0)
 			wfe();
 		else
-			DELAY(100);
-
-		q->lc.cons = bus_read_4(sc->res[0], q->cons_off);
+			cpu_spinwait();
 	} while ((getsbinuptime() - start) < SBT_1S);
 
-	if (!smmu_q_consumed(q, prod))
-		device_printf(sc->dev, "Failed to sync\n");
+	device_printf(sc->dev, "Failed to sync\n");
 }
 
+/*
+ * Wait for the CMD_SYNC in slot to complete: its MSI write clears it.  Spin,
+ * as Linux does: a sync takes a microsecond or so, and every DMA map and
+ * unmap waits for one (DELAY(100) held a NIC to a few MB/s).
+ */
 static void
-smmu_sync_wait_msi(struct smmu_softc *sc, struct smmu_queue *q)
+smmu_sync_wait_msi(struct smmu_softc *sc, uint32_t *slot)
 {
 	sbintime_t start;
-	uint32_t *base;
-	int prod;
-
-	prod = q->lc.prod;
-
-	/* Wait for the sync completion. */
-	base = (void *)((uint64_t)q->vaddr +
-	    Q_IDX(q, prod) * CMDQ_ENTRY_DWORDS * 8);
 
 	start = getsbinuptime();
 	do {
-		if (atomic_load_32(base) == 0) {
+		if (atomic_load_32(slot) == 0) {
 			/* MSI write completed. */
 			return;
 		}
-		DELAY(100);
+		cpu_spinwait();
 	} while ((getsbinuptime() - start) < SBT_1S);
 
-	if (atomic_load_32(base) != 0)
+	if (atomic_load_32(slot) != 0)
 		device_printf(sc->dev, "Failed to sync\n");
 }
 
+/*
+ * Issue a CMD_SYNC and wait for it, and so for the commands before it.  The
+ * slot it takes, which its MSI write (when MSI-polling) clears, is chosen
+ * under the lock that orders the queue: other CPUs enqueue meanwhile, and a
+ * sync waiting on another's slot would return early, its invalidations not
+ * done, or have the SMMU clear another's command.
+ */
 static int
 smmu_sync(struct smmu_softc *sc)
 {
-	struct smmu_cmdq_entry cmd;
+	uint64_t cmd[CMDQ_ENTRY_DWORDS];
+	struct smmu_cmdq_entry entry;
 	struct smmu_queue *q;
-	int prod;
+	uint32_t *slot;
+	uint32_t prod;
 	bool msipoll;
 
 	q = &sc->cmdq;
-	prod = q->lc.prod;
-
 	msipoll = ((sc->options & SMMU_OPT_MSIPOLL) != 0);
 
-	/* Enqueue sync command. */
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.opcode = CMD_SYNC;
-	if (msipoll) {
-		cmd.sync.msiaddr = q->paddr +
-		    Q_IDX(q, prod) * CMDQ_ENTRY_DWORDS * 8;
-	}
-	smmu_cmdq_enqueue_cmd(sc, &cmd);
+	memset(&entry, 0, sizeof(entry));
+	entry.opcode = CMD_SYNC;
+
+	SMMU_LOCK(sc);
+
+	/* Ensure that a space is available. */
+	do {
+		q->lc.cons = bus_read_4(sc->res[0], q->cons_off);
+	} while (smmu_q_has_space(q) == 0);
+
+	slot = (void *)((uint64_t)q->vaddr +
+	    Q_IDX(q, q->lc.prod) * CMDQ_ENTRY_DWORDS * 8);
+	if (msipoll)
+		entry.sync.msiaddr = q->paddr +
+		    Q_IDX(q, q->lc.prod) * CMDQ_ENTRY_DWORDS * 8;
+	make_cmd(sc, cmd, &entry);
+	memcpy(slot, cmd, CMDQ_ENTRY_DWORDS * 8);
+
+	/* As in smmu_cmdq_enqueue_cmd(): the command before its index. */
+	wmb();
+	q->lc.prod = smmu_q_inc_prod(q);
+	prod = q->lc.prod;
+	bus_write_4(sc->res[0], q->prod_off, prod);
+
+	SMMU_UNLOCK(sc);
 
 	if (msipoll)
-		smmu_sync_wait_msi(sc, q);
+		smmu_sync_wait_msi(sc, slot);
 	else
-		smmu_sync_wait_poll(sc, q);
+		smmu_sync_wait_poll(sc, q, prod);
 
 	return (0);
 }
