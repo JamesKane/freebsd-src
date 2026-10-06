@@ -53,6 +53,7 @@ struct platform_device {
 	const struct platform_device_id *id_entry;
 
 	struct list_head	lkpi_link;	/* LinuxKPI private */
+	bool			lkpi_deferred;	/* LinuxKPI private */
 };
 
 struct platform_device_info {

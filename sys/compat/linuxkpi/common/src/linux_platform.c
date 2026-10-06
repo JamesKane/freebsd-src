@@ -99,6 +99,7 @@ static void
 lkpi_platform_unbind(struct platform_device *pdev)
 {
 	lkpi_devres_release_free_list(&pdev->dev);
+	dev_set_drvdata(&pdev->dev, NULL);
 	pdev->dev.driver = NULL;
 	pdev->id_entry = NULL;
 }
@@ -111,6 +112,7 @@ lkpi_platform_probe(struct platform_device *pdev,
 
 	pdev->dev.driver = &pdrv->driver;
 	error = pdrv->probe != NULL ? pdrv->probe(pdev) : 0;
+	pdev->lkpi_deferred = error == -EPROBE_DEFER;
 	if (error != 0) {
 		if (error != -ENODEV && error != -ENXIO &&
 		    error != -EPROBE_DEFER)
@@ -132,26 +134,46 @@ lkpi_platform_remove(struct platform_device *pdev)
 	lkpi_platform_unbind(pdev);
 }
 
+static bool
+lkpi_platform_try(struct platform_device *pdev, struct platform_driver *pdrv)
+{
+	return (pdev->dev.driver == NULL && lkpi_platform_match(pdev, pdrv) &&
+	    lkpi_platform_probe(pdev, pdrv) == 0);
+}
+
 /*
- * Bind every unbound device a driver matches.  A bound device may be what a
- * deferred probe was waiting for, so start again after each one.
+ * Bind what a new device or driver makes bindable, as Linux does: a new
+ * device tries the drivers, a new driver the unbound devices.  Then the
+ * probes that were deferred are tried again: a bound device may be what one
+ * was waiting for, so start again after each bind.  A probe that failed
+ * otherwise is not retried: probing again would find the device as the
+ * failed probe left it (panthor's GPU, with its clocks off).
  */
 static void
-lkpi_platform_probe_all(void)
+lkpi_platform_probe_all(struct platform_device *newdev,
+    struct platform_driver *newdrv)
 {
 	struct platform_device *pdev;
 	struct platform_driver *pdrv;
 
 	sx_assert(&lkpi_platform_lock, SA_XLOCKED);
-again:
 	list_for_each_entry(pdev, &lkpi_platform_devices, lkpi_link) {
-		if (pdev->dev.driver != NULL)
+		if (newdev != NULL && pdev != newdev)
 			continue;
 		list_for_each_entry(pdrv, &lkpi_platform_drivers, lkpi_link) {
-			if (lkpi_platform_match(pdev, pdrv) &&
-			    lkpi_platform_probe(pdev, pdrv) == 0)
-				goto again;
+			if (newdrv != NULL && pdrv != newdrv)
+				continue;
+			if (lkpi_platform_try(pdev, pdrv))
+				break;
 		}
+	}
+again:
+	list_for_each_entry(pdev, &lkpi_platform_devices, lkpi_link) {
+		if (!pdev->lkpi_deferred)
+			continue;
+		list_for_each_entry(pdrv, &lkpi_platform_drivers, lkpi_link)
+			if (lkpi_platform_try(pdev, pdrv))
+				goto again;
 	}
 }
 
@@ -162,7 +184,7 @@ platform_driver_register(struct platform_driver *pdrv)
 {
 	sx_xlock(&lkpi_platform_lock);
 	list_add_tail(&pdrv->lkpi_link, &lkpi_platform_drivers);
-	lkpi_platform_probe_all();
+	lkpi_platform_probe_all(NULL, pdrv);
 	sx_xunlock(&lkpi_platform_lock);
 	return (0);
 }
@@ -269,7 +291,7 @@ platform_device_add(struct platform_device *pdev)
 
 	sx_xlock(&lkpi_platform_lock);
 	list_add_tail(&pdev->lkpi_link, &lkpi_platform_devices);
-	lkpi_platform_probe_all();
+	lkpi_platform_probe_all(pdev, NULL);
 	sx_xunlock(&lkpi_platform_lock);
 	return (0);
 }
