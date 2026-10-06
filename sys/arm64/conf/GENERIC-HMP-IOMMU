@@ -1,0 +1,11 @@
+#
+# GENERIC-HMP-IOMMU -- GENERIC-HMP with the SMMUv3 (IOMMU): DMA through the
+# SMMUs IORT describes, translated for PCI devices; streams with reserved
+# memory (IORT RMR) bypassed.
+#
+
+include		GENERIC-HMP
+
+ident		GENERIC-HMP-IOMMU
+
+options 	IOMMU
