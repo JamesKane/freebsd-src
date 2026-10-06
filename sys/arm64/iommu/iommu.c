@@ -427,6 +427,10 @@ iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
 	struct iommu_domain *iodom;
 	struct iommu_ctx *ioctx;
 	int error;
+#ifdef DEV_ACPI
+	ACPI_HANDLE h;
+	int cca;
+#endif
 
 	/* As on x86, each context returned holds a reference. */
 	IOMMU_LOCK(iommu);
@@ -462,6 +466,16 @@ iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
 		return (NULL);
 	}
 	ioctx->refs = 1;
+#ifdef DEV_ACPI
+	/*
+	 * A device's DMA is cache-coherent if ACPI says so (_CCA); a PCI
+	 * device's taken to be, as before.
+	 */
+	if (!is_pci_device(requester) &&
+	    ((h = acpi_get_handle(requester)) == NULL ||
+	    ACPI_FAILURE(acpi_GetInteger(h, "_CCA", &cca)) || cca == 0))
+		ioctx->flags |= IOMMU_CTX_NONCOHERENT;
+#endif
 
 	return (ioctx);
 }

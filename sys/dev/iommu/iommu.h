@@ -141,6 +141,8 @@ struct iommu_ctx {
 #define	IOMMU_CTX_DISABLED	0x0002	/* Device is disabled, the
 					   ephemeral reference is kept
 					   to prevent context destruction */
+#define	IOMMU_CTX_NONCOHERENT	0x0004	/* Device does not snoop CPU
+					   caches: busdma syncs them */
 
 #define	IOMMU_DOMAIN_GAS_INITED		0x0001
 #define	IOMMU_DOMAIN_PGTBL_INITED	0x0002

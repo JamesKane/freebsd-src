@@ -480,6 +480,8 @@ iommu_bus_dmamap_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp)
 	}
 	IOMMU_DMAMAP_INIT(map);
 	TAILQ_INIT(&map->map_entries);
+	map->sync = map->sync_inline;
+	map->maxsync = nitems(map->sync_inline);
 	map->tag = tag;
 	map->locked = true;
 	map->cansleep = false;
@@ -504,6 +506,8 @@ iommu_bus_dmamap_destroy(bus_dma_tag_t dmat, bus_dmamap_t map1)
 			return (EBUSY);
 		}
 		IOMMU_DMAMAP_DESTROY(map);
+		if (map->sync != map->sync_inline)
+			free(map->sync, M_IOMMU_DMAMAP);
 		free(map, M_IOMMU_DMAMAP);
 	}
 	tag->map_count--;
@@ -661,6 +665,46 @@ iommu_bus_dmamap_load_something1(struct bus_dma_tag_iommu *tag,
 	return (error);
 }
 
+/*
+ * Note the physical ranges of a buffer a non-coherent device's map loads:
+ * the IOMMU hides them in its page tables, and syncs maintain the CPU
+ * caches by them.
+ */
+static int
+iommu_bus_dmamap_note_ranges(struct bus_dmamap_iommu *map, vm_page_t *ma,
+    int offset, bus_size_t buflen)
+{
+	struct iommu_sync_range *r, *n;
+	vm_paddr_t pa;
+	bus_size_t len;
+	u_int i;
+
+	for (i = 0; buflen > 0; i++, offset = 0, buflen -= len) {
+		pa = VM_PAGE_TO_PHYS(ma[i]) + offset;
+		len = MIN(buflen, PAGE_SIZE - offset);
+		r = map->nsync > 0 ? &map->sync[map->nsync - 1] : NULL;
+		if (r != NULL && r->pa + r->len == pa) {
+			r->len += len;
+			continue;
+		}
+		if (map->nsync == map->maxsync) {
+			n = malloc(sizeof(*n) * map->maxsync * 2,
+			    M_IOMMU_DMAMAP, M_NOWAIT);
+			if (n == NULL)
+				return (ENOMEM);
+			memcpy(n, map->sync, sizeof(*n) * map->nsync);
+			if (map->sync != map->sync_inline)
+				free(map->sync, M_IOMMU_DMAMAP);
+			map->sync = n;
+			map->maxsync *= 2;
+		}
+		map->sync[map->nsync].pa = pa;
+		map->sync[map->nsync].len = len;
+		map->nsync++;
+	}
+	return (0);
+}
+
 static int
 iommu_bus_dmamap_load_something(struct bus_dma_tag_iommu *tag,
     struct bus_dmamap_iommu *map, vm_page_t *ma, int offset, bus_size_t buflen,
@@ -669,15 +713,27 @@ iommu_bus_dmamap_load_something(struct bus_dma_tag_iommu *tag,
 	struct iommu_ctx *ctx;
 	struct iommu_domain *domain;
 	struct iommu_map_entries_tailq entries;
+	u_int nsync;
 	int error;
 
 	ctx = tag->ctx;
 	domain = ctx->domain;
 	atomic_add_long(&ctx->loads, 1);
 
+	nsync = map->nsync;
+	if ((ctx->flags & IOMMU_CTX_NONCOHERENT) != 0) {
+		error = iommu_bus_dmamap_note_ranges(map, ma, offset, buflen);
+		if (error != 0) {
+			map->nsync = nsync;
+			return (error);
+		}
+	}
+
 	TAILQ_INIT(&entries);
 	error = iommu_bus_dmamap_load_something1(tag, map, ma, offset,
 	    buflen, flags, segs, segp, &entries);
+	if (error != 0)
+		map->nsync = nsync;	/* A deferred load notes them again. */
 	if (error == 0) {
 		IOMMU_DMAMAP_LOCK(map);
 		TAILQ_CONCAT(&map->map_entries, &entries, dmamap_link);
@@ -892,6 +948,7 @@ iommu_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map1)
 	IOMMU_DMAMAP_LOCK(map);
 	TAILQ_CONCAT(&entries, &map->map_entries, dmamap_link);
 	IOMMU_DMAMAP_UNLOCK(map);
+	map->nsync = 0;
 #if defined(IOMMU_DOMAIN_UNLOAD_SLEEP)
 	IOMMU_DOMAIN_LOCK(domain);
 	TAILQ_CONCAT(&domain->unload_entries, &entries, dmamap_link);
@@ -906,13 +963,59 @@ iommu_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map1)
 #endif
 }
 
+#ifdef __aarch64__
+/*
+ * The CPU caches, for a device that does not snoop them, as Linux's
+ * arm64 DMA does: cleaned to the point of coherency before the device
+ * accesses memory, invalidated after it wrote.  Partial lines at the
+ * ends, which other data share, are cleaned too, not to lose it.
+ */
+static void
+iommu_bus_dmamap_sync_cache(struct bus_dmamap_iommu *map,
+    bus_dmasync_op_t op)
+{
+	struct iommu_sync_range *r;
+	vm_offset_t va, s, e;
+	u_int i;
+
+	for (i = 0; i < map->nsync; i++) {
+		r = &map->sync[i];
+		if (!PHYS_IN_DMAP(r->pa) || !PHYS_IN_DMAP(r->pa + r->len - 1))
+			continue;
+		va = (vm_offset_t)PHYS_TO_DMAP(r->pa);
+		if ((op & (BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE)) != 0)
+			cpu_dcache_wb_range((void *)va, r->len);
+		if ((op & BUS_DMASYNC_POSTREAD) != 0) {
+			s = roundup2(va, dcache_line_size);
+			e = rounddown2(va + r->len, dcache_line_size);
+			if (s > e) {
+				cpu_dcache_wbinv_range((void *)va, r->len);
+				continue;
+			}
+			if (s != va)
+				cpu_dcache_wbinv_range((void *)va, s - va);
+			if (e > s)
+				cpu_dcache_inv_range((void *)s, e - s);
+			if (va + r->len != e)
+				cpu_dcache_wbinv_range((void *)e,
+				    va + r->len - e);
+		}
+	}
+}
+#endif
+
 static void
 iommu_bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map1,
     bus_dmasync_op_t op)
 {
-	struct bus_dmamap_iommu *map __unused;
+	struct bus_dmamap_iommu *map;
 
 	map = (struct bus_dmamap_iommu *)map1;
+#ifdef __aarch64__
+	if (map != NULL &&
+	    (map->tag->ctx->flags & IOMMU_CTX_NONCOHERENT) != 0)
+		iommu_bus_dmamap_sync_cache(map, op);
+#endif
 	kmsan_bus_dmamap_sync(&map->kmsan_mem, op);
 }
 

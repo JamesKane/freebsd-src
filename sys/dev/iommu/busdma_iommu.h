@@ -42,9 +42,21 @@ struct bus_dma_tag_iommu {
 	bus_dma_segment_t *segments;
 };
 
+/* A physical range a map covers, for a non-coherent device's syncs. */
+struct iommu_sync_range {
+	vm_paddr_t	pa;
+	vm_size_t	len;
+};
+
+#define	IOMMU_DMAMAP_NSYNC	4
+
 struct bus_dmamap_iommu {
 	struct bus_dma_tag_iommu *tag;
 	struct memdesc mem;
+	struct iommu_sync_range *sync;	/* (IOMMU_CTX_NONCOHERENT) */
+	u_int nsync;
+	u_int maxsync;
+	struct iommu_sync_range sync_inline[IOMMU_DMAMAP_NSYNC];
 	bus_dmamap_callback_t *callback;
 	void *callback_arg;
 	struct mtx lock;
