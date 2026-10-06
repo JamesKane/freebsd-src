@@ -642,6 +642,38 @@ iommu_gas_free_region(struct iommu_map_entry *entry)
 	IOMMU_DOMAIN_UNLOCK(domain);
 }
 
+/*
+ * Release what a domain has reserved, for iommu_gas_fini_domain(): its
+ * reserved regions, and its RMRR regions, unmapped.
+ */
+void
+iommu_gas_free_reserved(struct iommu_domain *domain)
+{
+	struct iommu_map_entry *entry;
+
+	for (;;) {
+		IOMMU_DOMAIN_LOCK(domain);
+		RB_FOREACH(entry, iommu_gas_entries_tree, &domain->rb_root)
+			if ((entry->flags & IOMMU_MAP_ENTRY_PLACE) == 0)
+				break;
+		if (entry == NULL) {
+			IOMMU_DOMAIN_UNLOCK(domain);
+			return;
+		}
+		if ((entry->flags & IOMMU_MAP_ENTRY_RMRR) != 0) {
+			IOMMU_DOMAIN_UNLOCK(domain);
+			domain->ops->unmap(domain, entry, IOMMU_PGF_WAITOK);
+			iommu_gas_free_region(entry);
+		} else {
+			KASSERT((entry->flags & IOMMU_MAP_ENTRY_UNMAPPED) != 0,
+			    ("domain %p entry %p in use", domain, entry));
+			iommu_gas_rb_remove(domain, entry);
+			IOMMU_DOMAIN_UNLOCK(domain);
+		}
+		iommu_gas_free_entry(entry);
+	}
+}
+
 static struct iommu_map_entry *
 iommu_gas_remove_clip_left(struct iommu_domain *domain, iommu_gaddr_t start,
     iommu_gaddr_t end, struct iommu_map_entry **r)

@@ -152,6 +152,10 @@ iommu_domain_free(struct iommu_domain *iodom)
 
 	iommu = iodom->iommu;
 
+	/* Reserved and identity-mapped regions; unmapping may wait. */
+	if ((iodom->flags & IOMMU_DOMAIN_GAS_INITED) != 0)
+		iommu_gas_free_reserved(iodom);
+
 	IOMMU_LOCK(iommu);
 
 	if ((iodom->flags & IOMMU_DOMAIN_GAS_INITED) != 0) {
