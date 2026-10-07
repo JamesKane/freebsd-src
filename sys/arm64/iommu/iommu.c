@@ -420,6 +420,19 @@ iommu_reserve_pci_windows(struct iommu_domain *iodom, device_t dev)
 }
 #endif
 
+/*
+ * PCIe relaxed ordering lets a device's write pass its earlier writes: an
+ * NVMe controller's completion could then reach memory before the last of
+ * its data, and the buffer be unmapped, on the completion, under the data
+ * still on its way (a translation fault, the data lost).  Without an IOMMU
+ * the late data lands in the buffer all the same.  Seen on the CIX Sky1;
+ * hw.iommu.relaxed_ordering=1 keeps it.
+ */
+static int iommu_relaxed_ordering = 0;
+SYSCTL_INT(_hw_iommu, OID_AUTO, relaxed_ordering, CTLFLAG_RDTUN,
+    &iommu_relaxed_ordering, 0,
+    "Leave PCIe relaxed ordering enabled on devices the IOMMU translates");
+
 struct iommu_ctx *
 iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
     uint16_t rid, bool disabled, bool rmrr)
@@ -466,6 +479,15 @@ iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
 		return (NULL);
 	}
 	ioctx->refs = 1;
+
+	/* Translated, a PCIe device's writes keep their order. */
+	if (!disabled && !iommu_relaxed_ordering &&
+	    is_pci_device(requester) &&
+	    (pcie_adjust_config(requester, PCIER_DEVICE_CTL,
+	    PCIEM_CTL_RELAXED_ORD_ENABLE, 0, 2) &
+	    PCIEM_CTL_RELAXED_ORD_ENABLE) != 0)
+		device_printf(requester,
+		    "relaxed ordering disabled (IOMMU translation)\n");
 #ifdef DEV_ACPI
 	/*
 	 * A device's DMA is cache-coherent if ACPI says so (_CCA); a PCI
