@@ -80,6 +80,9 @@ struct kobject {
 };
 
 extern struct kobject *mm_kobj;
+/* Linux's /sys/kernel: sys.kernel. */
+extern struct kobject linux_kernel_kobj;
+#define	kernel_kobj	(&linux_kernel_kobj)
 
 struct attribute {
 	const char	*name;

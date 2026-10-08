@@ -467,9 +467,12 @@ sysfs_unmerge_group(struct kobject *kobj, const struct attribute_group *grp)
 static inline int
 sysfs_create_dir(struct kobject *kobj)
 {
+	extern struct sysctl_oid *linux_sysfs_root;
 	struct sysctl_oid *oid;
 
-	oid = SYSCTL_ADD_NODE(NULL, SYSCTL_CHILDREN(kobj->parent->oidp),
+	/* No parent: the top of sysfs, as Linux has it. */
+	oid = SYSCTL_ADD_NODE(NULL, SYSCTL_CHILDREN(kobj->parent != NULL ?
+	    kobj->parent->oidp : linux_sysfs_root),
 	    OID_AUTO, kobj->name, CTLFLAG_RD|CTLFLAG_MPSAFE, NULL, kobj->name);
 	if (!oid) {
 		return (-ENOMEM);

@@ -160,6 +160,9 @@ static cpumask_t **static_single_cpu_mask;
 static cpumask_t *static_single_cpu_mask_lcs;
 struct kobject linux_class_root;
 struct device linux_root_device;
+/* sysfs's root (sys.*), and Linux's /sys/kernel (kernel_kobj). */
+struct sysctl_oid *linux_sysfs_root;
+struct kobject linux_kernel_kobj;
 struct class linux_class_misc;
 struct list_head pci_drivers;
 struct list_head pci_devices;
@@ -2941,7 +2944,6 @@ lkpi_xen_pv_domain(void)
 static void
 linux_compat_init(void *arg)
 {
-	struct sysctl_oid *rootoid;
 	int i;
 
 #if defined(__i386__) || defined(__amd64__)
@@ -2983,17 +2985,23 @@ linux_compat_init(void *arg)
 #endif
 	rw_init(&linux_vma_lock, "lkpi-vma-lock");
 
-	rootoid = SYSCTL_ADD_ROOT_NODE(NULL,
+	linux_sysfs_root = SYSCTL_ADD_ROOT_NODE(NULL,
 	    OID_AUTO, "sys", CTLFLAG_RD|CTLFLAG_MPSAFE, NULL, "sys");
 	kobject_init(&linux_class_root, &linux_class_ktype);
 	kobject_set_name(&linux_class_root, "class");
-	linux_class_root.oidp = SYSCTL_ADD_NODE(NULL, SYSCTL_CHILDREN(rootoid),
-	    OID_AUTO, "class", CTLFLAG_RD|CTLFLAG_MPSAFE, NULL, "class");
+	linux_class_root.oidp = SYSCTL_ADD_NODE(NULL,
+	    SYSCTL_CHILDREN(linux_sysfs_root), OID_AUTO, "class",
+	    CTLFLAG_RD|CTLFLAG_MPSAFE, NULL, "class");
 	kobject_init(&linux_root_device.kobj, &linux_dev_ktype);
 	kobject_set_name(&linux_root_device.kobj, "device");
 	linux_root_device.kobj.oidp = SYSCTL_ADD_NODE(NULL,
-	    SYSCTL_CHILDREN(rootoid), OID_AUTO, "device",
+	    SYSCTL_CHILDREN(linux_sysfs_root), OID_AUTO, "device",
 	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "device");
+	kobject_init(&linux_kernel_kobj, &linux_class_ktype);
+	kobject_set_name(&linux_kernel_kobj, "kernel");
+	linux_kernel_kobj.oidp = SYSCTL_ADD_NODE(NULL,
+	    SYSCTL_CHILDREN(linux_sysfs_root), OID_AUTO, "kernel",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "kernel");
 	linux_root_device.bsddev = root_bus;
 	linux_class_misc.name = "misc";
 	class_register(&linux_class_misc);
@@ -3102,6 +3110,7 @@ linux_compat_uninit(void *arg)
 {
 	linux_kobject_kfree_name(&linux_class_root);
 	linux_kobject_kfree_name(&linux_root_device.kobj);
+	linux_kobject_kfree_name(&linux_kernel_kobj);
 	linux_kobject_kfree_name(&linux_class_misc.kobj);
 
 	free(static_single_cpu_mask_lcs, M_KMALLOC);
