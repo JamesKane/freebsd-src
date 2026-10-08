@@ -987,6 +987,16 @@ iommu_gas_reserve_region_extend(struct iommu_domain *domain,
 		KASSERT(next != NULL, ("domain %p with end %#jx has no entry "
 		    "after %#jx", domain, (uintmax_t)domain->end,
 		    (uintmax_t)start));
+		/*
+		 * Past an empty entry at start (the domain's first, at 0):
+		 * stepping to its end would not advance.
+		 */
+		if (next->end == start && next->start == start) {
+			next = RB_NEXT(iommu_gas_entries_tree, &domain->rb_root,
+			    next);
+			KASSERT(next != NULL, ("domain %p: no entry after the "
+			    "empty one at %#jx", domain, (uintmax_t)start));
+		}
 		entry_end = ummin(end, next->start);
 		prev = RB_PREV(iommu_gas_entries_tree, &domain->rb_root, next);
 		if (prev != NULL)
