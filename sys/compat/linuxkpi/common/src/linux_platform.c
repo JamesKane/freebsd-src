@@ -289,6 +289,17 @@ platform_device_add(struct platform_device *pdev)
 		return (error);
 	}
 
+	/*
+	 * Its sysfs node, as Linux's /sys/devices: under its parent's, or
+	 * sys.device, for the attributes and ksets drivers hang off it.  The
+	 * device's release removes it.
+	 */
+	dev->kobj.parent = dev->parent != NULL &&
+	    dev->parent->kobj.oidp != NULL ? &dev->parent->kobj :
+	    &linux_root_device.kobj;
+	if (sysfs_create_dir(&dev->kobj) != 0)
+		dev_warn(dev, "no sysfs node\n");
+
 	sx_xlock(&lkpi_platform_lock);
 	list_add_tail(&pdev->lkpi_link, &lkpi_platform_devices);
 	lkpi_platform_probe_all(pdev, NULL);
