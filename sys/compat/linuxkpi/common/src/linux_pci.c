@@ -1699,6 +1699,7 @@ struct linux_dma_obj {
 	size_t		size;
 	bus_dmamap_t	dmamap;
 	bus_dma_tag_t	dmat;
+	bus_dma_tag_t	own_dmat;	/* made for this mapping; destroyed */
 };
 
 static uma_zone_t linux_dma_trie_zone;
@@ -1766,7 +1767,7 @@ linux_dma_map_phys_common(struct device *dev, vm_paddr_t phys, size_t len,
 	if (bus_dma_id_mapped(dmat, phys, len))
 		return (phys);
 
-	obj = uma_zalloc(linux_dma_obj_zone, M_NOWAIT);
+	obj = uma_zalloc(linux_dma_obj_zone, M_NOWAIT | M_ZERO);
 	if (obj == NULL) {
 		return (0);
 	}
@@ -1890,6 +1891,8 @@ skip_sync:
 	bus_dmamap_destroy(obj->dmat, obj->dmamap);
 	DMA_PRIV_UNLOCK(priv);
 
+	if (obj->own_dmat != NULL)
+		bus_dma_tag_destroy(obj->own_dmat);
 	uma_zfree(linux_dma_obj_zone, obj);
 }
 #else
@@ -1905,6 +1908,42 @@ void
 linux_dma_unmap(struct device *dev, dma_addr_t dma_addr, size_t len)
 {
 	lkpi_dma_unmap(dev, dma_addr, len, DMA_NONE, 0);
+}
+
+/*
+ * Map coherent memory as Linux promises it: its DMA address, like its
+ * physical one, aligned to the smallest page order at least its size.  A
+ * translated address (behind an IOMMU) gets that alignment from a tag made
+ * for the mapping; firmware relies on it (Qualcomm's video codec takes a
+ * queue table only at an address aligned to its region).
+ */
+static dma_addr_t
+lkpi_dma_map_aligned(struct device *dev, vm_paddr_t phys, size_t size,
+    size_t align, bus_dma_tag_t parent)
+{
+	struct linux_dma_priv *priv;
+	struct linux_dma_obj *obj;
+	bus_dma_tag_t dmat;
+	dma_addr_t dma;
+
+	priv = dev->dma_priv;
+	if (align <= PAGE_SIZE || bus_dma_id_mapped(parent, phys, size))
+		return (linux_dma_map_phys_common(dev, phys, size, parent));
+	if (bus_dma_tag_create(parent, align, 0,
+	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL, size, 1, size,
+	    0, NULL, NULL, &dmat) != 0)
+		return (0);
+	dma = linux_dma_map_phys_common(dev, phys, size, dmat);
+	if (dma == 0) {
+		bus_dma_tag_destroy(dmat);
+		return (0);
+	}
+	DMA_PRIV_LOCK(priv);
+	obj = LINUX_DMA_PCTRIE_LOOKUP(&priv->ptree, dma);
+	if (obj != NULL)
+		obj->own_dmat = dmat;
+	DMA_PRIV_UNLOCK(priv);
+	return (dma);
 }
 
 void *
@@ -1932,8 +1971,8 @@ linux_dma_alloc_coherent(struct device *dev, size_t size,
 	mem = kmem_alloc_contig(size, flag & GFP_NATIVE_MASK, 0, high,
 	    align, 0, VM_MEMATTR_DEFAULT);
 	if (mem != NULL) {
-		*dma_handle = linux_dma_map_phys_common(dev, vtophys(mem), size,
-		    priv->dmat_coherent);
+		*dma_handle = lkpi_dma_map_aligned(dev, vtophys(mem), size,
+		    align, priv->dmat_coherent);
 		if (*dma_handle == 0) {
 			kmem_free(mem, size);
 			mem = NULL;
@@ -2037,7 +2076,8 @@ linuxkpi_dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *dma_
 	}
 
 	priv = dev->dma_priv;
-	*dma_handle = linux_dma_map_phys_common(dev, vtophys(mem), size, priv->dmat);
+	*dma_handle = lkpi_dma_map_aligned(dev, vtophys(mem), size, align,
+	    priv->dmat);
 	if (*dma_handle == 0) {
 		kmem_free(mem, size);
 		mem = NULL;
@@ -2057,8 +2097,9 @@ void *
 linuxkpi_dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
     gfp_t gfp, unsigned long attrs)
 {
+	/* Zeroed, as Linux's (it allocates coherent memory). */
 	return (linuxkpi_dma_alloc_noncoherent(dev, size, dma_handle,
-	    DMA_BIDIRECTIONAL, gfp));
+	    DMA_BIDIRECTIONAL, gfp | __GFP_ZERO));
 }
 
 void
