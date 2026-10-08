@@ -61,6 +61,9 @@ int	qcom_apps_smmu_map_at(struct qcom_apps_smmu_dom *d, uint64_t iova,
 	    vm_page_t *ma, u_int npages, u_int flags);
 void	qcom_apps_smmu_unmap_at(struct qcom_apps_smmu_dom *d, uint64_t iova,
 	    size_t size);
+uint32_t qcom_apps_smmu_fault(struct qcom_apps_smmu_dom *d, uint64_t *far,
+	    uint32_t *fsynr0, uint32_t *sid, bool clear);
+u_int	qcom_apps_smmu_bank(struct qcom_apps_smmu_dom *d);
 /* What an I/O address translates to, or 0. */
 vm_paddr_t qcom_apps_smmu_lookup(struct qcom_apps_smmu_dom *d,
 	    uint64_t iova);

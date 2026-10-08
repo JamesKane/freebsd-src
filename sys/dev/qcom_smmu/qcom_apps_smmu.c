@@ -114,6 +114,9 @@
 #define	CB_MAIR0		0x038
 #define	CB_MAIR1		0x03c
 #define	CB_FSR			0x058
+#define	CB_FAR			0x060
+#define	CB_FSYNR0		0x068
+#define	SMMU_CBFRSYNRA(n)	(0x1400 + 4 * (n))	/* in GR1 */
 #define	CB_TLBIASID		0x610
 #define	CB_TLBSYNC		0x7f0
 #define	CB_TLBSTATUS		0x7f4
@@ -482,6 +485,34 @@ vm_paddr_t
 qcom_apps_smmu_lookup(struct qcom_apps_smmu_dom *d, uint64_t iova)
 {
 	return (qcom_smmu_lookup(d->pt, iova));
+}
+
+/*
+ * The bank's fault syndrome: its status (0 if none), address, syndrome and
+ * the faulting stream; with clear, the status is cleared after.
+ */
+uint32_t
+qcom_apps_smmu_fault(struct qcom_apps_smmu_dom *d, uint64_t *far,
+    uint32_t *fsynr0, uint32_t *sid, bool clear)
+{
+	uint32_t fsr;
+
+	mtx_lock(&qcom_apps_smmu_mtx);
+	fsr = RD(CB(d->cb, CB_FSR));
+	*far = RD(CB(d->cb, CB_FAR)) |
+	    (uint64_t)RD(CB(d->cb, CB_FAR) + 4) << 32;
+	*fsynr0 = RD(CB(d->cb, CB_FSYNR0));
+	*sid = RD(SMMU_CBFRSYNRA(d->cb)) & 0xffff;
+	if (clear && fsr != 0)
+		WR(CB(d->cb, CB_FSR), fsr);
+	mtx_unlock(&qcom_apps_smmu_mtx);
+	return (fsr);
+}
+
+u_int
+qcom_apps_smmu_bank(struct qcom_apps_smmu_dom *d)
+{
+	return (d->cb);
 }
 
 /*

@@ -47,6 +47,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/queue.h>
+#include <sys/sbuf.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <sys/tree.h>
@@ -487,6 +488,38 @@ qcom_apps_iommu_test_sysctl(SYSCTL_HANDLER_ARGS)
 	return (qcom_apps_iommu_test(sc));
 }
 
+/* Each domain's bank and its fault state (then cleared), for debugging. */
+static int
+qcom_apps_iommu_faults_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct qcom_apps_iommu_softc *sc = arg1;
+	struct qcom_apps_iommu_domain *domain;
+	struct qcom_apps_iommu_ctx *ctx;
+	struct sbuf sb;
+	uint64_t far;
+	uint32_t fsr, fsynr0, sid;
+	int error;
+
+	sbuf_new_for_sysctl(&sb, NULL, 256, req);
+	IOMMU_LOCK(&sc->iommu);
+	LIST_FOREACH(domain, &sc->domains, next) {
+		if (domain->d == NULL)
+			continue;
+		ctx = LIST_FIRST(&domain->ctxs);
+		fsr = qcom_apps_smmu_fault(domain->d, &far, &fsynr0, &sid,
+		    true);
+		sbuf_printf(&sb, "%s: bank %u fsr %#x far %#jx fsynr0 %#x "
+		    "stream %#x\n", ctx != NULL ?
+		    device_get_nameunit(ctx->dev) : "?",
+		    qcom_apps_smmu_bank(domain->d), fsr, (uintmax_t)far,
+		    fsynr0, sid);
+	}
+	IOMMU_UNLOCK(&sc->iommu);
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+
 /* The device */
 
 static void
@@ -533,6 +566,11 @@ qcom_apps_iommu_attach(device_t dev)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
 	    qcom_apps_iommu_test_sysctl, "I",
 	    "Map a buffer through the video codec's streams and check it");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "faults",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    qcom_apps_iommu_faults_sysctl, "A",
+	    "Each domain's context bank fault state (read clears it)");
 	return (0);
 }
 
