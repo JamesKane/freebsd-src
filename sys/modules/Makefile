@@ -89,7 +89,7 @@ SUBDIR=	\
 	${_chromebook_platform} \
 	${_ciss} \
 	${_coreboot} \
-	coreindex \
+	${_coreindex} \
 	${_coretemp} \
 	${_cpsw} \
 	${_cpuctl} \
@@ -471,6 +471,11 @@ SUBDIR=	\
 
 .if ${MK_AUTOFS} != "no" || defined(ALL_MODULES)
 _autofs=	autofs
+.endif
+
+# coreindex(4) sets hmp(4)'s capacities: only for a kernel with it.
+.if ${KERN_OPTS:MHMP}
+_coreindex=	coreindex
 .endif
 
 .if ${MK_DTRACE} != "no" || defined(ALL_MODULES)
