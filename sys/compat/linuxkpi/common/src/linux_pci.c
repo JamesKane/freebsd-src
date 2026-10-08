@@ -1696,6 +1696,7 @@ CTASSERT(sizeof(dma_addr_t) <= sizeof(uint64_t));
 struct linux_dma_obj {
 	void		*vaddr;
 	uint64_t	dma_addr;
+	size_t		size;
 	bus_dmamap_t	dmamap;
 	bus_dma_tag_t	dmat;
 };
@@ -1797,6 +1798,7 @@ linux_dma_map_phys_common(struct device *dev, vm_paddr_t phys, size_t len,
 
 	KASSERT(++nseg == 1, ("More than one segment (nseg=%d)", nseg));
 	obj->dma_addr = seg.ds_addr;
+	obj->size = seg.ds_len;
 
 	error = LINUX_DMA_PCTRIE_INSERT(&priv->ptree, obj);
 	if (error != 0) {
@@ -2073,21 +2075,53 @@ linuxkpi_dma_sync(struct device *dev, dma_addr_t dma_addr, size_t size,
 {
 	struct linux_dma_priv *priv;
 	struct linux_dma_obj *obj;
+	bus_dmamap_t map;
+	bus_addr_t start, end;
+	int nseg;
 
 	priv = dev->dma_priv;
 
-	if (pctrie_is_empty(&priv->ptree))
-		return;
-
+	/*
+	 * As Linux: any range within a mapping, not only its start (drivers
+	 * sync a structure inside a mapped page).  The mapping is synced
+	 * whole.
+	 */
 	DMA_PRIV_LOCK(priv);
-	obj = LINUX_DMA_PCTRIE_LOOKUP(&priv->ptree, dma_addr);
-	if (obj == NULL) {
+	obj = LINUX_DMA_PCTRIE_LOOKUP_LE(&priv->ptree, dma_addr);
+	if (obj != NULL && dma_addr < obj->dma_addr + obj->size) {
+		bus_dmamap_sync(obj->dmat, obj->dmamap, op);
 		DMA_PRIV_UNLOCK(priv);
 		return;
 	}
-
-	bus_dmamap_sync(obj->dmat, obj->dmamap, op);
 	DMA_PRIV_UNLOCK(priv);
+
+	/*
+	 * Not a mapping we keep: a 1:1 one, which linux_dma_map_phys_common()
+	 * returns untracked.  Sync the range through a map of its own, for
+	 * what the tag needs: a device that does not snoop the CPU caches
+	 * needs them cleaned or invalidated.  Whole cache lines, or the map
+	 * would bounce: drivers sync a page table entry or a queue index.
+	 * The lines the range shares with other data are written back before
+	 * they are invalidated, as Linux does.  The map is ours alone: no
+	 * lock, and creating it may sleep.
+	 */
+	start = rounddown2(dma_addr, CACHE_LINE_SIZE);
+	end = roundup2(dma_addr + size, CACHE_LINE_SIZE);
+	if (size != 0 && bus_dma_id_mapped(priv->dmat, start, end - start) &&
+	    bus_dmamap_create(priv->dmat, 0, &map) == 0) {
+		nseg = -1;
+		if (_bus_dmamap_load_phys(priv->dmat, map, start, end - start,
+		    BUS_DMA_NOWAIT, NULL, &nseg) == 0) {
+			if ((op & (BUS_DMASYNC_PREREAD |
+			    BUS_DMASYNC_POSTREAD)) != 0 &&
+			    (start != dma_addr || end != dma_addr + size))
+				bus_dmamap_sync(priv->dmat, map,
+				    BUS_DMASYNC_PREWRITE);
+			bus_dmamap_sync(priv->dmat, map, op);
+			bus_dmamap_unload(priv->dmat, map);
+		}
+		bus_dmamap_destroy(priv->dmat, map);
+	}
 }
 
 void
@@ -2249,6 +2283,7 @@ dma_pool_obj_ctor(void *mem, int size, void *arg, int flags)
 	}
 	KASSERT(++nseg == 1, ("More than one segment (nseg=%d)", nseg));
 	obj->dma_addr = seg.ds_addr;
+	obj->size = seg.ds_len;
 
 	return (0);
 }
