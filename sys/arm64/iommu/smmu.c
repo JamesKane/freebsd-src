@@ -929,6 +929,13 @@ smmu_init_cd(struct smmu_softc *sc, struct smmu_domain *domain)
 	val |= CD0_EPD1; /* Disable TT1 */
 	val |= ((64 - sc->ias) << CD0_T0SZ_S);
 	val |= CD0_IPS_48BITS;
+	/*
+	 * Table walks: cacheable when the SMMU is coherent, as its stream
+	 * table and queues are.  Non-cacheable, every TLB miss walks DRAM:
+	 * ten times slower on a CIX Sky1's NPU.
+	 */
+	if ((sc->features & SMMU_FEATURE_COHERENCY) != 0)
+		val |= CD0_IR0_WBC_RWA | CD0_OR0_WBC_RWA | CD0_SH0_IS;
 
 	paddr = p->sp_l0_paddr & CD1_TTB0_M;
 	KASSERT(paddr == p->sp_l0_paddr, ("bad allocation 1"));
