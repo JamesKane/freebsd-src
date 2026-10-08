@@ -463,6 +463,15 @@ iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
 	if (iodom == NULL)
 		return (NULL);
 #ifdef DEV_ACPI
+	/*
+	 * A device's DMA is cache-coherent if ACPI says so (_CCA); a PCI
+	 * device's taken to be, as before.  Decided before anything is
+	 * mapped: the memory type of its mappings follows.
+	 */
+	if (!is_pci_device(requester) &&
+	    ((h = acpi_get_handle(requester)) == NULL ||
+	    ACPI_FAILURE(acpi_GetInteger(h, "_CCA", &cca)) || cca == 0))
+		iodom->flags |= IOMMU_DOMAIN_NONCOHERENT;
 	iommu_reserve_pci_windows(iodom, requester);
 #endif
 
@@ -488,16 +497,8 @@ iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
 	    PCIEM_CTL_RELAXED_ORD_ENABLE) != 0)
 		device_printf(requester,
 		    "relaxed ordering disabled (IOMMU translation)\n");
-#ifdef DEV_ACPI
-	/*
-	 * A device's DMA is cache-coherent if ACPI says so (_CCA); a PCI
-	 * device's taken to be, as before.
-	 */
-	if (!is_pci_device(requester) &&
-	    ((h = acpi_get_handle(requester)) == NULL ||
-	    ACPI_FAILURE(acpi_GetInteger(h, "_CCA", &cca)) || cca == 0))
+	if ((iodom->flags & IOMMU_DOMAIN_NONCOHERENT) != 0)
 		ioctx->flags |= IOMMU_CTX_NONCOHERENT;
-#endif
 
 	return (ioctx);
 }

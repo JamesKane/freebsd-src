@@ -150,6 +150,9 @@ struct iommu_ctx {
 						   page table */
 #define	IOMMU_DOMAIN_RMRR		0x0020	/* Domain contains RMRR entry,
 						   cannot be turned off */
+#define	IOMMU_DOMAIN_NONCOHERENT	0x0040	/* Its device does not snoop
+						   CPU caches: map memory
+						   non-cacheable */
 
 #define	IOMMU_LOCK(unit)		mtx_lock(&(unit)->lock)
 #define	IOMMU_UNLOCK(unit)		mtx_unlock(&(unit)->lock)

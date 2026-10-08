@@ -1829,7 +1829,9 @@ smmu_map(device_t dev, struct iommu_domain *iodom,
 
 	for (i = 0; size > 0; size -= PAGE_SIZE) {
 		pa = VM_PAGE_TO_PHYS(ma[i++]);
-		error = smmu_pmap_enter(&domain->p, va, pa, prot, 0);
+		error = smmu_pmap_enter(&domain->p, va, pa, prot,
+		    (iodom->flags & IOMMU_DOMAIN_NONCOHERENT) != 0 ?
+		    SMMU_PMAP_NONCOHERENT : 0);
 		if (error)
 			return (error);
 		smmu_tlbi_va(sc, va, domain->asid);

@@ -708,8 +708,18 @@ smmu_pmap_enter(struct smmu_pmap *pmap, vm_offset_t va, vm_paddr_t pa,
 	KASSERT(va < VM_MAXUSER_ADDRESS, ("wrong address space"));
 
 	va = trunc_page(va);
-	new_l3 = (pt_entry_t)(pa | ATTR_AF | ATTR_SH(ATTR_SH_IS) |
-	    ATTR_S1_IDX(VM_MEMATTR_DEVICE) | IOMMU_L3_PAGE);
+	/*
+	 * Normal memory, as Linux maps DMA: write-back for a coherent device,
+	 * non-cacheable for one that does not snoop.  (Device memory, which
+	 * this was, can be neither gathered nor reordered: a DMA engine runs
+	 * ten times slower through it.)
+	 */
+	if ((flags & SMMU_PMAP_NONCOHERENT) != 0)
+		new_l3 = (pt_entry_t)(pa | ATTR_AF | ATTR_SH(ATTR_SH_OS) |
+		    ATTR_S1_IDX(VM_MEMATTR_UNCACHEABLE) | IOMMU_L3_PAGE);
+	else
+		new_l3 = (pt_entry_t)(pa | ATTR_AF | ATTR_SH(ATTR_SH_IS) |
+		    ATTR_S1_IDX(VM_MEMATTR_WRITE_BACK) | IOMMU_L3_PAGE);
 	if ((prot & VM_PROT_WRITE) == 0)
 		new_l3 |= ATTR_S1_AP(ATTR_S1_AP_RO);
 	new_l3 |= ATTR_S1_XN; /* Execute never. */
