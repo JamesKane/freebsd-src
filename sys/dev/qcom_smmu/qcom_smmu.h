@@ -86,6 +86,11 @@ typedef void qcom_smmu_fault_fn(void *arg, const struct qcom_smmu_fault *f);
 
 /* Page table flags. */
 #define	QCOM_SMMU_PT_UPPER	0x01	/* the top of the address space */
+/*
+ * Map and unmap under a mutex, allocating tables without sleeping (map
+ * returns ENOMEM when none is free): for busdma, which maps with locks held.
+ */
+#define	QCOM_SMMU_PT_NOSLEEP	0x02
 
 struct qcom_smmu_pt *qcom_smmu_pt_create(u_int flags);
 void	qcom_smmu_pt_destroy(struct qcom_smmu_pt *pt);
@@ -94,6 +99,8 @@ int	qcom_smmu_map(struct qcom_smmu_pt *pt, uint64_t va,
 void	qcom_smmu_unmap(struct qcom_smmu_pt *pt, uint64_t va,
 	    size_t size);
 vm_paddr_t qcom_smmu_pt_root(struct qcom_smmu_pt *pt);
+/* What va translates to, or 0 if it is not mapped. */
+vm_paddr_t qcom_smmu_lookup(struct qcom_smmu_pt *pt, uint64_t va);
 
 int	qcom_smmu_cb_alloc(struct qcom_smmu *sc,
 	    struct qcom_smmu_pt *pt, struct qcom_smmu_cb **cbp);

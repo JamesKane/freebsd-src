@@ -53,6 +53,7 @@
 #include <sys/bus.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
+#include <sys/mutex.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/rman.h>
@@ -191,8 +192,10 @@ struct qcom_smmu_cb {
 
 struct qcom_smmu_pt {
 	struct sx		lock;
+	struct mtx		mtx;	/* QCOM_SMMU_PT_NOSLEEP's */
 	vm_page_t		root;
 	bool			upper;
+	bool			nosleep;
 };
 
 static MALLOC_DEFINE(M_QCOM_SMMU, "qcom_smmu",
@@ -278,11 +281,30 @@ pt_table(vm_page_t m)
 	return ((uint64_t *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m)));
 }
 
+/* NULL only with nosleep, when no page is free. */
 static vm_page_t
-pt_alloc_table(void)
+pt_alloc_table(bool nosleep)
 {
-	return (vm_page_alloc_noobj(VM_ALLOC_WAITOK | VM_ALLOC_WIRED |
-	    VM_ALLOC_ZERO));
+	return (vm_page_alloc_noobj((nosleep ? 0 : VM_ALLOC_WAITOK) |
+	    VM_ALLOC_WIRED | VM_ALLOC_ZERO));
+}
+
+static void
+pt_lock(struct qcom_smmu_pt *pt)
+{
+	if (pt->nosleep)
+		mtx_lock(&pt->mtx);
+	else
+		sx_xlock(&pt->lock);
+}
+
+static void
+pt_unlock(struct qcom_smmu_pt *pt)
+{
+	if (pt->nosleep)
+		mtx_unlock(&pt->mtx);
+	else
+		sx_xunlock(&pt->lock);
 }
 
 static void
@@ -310,8 +332,10 @@ qcom_smmu_pt_create(u_int flags)
 
 	pt = malloc(sizeof(*pt), M_QCOM_SMMU, M_WAITOK | M_ZERO);
 	sx_init(&pt->lock, "adreno smmu pt");
-	pt->root = pt_alloc_table();
+	mtx_init(&pt->mtx, "qcom smmu pt", NULL, MTX_DEF);
+	pt->root = pt_alloc_table(false);
 	pt->upper = (flags & QCOM_SMMU_PT_UPPER) != 0;
+	pt->nosleep = (flags & QCOM_SMMU_PT_NOSLEEP) != 0;
 	return (pt);
 }
 
@@ -322,6 +346,7 @@ qcom_smmu_pt_destroy(struct qcom_smmu_pt *pt)
 		return;
 	pt_free_table(pt_table(pt->root), 0);
 	sx_destroy(&pt->lock);
+	mtx_destroy(&pt->mtx);
 	free(pt, M_QCOM_SMMU);
 }
 
@@ -339,14 +364,18 @@ pt_lookup(struct qcom_smmu_pt *pt, uint64_t va, bool alloc)
 	vm_page_t m;
 	int lvl;
 
-	sx_assert(&pt->lock, SA_XLOCKED);
+	if (pt->nosleep)
+		mtx_assert(&pt->mtx, MA_OWNED);
+	else
+		sx_assert(&pt->lock, SA_XLOCKED);
 	table = pt_table(pt->root);
 	for (lvl = 0; lvl < PT_LEVELS - 1; lvl++) {
 		e = &table[PT_INDEX(va, lvl)];
 		if ((*e & PT_DESC) != PT_DESC) {
 			if (!alloc)
 				return (NULL);
-			m = pt_alloc_table();
+			if ((m = pt_alloc_table(pt->nosleep)) == NULL)
+				return (NULL);
 			/* The walker is coherent: order the zeroing first. */
 			dsb(ishst);
 			*e = VM_PAGE_TO_PHYS(m) | PT_DESC;
@@ -376,6 +405,7 @@ qcom_smmu_map(struct qcom_smmu_pt *pt, uint64_t va,
 {
 	uint64_t attr, *e;
 	size_t done;
+	int error;
 
 	if (((va | pa | size) & PAGE_MASK) != 0 || !pt_range_ok(pt, va, size))
 		return (EINVAL);
@@ -393,20 +423,25 @@ qcom_smmu_map(struct qcom_smmu_pt *pt, uint64_t va,
 	attr |= ATTR_S1_IDX((flags & QCOM_SMMU_UNCACHED) != 0 ?
 	    VM_MEMATTR_UNCACHEABLE : VM_MEMATTR_WRITE_BACK);
 
-	sx_xlock(&pt->lock);
+	error = 0;
+	pt_lock(pt);
 	for (done = 0; done < size; done += PAGE_SIZE) {
 		e = pt_lookup(pt, va + done, true);
-		if ((*e & PT_DESC) == PT_DESC)
+		if (e == NULL) {
+			error = ENOMEM;
 			break;
+		}
+		if ((*e & PT_DESC) == PT_DESC) {
+			error = EEXIST;
+			break;
+		}
 		*e = (pa + done) | attr;
 	}
 	dsb(ishst);
-	sx_xunlock(&pt->lock);
-	if (done < size) {
+	pt_unlock(pt);
+	if (error != 0 && done > 0)
 		qcom_smmu_unmap(pt, va, done);
-		return (EEXIST);
-	}
-	return (0);
+	return (error);
 }
 
 void
@@ -422,14 +457,30 @@ qcom_smmu_unmap(struct qcom_smmu_pt *pt, uint64_t va,
 		    (uintmax_t)va, size));
 		return;
 	}
-	sx_xlock(&pt->lock);
+	pt_lock(pt);
 	for (done = 0; done < size; done += PAGE_SIZE) {
 		e = pt_lookup(pt, va + done, false);
 		if (e != NULL)
 			*e = 0;
 	}
 	dsb(ishst);
-	sx_xunlock(&pt->lock);
+	pt_unlock(pt);
+}
+
+vm_paddr_t
+qcom_smmu_lookup(struct qcom_smmu_pt *pt, uint64_t va)
+{
+	uint64_t *e;
+	vm_paddr_t pa;
+
+	if (!pt_range_ok(pt, trunc_page(va), PAGE_SIZE))
+		return (0);
+	pt_lock(pt);
+	e = pt_lookup(pt, trunc_page(va), false);
+	pa = e != NULL && (*e & PT_DESC) == PT_DESC ?
+	    (*e & PT_ADDR_MASK) | (va & PAGE_MASK) : 0;
+	pt_unlock(pt);
+	return (pa);
 }
 
 /* Context banks. */
