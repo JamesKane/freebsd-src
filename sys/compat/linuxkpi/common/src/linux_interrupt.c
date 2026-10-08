@@ -33,11 +33,15 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/proc.h>
 #include <sys/rman.h>
 #include <sys/interrupt.h>
 
 struct irq_ent {
 	struct list_head	links;
+	struct list_head	all;	/* lkpi_irq_all */
 	struct device	*dev;
 	struct resource	*res;
 	void		*arg;
@@ -45,7 +49,16 @@ struct irq_ent {
 	irqreturn_t	(*thread_handler)(int, void *);
 	void		*tag;
 	unsigned int	irq;
+	bool		masked;	/* disable_irq_nosync() from its handler */
 };
+
+/*
+ * Every requested IRQ, for disable_irq_nosync() from an interrupt handler,
+ * where neither the devices' sx lock nor tearing the handler down may sleep.
+ */
+static struct mtx lkpi_irq_all_mtx;
+MTX_SYSINIT(lkpi_irq_all, &lkpi_irq_all_mtx, "lkpi irqs", MTX_DEF);
+static LIST_HEAD(lkpi_irq_all);
 
 /* The PCI or platform device an IRQ number belongs to. */
 static struct device *
@@ -139,6 +152,9 @@ lkpi_irq_release(struct device *dev, struct irq_ent *irqe)
 		bus_release_resource(dev->bsddev, SYS_RES_IRQ,
 		    rman_get_rid(irqe->res), irqe->res);
 	list_del(&irqe->links);
+	mtx_lock(&lkpi_irq_all_mtx);
+	list_del(&irqe->all);
+	mtx_unlock(&lkpi_irq_all_mtx);
 }
 
 static void
@@ -199,6 +215,9 @@ lkpi_request_irq(struct device *xdev, unsigned int irq,
 			goto errout;
 	}
 	list_add(&irqe->links, &dev->irqents);
+	mtx_lock(&lkpi_irq_all_mtx);
+	list_add(&irqe->all, &lkpi_irq_all);
+	mtx_unlock(&lkpi_irq_all_mtx);
 	if (xdev != NULL)
 		devres_add(xdev, irqe);
 
@@ -219,6 +238,16 @@ lkpi_enable_irq(unsigned int irq)
 	struct irq_ent *irqe;
 	struct device *dev;
 
+	/* Masked by its handler: still set up, so just unmasked. */
+	mtx_lock(&lkpi_irq_all_mtx);
+	list_for_each_entry(irqe, &lkpi_irq_all, all)
+		if (irqe->irq == irq && irqe->masked) {
+			irqe->masked = false;
+			mtx_unlock(&lkpi_irq_all_mtx);
+			return (0);
+		}
+	mtx_unlock(&lkpi_irq_all_mtx);
+
 	dev = lkpi_find_irq_dev(irq);
 	if (dev == NULL)
 		return -EINVAL;
@@ -234,6 +263,23 @@ lkpi_disable_irq(unsigned int irq)
 {
 	struct irq_ent *irqe;
 	struct device *dev;
+
+	/*
+	 * From an interrupt handler (Linux's threaded drivers' primary
+	 * handlers call disable_irq_nosync()): the interrupt thread keeps its
+	 * source masked until it returns, and runs the threaded handler,
+	 * which enables it again, before then.  So only note it.
+	 */
+	if ((curthread->td_pflags & TDP_ITHREAD) != 0) {
+		mtx_lock(&lkpi_irq_all_mtx);
+		list_for_each_entry(irqe, &lkpi_irq_all, all)
+			if (irqe->irq == irq) {
+				irqe->masked = true;
+				break;
+			}
+		mtx_unlock(&lkpi_irq_all_mtx);
+		return;
+	}
 
 	dev = lkpi_find_irq_dev(irq);
 	if (dev == NULL)
