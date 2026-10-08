@@ -833,6 +833,7 @@ dev/qcom_glink/qcom_socinfo.c			optional qcom_glink acpi
 dev/qcom_pmic_glink/qcom_pmic_glink.c		optional qcom_pmic_glink qcom_glink acpi
 dev/qcom_rpmh/qcom_rpmh.c			optional qcom_rpmh qcom_cmd_db acpi
 dev/qcom_gpucc/qcom_gpucc.c			optional qcom_gpucc
+dev/qcom_videocc/qcom_videocc.c			optional qcom_videocc acpi qcom_rpmh
 dev/qcom_scm/qcom_scm.c				optional qcom_scm acpi | qcom_scm fdt
 dev/qcom_smmu/qcom_apps_smmu.c		optional qcom_smmu acpi
 dev/qcom_smmu/qcom_smmu.c			optional qcom_smmu acpi

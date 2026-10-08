@@ -357,6 +357,7 @@ SUBDIR=	\
 	${_qcom_scm} \
 	${_qcom_smmu} \
 	${_qcom_tsens} \
+	${_qcom_videocc} \
 	${_qlxge} \
 	${_qlxgb} \
 	${_qlxgbe} \
@@ -777,6 +778,7 @@ _qcom_gpucc=	qcom_gpucc
 _qcom_scm=	qcom_scm
 _qcom_smmu=	qcom_smmu
 _qcom_tsens=	qcom_tsens
+_qcom_videocc=	qcom_videocc
 _tcx=		tcx
 _hyperv=  hyperv
 _vf_i2c=	vf_i2c
