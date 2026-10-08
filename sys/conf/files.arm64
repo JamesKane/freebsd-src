@@ -835,6 +835,7 @@ dev/qcom_rpmh/qcom_rpmh.c			optional qcom_rpmh qcom_cmd_db acpi
 dev/qcom_gpucc/qcom_gpucc.c			optional qcom_gpucc
 dev/qcom_videocc/qcom_videocc.c			optional qcom_videocc acpi qcom_rpmh
 dev/qcom_scm/qcom_scm.c				optional qcom_scm acpi | qcom_scm fdt
+dev/qcom_smmu/qcom_apps_iommu.c		optional qcom_smmu iommu acpi
 dev/qcom_smmu/qcom_apps_smmu.c		optional qcom_smmu acpi
 dev/qcom_smmu/qcom_smmu.c			optional qcom_smmu acpi
 dev/qcom_tsens/qcom_tsens.c			optional qcom_tsens acpi | qcom_tsens fdt

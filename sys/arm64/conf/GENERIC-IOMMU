@@ -1,0 +1,12 @@
+#
+# GENERIC-IOMMU -- GENERIC with iommu(4): DMA through the SMMUs IORT
+# describes (SMMUv3), and through the Qualcomm apps SMMU for the devices
+# whose drivers claim it (qcom_apps_iommu: the SC8280XP's video codec).
+# Devices nothing claims are not translated.
+#
+
+include		GENERIC
+
+ident		GENERIC-IOMMU
+
+options 	IOMMU
