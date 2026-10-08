@@ -133,12 +133,16 @@ static const struct qcom_apps_smmu_soc qcom_apps_smmu_socs[] = {
 };
 
 struct qcom_apps_smmu_dom {
-	uint16_t		sid;
+	uint16_t		sid;	/* the first stream's */
 	uint16_t		mask;
+	u_int			nstreams;
+	uint16_t		sids[QCOM_APPS_SMMU_MAXSTREAMS];
+	uint16_t		masks[QCOM_APPS_SMMU_MAXSTREAMS];
+	u_int			smrs[QCOM_APPS_SMMU_MAXSTREAMS];
 	u_int			cb;
 	struct qcom_smmu_pt	*pt;
 	vm_paddr_t		l1;	/* the walk's first table */
-	vmem_t			*iova;	/* the I/O addresses free */
+	vmem_t			*iova;	/* the I/O addresses free, or NULL */
 };
 
 static struct mtx qcom_apps_smmu_mtx;
@@ -167,17 +171,30 @@ qcom_apps_smmu_find_soc(void)
 #define	WR(off, v)	(qcom_apps_smmu_regs[(off) / 4] = (v))
 #define	CB(cb, reg)	(qcom_apps_smmu_cbbase + (cb) * 0x1000 + (reg))
 
-/* Set up a translating bank for the stream, or find the one it has. */
+/* Banks this driver set up and let go: free to set up again. */
+static uint32_t qcom_apps_smmu_freed[8];
+
+/*
+ * Set up a translating bank for the streams, each matched with its mask (0
+ * for exactly), or find the one an earlier load of this driver left them on.
+ * With QCOM_APPS_SMMU_IOMMU the caller places mappings itself
+ * (qcom_apps_smmu_map_at()), with locks held: the page table maps without
+ * sleeping, and no I/O addresses are allocated here.
+ */
 int
-qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
-    struct qcom_apps_smmu_dom **dp)
+qcom_apps_smmu_attach_streams(const uint16_t *sids, const uint16_t *masks,
+    u_int nstreams, u_int flags, struct qcom_apps_smmu_dom **dp)
 {
 	const struct qcom_apps_smmu_soc *soc;
 	struct qcom_apps_smmu_dom *d;
-	uint32_t idr1, smr, used[8];
+	uint32_t idr1, smr, s2cr, used[nitems(qcom_apps_smmu_freed)];
 	uint64_t mair, ttbr;
-	u_int nsmr, ncb, i, cb, free_smr, own_smr;
+	u_int smrs[QCOM_APPS_SMMU_MAXSTREAMS];
+	bool own[QCOM_APPS_SMMU_MAXSTREAMS], any_own;
+	u_int nsmr, ncb, i, cb, s;
 
+	if (nstreams == 0 || nstreams > QCOM_APPS_SMMU_MAXSTREAMS)
+		return (EINVAL);
 	mtx_lock(&qcom_apps_smmu_mtx);
 	if (qcom_apps_smmu_regs == NULL) {
 		soc = qcom_apps_smmu_find_soc();
@@ -195,55 +212,83 @@ qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
 	    ((idr1 & IDR1_PAGESIZE_64K) != 0 ? 65536 : 4096);
 
 	memset(used, 0, sizeof(used));
-	free_smr = own_smr = nsmr;
+	for (s = 0; s < nstreams; s++) {
+		smrs[s] = nsmr;
+		own[s] = false;
+	}
+	any_own = false;
 	cb = ncb;
 	for (i = 0; i < nsmr; i++) {
 		smr = RD(SMMU_SMR(i));
-		if ((smr & SMR_VALID) == 0) {
-			if (free_smr == nsmr &&
-			    S2CR_TYPE(RD(SMMU_S2CR(i))) == S2CR_TYPE_FAULT)
-				free_smr = i;
+		s2cr = RD(SMMU_S2CR(i));
+		if ((smr & SMR_VALID) == 0)
 			continue;
-		}
-		if ((SMR_ID(smr) & ~SMR_MASK(smr)) == (sid & ~SMR_MASK(smr))) {
+		for (s = 0; s < nstreams; s++)
+			if ((SMR_ID(smr) & ~SMR_MASK(smr)) ==
+			    (sids[s] & ~SMR_MASK(smr)))
+				break;
+		if (s < nstreams) {
 			/*
 			 * Set up by an earlier load of this driver, which
 			 * leaves it: take its bank over.  Anything else
 			 * already routing the stream is not ours to change.
 			 */
-			if (SMR_ID(smr) != sid || SMR_MASK(smr) != mask ||
-			    S2CR_TYPE(RD(SMMU_S2CR(i))) != S2CR_TYPE_TRANS) {
+			if (SMR_ID(smr) != sids[s] || SMR_MASK(smr) != masks[s] ||
+			    S2CR_TYPE(s2cr) != S2CR_TYPE_TRANS ||
+			    (cb != ncb && S2CR_CBNDX(s2cr) != cb)) {
 				mtx_unlock(&qcom_apps_smmu_mtx);
 				return (EEXIST);
 			}
-			own_smr = i;
-			cb = S2CR_CBNDX(RD(SMMU_S2CR(i)));
+			smrs[s] = i;
+			own[s] = any_own = true;
+			cb = S2CR_CBNDX(s2cr);
 			continue;
 		}
-		if (S2CR_TYPE(RD(SMMU_S2CR(i))) == S2CR_TYPE_TRANS)
-			used[S2CR_CBNDX(RD(SMMU_S2CR(i))) / 32] |=
-			    1u << (S2CR_CBNDX(RD(SMMU_S2CR(i))) % 32);
+		if (S2CR_TYPE(s2cr) == S2CR_TYPE_TRANS)
+			used[S2CR_CBNDX(s2cr) / 32] |= 1u << (S2CR_CBNDX(s2cr) % 32);
 	}
-	if (own_smr != nsmr)
-		free_smr = own_smr;
-	else
+	/* Free entries for the streams not yet routed. */
+	for (s = 0, i = 0; s < nstreams; s++) {
+		if (own[s])
+			continue;
+		for (; i < nsmr; i++)
+			if ((RD(SMMU_SMR(i)) & SMR_VALID) == 0 &&
+			    S2CR_TYPE(RD(SMMU_S2CR(i))) == S2CR_TYPE_FAULT)
+				break;
+		if (i == nsmr)
+			break;
+		smrs[s] = i++;
+	}
+	if (cb == ncb)
 		for (cb = 0; cb < ncb; cb++)
 			if ((used[cb / 32] & (1u << (cb % 32))) == 0 &&
-			    RD(SMMU_CBAR(cb)) == 0)
+			    (RD(SMMU_CBAR(cb)) == 0 ||
+			    (qcom_apps_smmu_freed[cb / 32] & (1u << (cb % 32))) != 0))
 				break;
-	if (free_smr == nsmr || cb == ncb) {
+	if (s < nstreams || cb == ncb) {
 		mtx_unlock(&qcom_apps_smmu_mtx);
 		return (ENOSPC);
 	}
+	qcom_apps_smmu_freed[cb / 32] &= ~(1u << (cb % 32));
 	mtx_unlock(&qcom_apps_smmu_mtx);
 
 	d = malloc(sizeof(*d), M_DEVBUF, M_WAITOK | M_ZERO);
-	d->sid = sid;
-	d->mask = mask;
+	d->nstreams = nstreams;
+	for (s = 0; s < nstreams; s++) {
+		d->sids[s] = sids[s];
+		d->masks[s] = masks[s];
+		d->smrs[s] = smrs[s];
+	}
+	d->sid = sids[0];
+	d->mask = masks[0];
 	d->cb = cb;
-	d->pt = qcom_smmu_pt_create(0);
-	d->iova = vmem_create("qcom_apps_smmu", IOVA_BASE, IOVA_END - IOVA_BASE,
-	    PAGE_SIZE, 0, M_WAITOK);
+	if ((flags & QCOM_APPS_SMMU_IOMMU) != 0)
+		d->pt = qcom_smmu_pt_create(QCOM_SMMU_PT_NOSLEEP);
+	else {
+		d->pt = qcom_smmu_pt_create(0);
+		d->iova = vmem_create("qcom_apps_smmu", IOVA_BASE,
+		    IOVA_END - IOVA_BASE, PAGE_SIZE, 0, M_WAITOK);
+	}
 	/*
 	 * This SMMU takes 36-bit addresses (IDR2's IAS and UBS), as Linux
 	 * sets it up: the walk starts at level 1, so the bank is given the
@@ -284,25 +329,38 @@ qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
 	WR(CB(cb, CB_SCTLR), CB_SCTLR_M | CB_SCTLR_TRE | CB_SCTLR_AFE |
 	    CB_SCTLR_CFRE | CB_SCTLR_ASIDPNE |
 	    (qcom_apps_smmu_stall ? CB_SCTLR_CFCFG : 0));
-	if (own_smr != nsmr) {
+	if (any_own) {
 		/* Already routed here: drop what the old tables left. */
 		WR(CB(cb, CB_TLBIASID), cb);
 		WR(CB(cb, CB_TLBSYNC), 0);
 		for (i = 0; i < 100000 &&
 		    (RD(CB(cb, CB_TLBSTATUS)) & CB_TLBSTATUS_ACTIVE) != 0; i++)
 			DELAY(1);
-	} else {
+	}
+	for (s = 0; s < nstreams; s++) {
+		if (own[s])
+			continue;
 		/* Then what points at it, then what makes it live. */
-		WR(SMMU_S2CR(free_smr), cb);
+		WR(SMMU_S2CR(smrs[s]), cb);
 		wmb();
-		WR(SMMU_SMR(free_smr), SMR_VALID | (uint32_t)mask << 16 | sid);
+		WR(SMMU_SMR(smrs[s]), SMR_VALID | (uint32_t)masks[s] << 16 |
+		    sids[s]);
 		wmb();
 	}
 	mtx_unlock(&qcom_apps_smmu_mtx);
-	printf("qcom_apps_smmu: stream %#x through context bank %u "
-	    "(entry %u), translated\n", sid, cb, free_smr);
+	for (s = 0; s < nstreams; s++)
+		printf("qcom_apps_smmu: stream %#x mask %#x through context "
+		    "bank %u (entry %u), translated\n", sids[s], masks[s], cb,
+		    smrs[s]);
 	*dp = d;
 	return (0);
+}
+
+int
+qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
+    struct qcom_apps_smmu_dom **dp)
+{
+	return (qcom_apps_smmu_attach_streams(&sid, &mask, 1, 0, dp));
 }
 
 static void
@@ -326,6 +384,8 @@ qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa, size_t size,
 	vmem_addr_t iova;
 	int error;
 
+	if (d->iova == NULL)
+		return (ENXIO);
 	size = roundup2(size, PAGE_SIZE);
 	error = vmem_alloc(d->iova, size, M_BESTFIT | M_NOWAIT, &iova);
 	if (error != 0)
@@ -353,6 +413,8 @@ qcom_apps_smmu_map_pages(struct qcom_apps_smmu_dom *d, vm_page_t *ma,
 	u_int i;
 	int error;
 
+	if (d->iova == NULL)
+		return (ENXIO);
 	error = vmem_alloc(d->iova, ptoa(npages), M_BESTFIT | M_NOWAIT, &iova);
 	if (error != 0)
 		return (ENOSPC);
@@ -379,5 +441,72 @@ qcom_apps_smmu_unmap(struct qcom_apps_smmu_dom *d, uint64_t iova, size_t size)
 	size = roundup2(size, PAGE_SIZE);
 	qcom_smmu_unmap(d->pt, iova, size);
 	qcom_apps_smmu_tlb_flush(d);
-	vmem_free(d->iova, iova, size);
+	if (d->iova != NULL)
+		vmem_free(d->iova, iova, size);
+}
+
+/*
+ * Pages at consecutive I/O addresses the caller chose (QCOM_APPS_SMMU_IOMMU
+ * domains); QCOM_SMMU_CACHED as for qcom_apps_smmu_map_pages().  Doesn't
+ * sleep.
+ */
+int
+qcom_apps_smmu_map_at(struct qcom_apps_smmu_dom *d, uint64_t iova,
+    vm_page_t *ma, u_int npages, u_int flags)
+{
+	u_int i;
+	int error;
+
+	for (i = 0; i < npages; i++) {
+		error = qcom_smmu_map(d->pt, iova + ptoa(i),
+		    VM_PAGE_TO_PHYS(ma[i]), PAGE_SIZE,
+		    (flags & QCOM_SMMU_CACHED) != 0 ? 0 : QCOM_SMMU_UNCACHED);
+		if (error != 0) {
+			if (i > 0)
+				qcom_apps_smmu_unmap_at(d, iova, ptoa(i));
+			return (error);
+		}
+	}
+	return (0);
+}
+
+void
+qcom_apps_smmu_unmap_at(struct qcom_apps_smmu_dom *d, uint64_t iova,
+    size_t size)
+{
+	qcom_smmu_unmap(d->pt, iova, roundup2(size, PAGE_SIZE));
+	qcom_apps_smmu_tlb_flush(d);
+}
+
+vm_paddr_t
+qcom_apps_smmu_lookup(struct qcom_apps_smmu_dom *d, uint64_t iova)
+{
+	return (qcom_smmu_lookup(d->pt, iova));
+}
+
+/*
+ * The streams back to faulting and the bank off (never CBAR: writing it
+ * other than as stage 1 resets the SoC), then its table.  The bank is
+ * remembered as this driver's to set up again.
+ */
+void
+qcom_apps_smmu_detach(struct qcom_apps_smmu_dom *d)
+{
+	u_int s;
+
+	mtx_lock(&qcom_apps_smmu_mtx);
+	for (s = 0; s < d->nstreams; s++) {
+		WR(SMMU_SMR(d->smrs[s]), 0);
+		wmb();
+		WR(SMMU_S2CR(d->smrs[s]), S2CR_TYPE_FAULT << 16);
+		wmb();
+	}
+	WR(CB(d->cb, CB_SCTLR), 0);
+	qcom_apps_smmu_freed[d->cb / 32] |= 1u << (d->cb % 32);
+	mtx_unlock(&qcom_apps_smmu_mtx);
+	qcom_apps_smmu_tlb_flush(d);
+	qcom_smmu_pt_destroy(d->pt);
+	if (d->iova != NULL)
+		vmem_destroy(d->iova);
+	free(d, M_DEVBUF);
 }

@@ -38,6 +38,17 @@ struct qcom_apps_smmu_dom;
 /* The stream, matched with mask (0 for exactly), through a bank of its own. */
 int	qcom_apps_smmu_attach(uint16_t sid, uint16_t mask,
 	    struct qcom_apps_smmu_dom **dp);
+/*
+ * Several streams through one bank.  QCOM_APPS_SMMU_IOMMU: the caller places
+ * mappings (map_at, unmap_at), possibly with locks held; map and map_pages
+ * then fail.
+ */
+#define	QCOM_APPS_SMMU_MAXSTREAMS	4
+#define	QCOM_APPS_SMMU_IOMMU		0x1
+int	qcom_apps_smmu_attach_streams(const uint16_t *sids,
+	    const uint16_t *masks, u_int nstreams, u_int flags,
+	    struct qcom_apps_smmu_dom **dp);
+void	qcom_apps_smmu_detach(struct qcom_apps_smmu_dom *d);
 int	qcom_apps_smmu_map(struct qcom_apps_smmu_dom *d, vm_paddr_t pa,
 	    size_t size, uint64_t *iovap);
 /* Pages, wherever they are, at consecutive I/O addresses; uncached. */
@@ -46,5 +57,12 @@ int	qcom_apps_smmu_map_pages(struct qcom_apps_smmu_dom *d, vm_page_t *ma,
 #define	QCOM_SMMU_CACHED	0x100	/* map_pages: write-back, snooped */
 void	qcom_apps_smmu_unmap(struct qcom_apps_smmu_dom *d, uint64_t iova,
 	    size_t size);
+int	qcom_apps_smmu_map_at(struct qcom_apps_smmu_dom *d, uint64_t iova,
+	    vm_page_t *ma, u_int npages, u_int flags);
+void	qcom_apps_smmu_unmap_at(struct qcom_apps_smmu_dom *d, uint64_t iova,
+	    size_t size);
+/* What an I/O address translates to, or 0. */
+vm_paddr_t qcom_apps_smmu_lookup(struct qcom_apps_smmu_dom *d,
+	    uint64_t iova);
 
 #endif /* _DEV_QCOM_SMMU_QCOM_APPS_SMMU_H_ */
