@@ -48,6 +48,7 @@
 #define	QCOM_SCM_SVC_INFO		0x06
 #define	QCOM_SCM_INFO_IS_CALL_AVAIL	0x01
 #define	QCOM_SCM_SVC_MP			0x0c
+#define	QCOM_SCM_MP_VIDEO_VAR		0x08
 #define	QCOM_SCM_MP_CP_SMMU_APERTURE_ID	0x1b
 
 bool	qcom_scm_available(void);
@@ -62,5 +63,12 @@ int	qcom_scm_pas_shutdown(uint32_t pas_id);
 int	qcom_scm_set_remote_state(uint32_t state, uint32_t id);
 bool	qcom_scm_set_gpu_smmu_aperture_is_available(void);
 int	qcom_scm_set_gpu_smmu_aperture(u_int context_bank);
+/*
+ * Protect a video codec's content (its I/O addresses cp_start..+cp_size, of
+ * which nonpixel_start..+nonpixel_size hold its non-pixel data), once its
+ * firmware runs.
+ */
+int	qcom_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
+	    uint32_t nonpixel_start, uint32_t nonpixel_size);
 
 #endif /* _DEV_QCOM_SCM_QCOM_SCM_H_ */

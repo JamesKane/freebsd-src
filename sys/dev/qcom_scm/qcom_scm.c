@@ -368,6 +368,20 @@ qcom_scm_set_gpu_smmu_aperture(u_int context_bank)
 	return (qcom_scm_call(qcom_scm_sc, &desc, NULL));
 }
 
+int
+qcom_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
+    uint32_t nonpixel_start, uint32_t nonpixel_size)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_VIDEO_VAR,
+		.arginfo = SCM_ARGINFO(4),
+		.args = { cp_start, cp_size, nonpixel_start, nonpixel_size },
+	};
+
+	return (qcom_scm_call_res0(&desc));
+}
+
 #ifdef DEV_ACPI
 static char *qcom_scm_acpi_ids[] = { "QCOM04DD", NULL };
 #endif
