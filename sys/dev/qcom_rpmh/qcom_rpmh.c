@@ -240,6 +240,24 @@ qcom_rpmh_arc_vote(const char *res, u_int hlvl)
 	return (qcom_rpmh_write(addr, hlvl));
 }
 
+int
+qcom_rpmh_arc_vote_level(const char *res, u_int vlvl)
+{
+	const uint16_t *lv;
+	size_t len;
+	u_int n;
+
+	if (qcom_cmd_db_ready() != 0)
+		return (ENXIO);
+	lv = qcom_cmd_db_read_aux_data(res, &len);
+	if (lv == NULL)
+		return (ENOENT);
+	for (n = 0; n < len / 2 && (n == 0 || lv[n] != 0); n++)
+		if (lv[n] >= vlvl)
+			return (qcom_rpmh_arc_vote(res, n));
+	return (EINVAL);
+}
+
 /* By hand: a rail to its highest level ("nsp.lvl"), or a BCM's peak. */
 static int
 qcom_rpmh_vote_sysctl(SYSCTL_HANDLER_ARGS)

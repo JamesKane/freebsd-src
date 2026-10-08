@@ -35,6 +35,11 @@
 int	qcom_rpmh_write(uint32_t addr, uint32_t data);
 /* Vote a rail ("nsp.lvl") to a level index, or its highest. */
 int	qcom_rpmh_arc_vote(const char *res, u_int hlvl);
+/*
+ * Vote a rail to its lowest level at or above a voltage level (the vlvl of
+ * Linux's devicetrees: 256 nominal, 384 turbo, ...).
+ */
+int	qcom_rpmh_arc_vote_level(const char *res, u_int vlvl);
 /* Vote a BCM ("NSA0") to an average and peak bandwidth, in its units. */
 int	qcom_rpmh_bcm_vote(const char *bcm, uint32_t avg, uint32_t peak);
 
