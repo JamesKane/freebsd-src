@@ -43,6 +43,17 @@ int	sky1_scmi_clk_enable(uint32_t id, bool enable);
 int	sky1_scmi_clk_get_rate(uint32_t id, uint64_t *hz);
 int	sky1_scmi_clk_set_rate(uint32_t id, uint64_t hz);
 
+/*
+ * Performance protocol (0x13), by domain id (DVFS references in _DSD
+ * "power-domains"), in kHz: a domain's levels, up to max of them (the
+ * number it has in *nlevels), its current level, and a new one (the
+ * nearest).
+ */
+int	sky1_scmi_perf_levels(uint32_t domain, uint32_t *khz, int max,
+	    int *nlevels);
+int	sky1_scmi_perf_get(uint32_t domain, uint32_t *khz);
+int	sky1_scmi_perf_set(uint32_t domain, uint32_t khz);
+
 /* Power domain on or off, through TF-A (SCMI POWER_STATE_SET over SMC). */
 int	sky1_scmi_power_set(uint32_t domain, bool on);
 

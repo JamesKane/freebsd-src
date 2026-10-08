@@ -35,7 +35,8 @@
  * only, so this is a small client of its own: requests are written to the
  * shared memory, the doorbell rung, and the reply polled for (the platform
  * marks the channel free).  It offers the clock protocol to drivers, such
- * as the GPU's, whose clocks firmware leaves off.
+ * as the GPU's, whose clocks firmware leaves off, and the performance
+ * protocol (DVFS: the CPU clusters, GPU, NPU, VPU and interconnect).
  *
  * The firmware's AML has SCMI methods too (\_SB.PMMX), on another agent,
  * which answers NOT_FOUND for every clock.
@@ -87,6 +88,12 @@
 #define	 CLOCK_RATE_GET		6
 #define	 CLOCK_CONFIG_SET	7
 #define	SCMI_BASE_DISCOVER_VENDOR	3
+#define	SCMI_PROTO_PERF		0x13
+#define	 PERF_DOMAIN_ATTRIBUTES	3
+#define	 PERF_DESCRIBE_LEVELS	4
+#define	 PERF_LEVEL_SET		7
+#define	 PERF_LEVEL_GET		8
+#define	 PERF_LEVEL_WORDS	3	/* per level, protocol 3.x */
 
 #define	SCMI_REPLY_TIMEOUT_US	300000	/* as Linux on Sky1 */
 
@@ -207,6 +214,88 @@ sky1_scmi_clk_set_rate(uint32_t id, uint64_t hz)
 	uint32_t tx[4] = { 0, id, (uint32_t)hz, hz >> 32 };
 
 	return (sky1_scmi_request(SCMI_PROTO_CLOCK, CLOCK_RATE_SET, tx, 4,
+	    NULL, 0));
+}
+
+/*
+ * A performance domain's levels are abstract: its attributes give the ratio
+ * to frequency, a sustained frequency (kHz) and its level.
+ */
+static int
+sky1_scmi_perf_ratio(uint32_t domain, uint64_t *khz, uint64_t *level)
+{
+	uint32_t rx[4];
+	int error;
+
+	error = sky1_scmi_request(SCMI_PROTO_PERF, PERF_DOMAIN_ATTRIBUTES,
+	    &domain, 1, rx, nitems(rx));
+	if (error != 0)
+		return (error);
+	if (rx[2] == 0 || rx[3] == 0)
+		return (EIO);
+	*khz = rx[2];
+	*level = rx[3];
+	return (0);
+}
+
+int
+sky1_scmi_perf_levels(uint32_t domain, uint32_t *khz, int max, int *nlevels)
+{
+	uint32_t rx[SHMEM_MAX_WORDS - 1], tx[2];
+	uint64_t rkhz, rlevel;
+	u_int i, n, rem;
+	int error;
+
+	if ((error = sky1_scmi_perf_ratio(domain, &rkhz, &rlevel)) != 0)
+		return (error);
+	*nlevels = 0;
+	tx[0] = domain;
+	for (tx[1] = 0;; tx[1] += n) {
+		error = sky1_scmi_request(SCMI_PROTO_PERF, PERF_DESCRIBE_LEVELS,
+		    tx, 2, rx, nitems(rx));
+		if (error != 0)
+			return (error);
+		n = rx[0] & 0xfff;
+		rem = rx[0] >> 16;
+		if (n > (nitems(rx) - 1) / PERF_LEVEL_WORDS)
+			return (EIO);
+		for (i = 0; i < n; i++, (*nlevels)++)
+			if (*nlevels < max)
+				khz[*nlevels] = rx[1 + i * PERF_LEVEL_WORDS] *
+				    rkhz / rlevel;
+		if (rem == 0 || n == 0)
+			return (0);
+	}
+}
+
+int
+sky1_scmi_perf_get(uint32_t domain, uint32_t *khz)
+{
+	uint64_t rkhz, rlevel;
+	uint32_t level;
+	int error;
+
+	if ((error = sky1_scmi_perf_ratio(domain, &rkhz, &rlevel)) != 0)
+		return (error);
+	error = sky1_scmi_request(SCMI_PROTO_PERF, PERF_LEVEL_GET, &domain, 1,
+	    &level, 1);
+	if (error == 0)
+		*khz = level * rkhz / rlevel;
+	return (error);
+}
+
+int
+sky1_scmi_perf_set(uint32_t domain, uint32_t khz)
+{
+	uint64_t rkhz, rlevel;
+	uint32_t tx[2];
+	int error;
+
+	if ((error = sky1_scmi_perf_ratio(domain, &rkhz, &rlevel)) != 0)
+		return (error);
+	tx[0] = domain;
+	tx[1] = (khz * rlevel + rkhz / 2) / rkhz;	/* the nearest level */
+	return (sky1_scmi_request(SCMI_PROTO_PERF, PERF_LEVEL_SET, tx, 2,
 	    NULL, 0));
 }
 
