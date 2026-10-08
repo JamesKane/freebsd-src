@@ -129,7 +129,8 @@ sky1_scmi_request(uint32_t protocol, uint32_t msg, const uint32_t *tx,
 
 	if (sc == NULL)
 		return (ENXIO);
-	if (ntx > SHMEM_MAX_WORDS || nrx > SHMEM_MAX_WORDS)
+	/* A reply's status takes the payload's first word. */
+	if (ntx > SHMEM_MAX_WORDS || nrx > SHMEM_MAX_WORDS - 1)
 		return (EINVAL);
 	sx_xlock(&sc->lock);
 	/* The sending mailbox may attach after this driver. */
