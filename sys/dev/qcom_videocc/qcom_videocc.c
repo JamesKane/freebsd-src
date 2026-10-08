@@ -80,6 +80,7 @@
 #define	GDSC_WAIT(rest, few, clkdis)	\
 	((rest) << 20 | (few) << 16 | (clkdis) << 12)
 #define	GDSC_RETAIN_FF		(1u << 11)
+#define	GDSC_HW_CONTROL		(1u << 1)
 #define	GDSC_SW_COLLAPSE	(1u << 0)
 
 /* Lucid 5LPE PLL, from its base. */
@@ -523,9 +524,32 @@ qcom_videocc_hw_disable(struct qcom_videocc *sc)
 
 	if (!sc->hw_on)
 		return;
+	(void)qcom_videocc_hw_set_hwmode(sc, false);
 	qcom_videocc_branch_disable(sc, false, d->hw_cbcr);
 	qcom_videocc_gdsc_disable(sc, d->hw_gdscr);
 	sc->hw_on = false;
+}
+
+/*
+ * The core's power domain under the codec's control (its firmware powers
+ * the core up and down), or back under ours, as Linux's gdsc_set_hwmode():
+ * back under ours, it must be on.
+ */
+int
+qcom_videocc_hw_set_hwmode(struct qcom_videocc *sc, bool hw)
+{
+	const struct qcom_videocc_desc *d = sc->desc;
+
+	if (!sc->hw_on)
+		return (ENXIO);
+	qcom_videocc_set(sc, false, d->hw_gdscr, hw ? 0 : GDSC_HW_CONTROL,
+	    hw ? GDSC_HW_CONTROL : 0);
+	/* The controller takes a few cycles to see the change. */
+	DELAY(1);
+	if (hw)
+		return (0);
+	return (qcom_videocc_poll(sc, false, d->hw_gdscr, GDSC_PWR_ON,
+	    GDSC_PWR_ON, "core power"));
 }
 
 static const struct qcom_videocc_desc *

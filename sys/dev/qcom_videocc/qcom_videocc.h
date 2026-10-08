@@ -49,5 +49,7 @@ int	qcom_videocc_ctrl_enable(struct qcom_videocc *sc);
 void	qcom_videocc_ctrl_disable(struct qcom_videocc *sc);
 int	qcom_videocc_hw_enable(struct qcom_videocc *sc);
 void	qcom_videocc_hw_disable(struct qcom_videocc *sc);
+/* The core's power domain under the codec's control (hw) or ours. */
+int	qcom_videocc_hw_set_hwmode(struct qcom_videocc *sc, bool hw);
 
 #endif /* _DEV_QCOM_VIDEOCC_QCOM_VIDEOCC_H_ */
