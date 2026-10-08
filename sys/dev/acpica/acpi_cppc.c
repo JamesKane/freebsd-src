@@ -371,10 +371,13 @@ acpi_cppc_to_setting(struct acpi_cppc_softc *sc, int mhz,
 static void
 acpi_cppc_notify(struct acpi_cppc_softc *sc, int mhz)
 {
+#ifdef __aarch64__
 	int cpu;
 
+	/* Only arm64 keeps each CPU's clock in its pcpu. */
 	CPU_FOREACH_ISSET(cpu, &sc->cpus)
 		pcpu_find(cpu)->pc_clock = (uint64_t)mhz * 1000000;
+#endif
 }
 
 static int
