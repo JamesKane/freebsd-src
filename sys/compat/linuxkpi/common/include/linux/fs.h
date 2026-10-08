@@ -70,9 +70,20 @@ typedef struct files_struct *fl_owner_t;
 
 struct file_operations;
 
-struct linux_file_wait_queue {
+/*
+ * A file's poll waits: an entry on each wait queue its poll() passes
+ * poll_wait() (a V4L2 mem2mem device's: its events' and its two buffer
+ * queues'), sharing one state.
+ */
+struct linux_file_wait_entry {
 	struct wait_queue wq;
 	struct wait_queue_head *wqh;
+	struct linux_file *filp;
+};
+
+struct linux_file_wait_queue {
+#define	LINUX_FWQ_NENTRIES 4
+	struct linux_file_wait_entry ent[LINUX_FWQ_NENTRIES];
 	atomic_t state;
 #define	LINUX_FWQ_STATE_INIT 0
 #define	LINUX_FWQ_STATE_NOT_READY 1

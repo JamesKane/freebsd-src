@@ -1097,7 +1097,8 @@ linux_poll_wakeup_callback(wait_queue_t *wq, unsigned int wq_state, int flags, v
 		[LINUX_FWQ_STATE_QUEUED] = LINUX_FWQ_STATE_READY,
 		[LINUX_FWQ_STATE_READY] = LINUX_FWQ_STATE_READY, /* NOP */
 	};
-	struct linux_file *filp = container_of(wq, struct linux_file, f_wait_queue.wq);
+	struct linux_file *filp =
+	    container_of(wq, struct linux_file_wait_entry, wq)->filp;
 
 	switch (linux_poll_wakeup_state(&filp->f_wait_queue.state, state)) {
 	case LINUX_FWQ_STATE_QUEUED:
@@ -1108,31 +1109,40 @@ linux_poll_wakeup_callback(wait_queue_t *wq, unsigned int wq_state, int flags, v
 	}
 }
 
+/*
+ * The file's entry on wqh, added the first time a poll waits on it.  The
+ * select system call's record is linux_file_poll()'s, once for all the
+ * queues: select has one for each file descriptor.
+ */
 void
 linux_poll_wait(struct linux_file *filp, wait_queue_head_t *wqh, poll_table *p)
 {
 	static const uint8_t state[LINUX_FWQ_STATE_MAX] = {
-		[LINUX_FWQ_STATE_INIT] = LINUX_FWQ_STATE_NOT_READY,
+		[LINUX_FWQ_STATE_INIT] = LINUX_FWQ_STATE_QUEUED,
 		[LINUX_FWQ_STATE_NOT_READY] = LINUX_FWQ_STATE_NOT_READY, /* NOP */
 		[LINUX_FWQ_STATE_QUEUED] = LINUX_FWQ_STATE_QUEUED, /* NOP */
 		[LINUX_FWQ_STATE_READY] = LINUX_FWQ_STATE_QUEUED,
 	};
+	struct linux_file_wait_entry *ent;
+	int i;
 
-	/* check if we are called inside the select system call */
-	if (p == LINUX_POLL_TABLE_NORMAL)
-		selrecord(curthread, &filp->f_selinfo);
-
-	switch (linux_poll_wakeup_state(&filp->f_wait_queue.state, state)) {
-	case LINUX_FWQ_STATE_INIT:
-		/* NOTE: file handles can only belong to one wait-queue */
-		filp->f_wait_queue.wqh = wqh;
-		filp->f_wait_queue.wq.func = &linux_poll_wakeup_callback;
-		add_wait_queue(wqh, &filp->f_wait_queue.wq);
-		atomic_set(&filp->f_wait_queue.state, LINUX_FWQ_STATE_QUEUED);
-		break;
-	default:
-		break;
+	for (i = 0; i < LINUX_FWQ_NENTRIES; i++) {
+		ent = &filp->f_wait_queue.ent[i];
+		if (atomic_load_ptr(&ent->wqh) == wqh)
+			break;
+		if (atomic_cmpset_ptr((volatile uintptr_t *)&ent->wqh,
+		    (uintptr_t)NULL, (uintptr_t)wqh)) {
+			ent->filp = filp;
+			ent->wq.func = &linux_poll_wakeup_callback;
+			add_wait_queue(wqh, &ent->wq);
+			break;
+		}
 	}
+	if (i == LINUX_FWQ_NENTRIES)
+		pr_warn_once("%s: a poll waits on more than %d queues\n",
+		    __func__, LINUX_FWQ_NENTRIES);
+
+	(void)linux_poll_wakeup_state(&filp->f_wait_queue.state, state);
 }
 
 static void
@@ -1145,16 +1155,18 @@ linux_poll_wait_dequeue(struct linux_file *filp)
 		[LINUX_FWQ_STATE_READY] = LINUX_FWQ_STATE_INIT,
 	};
 
+	struct linux_file_wait_entry *ent;
+	int i;
+
 	seldrain(&filp->f_selinfo);
 
-	switch (linux_poll_wakeup_state(&filp->f_wait_queue.state, state)) {
-	case LINUX_FWQ_STATE_NOT_READY:
-	case LINUX_FWQ_STATE_QUEUED:
-	case LINUX_FWQ_STATE_READY:
-		remove_wait_queue(filp->f_wait_queue.wqh, &filp->f_wait_queue.wq);
-		break;
-	default:
-		break;
+	(void)linux_poll_wakeup_state(&filp->f_wait_queue.state, state);
+	for (i = 0; i < LINUX_FWQ_NENTRIES; i++) {
+		ent = &filp->f_wait_queue.ent[i];
+		if (ent->wqh == NULL)
+			continue;
+		remove_wait_queue(ent->wqh, &ent->wq);
+		ent->wqh = NULL;
 	}
 }
 
@@ -1625,6 +1637,8 @@ linux_file_poll(struct file *file, int events, struct ucred *active_cred,
 	linux_set_current(td);
 	linux_get_fop(filp, &fop, &ldev);
 	if (fop->poll != NULL) {
+		/* For the queues fop->poll() waits on (linux_poll_wait()). */
+		selrecord(td, &filp->f_selinfo);
 		revents = OPW(file, td, fop->poll(filp,
 		    LINUX_POLL_TABLE_NORMAL)) & events;
 	} else {
