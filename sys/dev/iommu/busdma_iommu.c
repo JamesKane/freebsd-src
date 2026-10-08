@@ -1008,7 +1008,7 @@ static void
 iommu_bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map1,
     bus_dmasync_op_t op)
 {
-	struct bus_dmamap_iommu *map;
+	struct bus_dmamap_iommu *map __unused;
 
 	map = (struct bus_dmamap_iommu *)map1;
 #ifdef __aarch64__
