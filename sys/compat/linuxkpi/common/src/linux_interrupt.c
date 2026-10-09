@@ -49,12 +49,12 @@ struct irq_ent {
 	irqreturn_t	(*thread_handler)(int, void *);
 	void		*tag;
 	unsigned int	irq;
-	bool		masked;	/* disable_irq_nosync() from its handler */
+	bool		masked;	/* disable_irq_nosync(), handlers not run */
 };
 
 /*
- * Every requested IRQ, for disable_irq_nosync() from an interrupt handler,
- * where neither the devices' sx lock nor tearing the handler down may sleep.
+ * Every requested IRQ, for disable_irq_nosync(), which may neither take the
+ * devices' sx lock (from an interrupt handler) nor wait for the handler.
  */
 static struct mtx lkpi_irq_all_mtx;
 MTX_SYSINIT(lkpi_irq_all, &lkpi_irq_all_mtx, "lkpi irqs", MTX_DEF);
@@ -122,6 +122,9 @@ lkpi_irq_handler(void *ent)
 	 * it returns, as with IRQF_ONESHOT.
 	 */
 	irqe = ent;
+	/* Disabled without waiting: the handlers are not run. */
+	if (READ_ONCE(irqe->masked))
+		return;
 	if ((irqe->handler == NULL ||
 	    irqe->handler(irqe->irq, irqe->arg) == IRQ_WAKE_THREAD) &&
 	    irqe->thread_handler != NULL) {
@@ -238,13 +241,16 @@ lkpi_enable_irq(unsigned int irq)
 	struct irq_ent *irqe;
 	struct device *dev;
 
-	/* Masked by its handler: still set up, so just unmasked. */
+	/* Disabled by disable_irq_nosync(): the handlers run again. */
 	mtx_lock(&lkpi_irq_all_mtx);
 	list_for_each_entry(irqe, &lkpi_irq_all, all)
 		if (irqe->irq == irq && irqe->masked) {
-			irqe->masked = false;
-			mtx_unlock(&lkpi_irq_all_mtx);
-			return (0);
+			WRITE_ONCE(irqe->masked, false);
+			if (irqe->tag != NULL) {
+				mtx_unlock(&lkpi_irq_all_mtx);
+				return (0);
+			}
+			break;
 		}
 	mtx_unlock(&lkpi_irq_all_mtx);
 
@@ -258,26 +264,35 @@ lkpi_enable_irq(unsigned int irq)
 	    NULL, lkpi_irq_handler, irqe, &irqe->tag);
 }
 
+/*
+ * Linux's disable_irq_nosync() returns without waiting for a running handler,
+ * and drivers call it from their handlers or holding a lock their threaded
+ * handler takes; tearing the handler down waits for it.  So the handlers are
+ * only skipped until enable_irq().
+ */
+void
+lkpi_disable_irq_nosync(unsigned int irq)
+{
+	struct irq_ent *irqe;
+
+	mtx_lock(&lkpi_irq_all_mtx);
+	list_for_each_entry(irqe, &lkpi_irq_all, all)
+		if (irqe->irq == irq) {
+			WRITE_ONCE(irqe->masked, true);
+			break;
+		}
+	mtx_unlock(&lkpi_irq_all_mtx);
+}
+
 void
 lkpi_disable_irq(unsigned int irq)
 {
 	struct irq_ent *irqe;
 	struct device *dev;
 
-	/*
-	 * From an interrupt handler (Linux's threaded drivers' primary
-	 * handlers call disable_irq_nosync()): the interrupt thread keeps its
-	 * source masked until it returns, and runs the threaded handler,
-	 * which enables it again, before then.  So only note it.
-	 */
+	/* From an interrupt handler, which cannot wait for itself. */
 	if ((curthread->td_pflags & TDP_ITHREAD) != 0) {
-		mtx_lock(&lkpi_irq_all_mtx);
-		list_for_each_entry(irqe, &lkpi_irq_all, all)
-			if (irqe->irq == irq) {
-				irqe->masked = true;
-				break;
-			}
-		mtx_unlock(&lkpi_irq_all_mtx);
+		lkpi_disable_irq_nosync(irq);
 		return;
 	}
 
