@@ -36,11 +36,8 @@
  * 560 MHz) is a rate of the PLL, retuned while it runs, and levels of the
  * MX and MMCX rails.
  *
- * RPMh keeps one vote per rail for the application processors, and nothing
- * here aggregates votes: the display runs on what UEFI voted for MMCX.  The
- * votes therefore never go below a floor that covers the display
- * (hw.qcom_videocc.mmcx_floor: nominal covers its MDP clock up to 500 MHz,
- * UEFI's runs at 300, and any DisplayPort link rate), and the video clock
+ * The rails are requests to qcom_rpmh(4), which aggregates them with other
+ * drivers' and keeps what the display UEFI set up needs.  The video clock
  * controller is touched only with them up: it lives in MMCX, and reading it
  * with MMCX off resets the SoC.
  */
@@ -206,22 +203,13 @@ struct qcom_videocc {
 	volatile uint32_t		*gcc;
 	volatile uint32_t		*cc;
 	u_int				level;	/* the core clock's */
+	struct qcom_rpmh_req		*mx, *mmcx;
 	u_int				mx_voted, mmcx_voted;
 	bool				ctrl_on;
 	bool				hw_on;
 };
 
 static MALLOC_DEFINE(M_QCOM_VIDEOCC, "qcom_videocc", "Qualcomm video clocks");
-
-SYSCTL_NODE(_hw, OID_AUTO, qcom_videocc, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
-    "Qualcomm video clocks");
-static u_int qcom_videocc_mx_floor = 128;		/* SVS */
-SYSCTL_UINT(_hw_qcom_videocc, OID_AUTO, mx_floor, CTLFLAG_RDTUN,
-    &qcom_videocc_mx_floor, 0, "Lowest MX level voted (RPMh vlvl)");
-static u_int qcom_videocc_mmcx_floor = 256;		/* nominal */
-SYSCTL_UINT(_hw_qcom_videocc, OID_AUTO, mmcx_floor, CTLFLAG_RDTUN,
-    &qcom_videocc_mmcx_floor, 0,
-    "Lowest MMCX level voted (RPMh vlvl), for the display UEFI set up");
 
 #define	VCC_PRINTF(sc, ...) do {					\
 	if ((sc)->dev != NULL)						\
@@ -297,25 +285,35 @@ qcom_videocc_branch_disable(struct qcom_videocc *sc, bool gcc, uint32_t reg)
 }
 
 /*
- * The rails for a level, or (lvl NULL) for none, never below the floors.
- * MMCX before MX going up, MX before MMCX going down, as Linux orders the
- * codec's required OPPs.
+ * The rails for a level, or (lvl NULL) for none.  MMCX before MX going up,
+ * MX before MMCX going down, as Linux orders the codec's required OPPs.
  */
 static int
 qcom_videocc_vote(struct qcom_videocc *sc, const struct qcom_videocc_level *lvl)
 {
+	const char *client;
 	u_int mx, mmcx;
 	int error;
 
-	mx = MAX(lvl != NULL ? lvl->mx_vlvl : 0, qcom_videocc_mx_floor);
-	mmcx = MAX(lvl != NULL ? lvl->mmcx_vlvl : 0, qcom_videocc_mmcx_floor);
+	client = sc->dev != NULL ? device_get_nameunit(sc->dev) :
+	    "qcom_videocc";
 	error = 0;
+	if (sc->mx == NULL)
+		sc->mx = qcom_rpmh_req_get("mx.lvl", client, &error);
+	if (error == 0 && sc->mmcx == NULL)
+		sc->mmcx = qcom_rpmh_req_get("mmcx.lvl", client, &error);
+	if (error != 0) {
+		VCC_PRINTF(sc, "cannot vote the rails: %d\n", error);
+		return (error);
+	}
+	mx = lvl != NULL ? lvl->mx_vlvl : 0;
+	mmcx = lvl != NULL ? lvl->mmcx_vlvl : 0;
 	if (mmcx > sc->mmcx_voted)
-		error = qcom_rpmh_arc_vote_level("mmcx.lvl", mmcx);
+		error = qcom_rpmh_req_level(sc->mmcx, mmcx);
 	if (error == 0 && mx != sc->mx_voted)
-		error = qcom_rpmh_arc_vote_level("mx.lvl", mx);
+		error = qcom_rpmh_req_level(sc->mx, mx);
 	if (error == 0 && mmcx < sc->mmcx_voted)
-		error = qcom_rpmh_arc_vote_level("mmcx.lvl", mmcx);
+		error = qcom_rpmh_req_level(sc->mmcx, mmcx);
 	if (error != 0) {
 		VCC_PRINTF(sc, "cannot vote the rails: %d\n", error);
 		return (error);
@@ -693,6 +691,8 @@ qcom_videocc_destroy(struct qcom_videocc *sc)
 	if (sc == NULL)
 		return;
 	qcom_videocc_ctrl_disable(sc);
+	qcom_rpmh_req_put(sc->mx);
+	qcom_rpmh_req_put(sc->mmcx);
 	pmap_unmapdev(__DEVOLATILE(void *, sc->gcc), sc->desc->gcc_size);
 	pmap_unmapdev(__DEVOLATILE(void *, sc->cc), sc->desc->cc_size);
 	free(sc, M_QCOM_VIDEOCC);
@@ -740,6 +740,8 @@ qcom_videocc_test_sysctl(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+SYSCTL_NODE(_hw, OID_AUTO, qcom_videocc, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Qualcomm video clocks");
 SYSCTL_PROC(_hw_qcom_videocc, OID_AUTO, test,
     CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, NULL, 0,
     qcom_videocc_test_sysctl, "I",

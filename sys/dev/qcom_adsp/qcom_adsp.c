@@ -147,6 +147,8 @@ struct qcom_adsp_softc {
 	struct timeout_task		start_task;
 	eventhandler_tag		mountroot_tag;
 	bool				voted;	/* the boot votes held */
+	struct qcom_rpmh_req		*rail_req;
+	struct qcom_rpmh_req		*bcm_req[4];
 	struct timeout_task		release_task;
 	int				release_wait; /* seconds left */
 };
@@ -216,7 +218,12 @@ qcom_adsp_votes(struct qcom_adsp_softc *sc, bool on)
 	int error, i;
 
 	if (b->rail != NULL) {
-		error = qcom_rpmh_arc_vote(b->rail, on ? QCOM_RPMH_ARC_MAX : 0);
+		if (sc->rail_req == NULL)
+			sc->rail_req = qcom_rpmh_req_get(b->rail,
+			    device_get_nameunit(sc->dev), &error);
+		if (sc->rail_req != NULL)
+			error = qcom_rpmh_req_level(sc->rail_req,
+			    on ? QCOM_RPMH_ARC_MAX : 0);
 		if (error != 0) {
 			device_printf(sc->dev, "no vote for %s: %d\n", b->rail,
 			    error);
@@ -224,8 +231,12 @@ qcom_adsp_votes(struct qcom_adsp_softc *sc, bool on)
 		}
 	}
 	for (i = 0; i < (int)nitems(b->bcms) && b->bcms[i] != NULL; i++) {
-		error = qcom_rpmh_bcm_vote(b->bcms[i], 0,
-		    on ? QCOM_RPMH_BCM_MAX : 0);
+		if (sc->bcm_req[i] == NULL)
+			sc->bcm_req[i] = qcom_rpmh_req_get(b->bcms[i],
+			    device_get_nameunit(sc->dev), &error);
+		if (sc->bcm_req[i] != NULL)
+			error = qcom_rpmh_req_bw(sc->bcm_req[i], 0,
+			    on ? QCOM_RPMH_BCM_MAX : 0);
 		if (error != 0) {
 			device_printf(sc->dev, "no vote for %s: %d\n",
 			    b->bcms[i], error);
@@ -539,6 +550,7 @@ static int
 qcom_adsp_detach(device_t dev)
 {
 	struct qcom_adsp_softc *sc = device_get_softc(dev);
+	int i;
 
 	if (sc->mountroot_tag != NULL)
 		EVENTHANDLER_DEREGISTER(mountroot, sc->mountroot_tag);
@@ -556,6 +568,9 @@ qcom_adsp_detach(device_t dev)
 	 */
 	if (sc->state == QCOM_ADSP_RUNNING)
 		return (EBUSY);
+	qcom_rpmh_req_put(sc->rail_req);
+	for (i = 0; i < (int)nitems(sc->bcm_req); i++)
+		qcom_rpmh_req_put(sc->bcm_req[i]);
 	mtx_destroy(&sc->mtx);
 	return (0);
 }

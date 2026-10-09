@@ -33,14 +33,28 @@
 
 /* An active-only RPMh write, acknowledged.  Sleeps. */
 int	qcom_rpmh_write(uint32_t addr, uint32_t data);
-/* Vote a rail ("nsp.lvl") to a level index, or its highest. */
-int	qcom_rpmh_arc_vote(const char *res, u_int hlvl);
+
 /*
- * Vote a rail to its lowest level at or above a voltage level (the vlvl of
- * Linux's devicetrees: 256 nominal, 384 turbo, ...).
+ * A driver's request on an RPMh resource: a rail ("mmcx.lvl") or a BCM
+ * ("MM1").  RPMh gets the aggregate of every driver's request on it: a
+ * rail's highest level, a BCM's summed average and highest peak.  Get one
+ * per resource (NULL, with *errorp, if the resource is unknown or the
+ * command DB isn't up yet), vote with it, put it to withdraw its vote.
+ * Sleeps.
  */
-int	qcom_rpmh_arc_vote_level(const char *res, u_int vlvl);
-/* Vote a BCM ("NSA0") to an average and peak bandwidth, in its units. */
-int	qcom_rpmh_bcm_vote(const char *bcm, uint32_t avg, uint32_t peak);
+struct qcom_rpmh_req;
+
+struct qcom_rpmh_req *qcom_rpmh_req_get(const char *res, const char *client,
+	    int *errorp);
+void	qcom_rpmh_req_put(struct qcom_rpmh_req *req);
+/*
+ * A rail to its lowest level at or above a voltage level (the vlvl of
+ * Linux's devicetrees: 256 nominal, 384 turbo, ...); 0 for none,
+ * QCOM_RPMH_ARC_MAX for its highest.
+ */
+int	qcom_rpmh_req_level(struct qcom_rpmh_req *req, u_int vlvl);
+/* A BCM's average and peak bandwidth, in its units. */
+int	qcom_rpmh_req_bw(struct qcom_rpmh_req *req, uint32_t avg,
+	    uint32_t peak);
 
 #endif /* _DEV_QCOM_RPMH_QCOM_RPMH_H_ */
