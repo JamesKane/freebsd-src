@@ -353,10 +353,14 @@ pm_runtime_mark_last_busy(struct device *dev)
 {
 	struct lkpi_rpm *r;
 
-	if ((r = lkpi_rpm_get(dev)) == NULL)
-		return;
-	r->last_busy = jiffies;
-	mutex_unlock(&r->lock);
+	/*
+	 * Lockless, as Linux's: drivers call it from their runtime PM
+	 * callbacks, which run with the state locked.  Nothing to mark before
+	 * the state exists: it is made busy now.
+	 */
+	r = dev_is_pci(dev) ? NULL : dev->power.lkpi_rpm;
+	if (r != NULL)
+		WRITE_ONCE(r->last_busy, jiffies);
 }
 
 void
@@ -522,10 +526,11 @@ pm_runtime_active(struct device *dev)
 	struct lkpi_rpm *r;
 	bool active;
 
-	if ((r = lkpi_rpm_get(dev)) == NULL)
+	/* Lockless, as Linux's status queries (see mark_last_busy). */
+	r = dev_is_pci(dev) ? NULL : dev->power.lkpi_rpm;
+	if (r == NULL)
 		return (true);
-	active = r->active || r->disable_depth > 0;
-	mutex_unlock(&r->lock);
+	active = READ_ONCE(r->active) || READ_ONCE(r->disable_depth) > 0;
 	return (active);
 }
 
@@ -535,10 +540,10 @@ pm_runtime_suspended(struct device *dev)
 	struct lkpi_rpm *r;
 	bool suspended;
 
-	if ((r = lkpi_rpm_get(dev)) == NULL)
+	r = dev_is_pci(dev) ? NULL : dev->power.lkpi_rpm;
+	if (r == NULL)
 		return (false);
-	suspended = !r->active && r->disable_depth == 0;
-	mutex_unlock(&r->lock);
+	suspended = !READ_ONCE(r->active) && READ_ONCE(r->disable_depth) == 0;
 	return (suspended);
 }
 
@@ -548,10 +553,10 @@ pm_runtime_status_suspended(struct device *dev)
 	struct lkpi_rpm *r;
 	bool suspended;
 
-	if ((r = lkpi_rpm_get(dev)) == NULL)
+	r = dev_is_pci(dev) ? NULL : dev->power.lkpi_rpm;
+	if (r == NULL)
 		return (false);
-	suspended = !r->active;
-	mutex_unlock(&r->lock);
+	suspended = !READ_ONCE(r->active);
 	return (suspended);
 }
 
