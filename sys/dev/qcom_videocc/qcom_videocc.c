@@ -31,15 +31,18 @@
  *
  * Linux's references: videocc-sm8350.c (which the SC8280XP shares, with
  * its own offsets for a few registers), the GCC's video clocks, and the Iris
- * driver's power-on order.  The rates are fixed: video_pll0 at 1599 MHz,
- * which the controller clock divides by 2 (799.5 MHz) and the core clock by
- * 3 (533 MHz, the OPP Linux runs the codec at, which needs MMCX at turbo).
+ * driver's power-on order.  The core clock is video_pll0 divided by 3 (the
+ * controller clock by 2): a level of the core clock (Linux's OPPs, 240 to
+ * 560 MHz) is a rate of the PLL, retuned while it runs, and levels of the
+ * MX and MMCX rails.
  *
  * RPMh keeps one vote per rail for the application processors, and nothing
  * here aggregates votes: the display runs on what UEFI voted for MMCX.  The
- * rails are therefore only ever raised, never lowered, and the video clock
- * controller is touched only once they are: it lives in MMCX, and reading
- * it with MMCX off resets the SoC.
+ * votes therefore never go below a floor that covers the display
+ * (hw.qcom_videocc.mmcx_floor: nominal covers its MDP clock up to 500 MHz,
+ * UEFI's runs at 300, and any DisplayPort link rate), and the video clock
+ * controller is touched only with them up: it lives in MMCX, and reading it
+ * with MMCX off resets the SoC.
  */
 
 #include "opt_acpi.h"
@@ -113,10 +116,17 @@
 #define	POLL_US			2000
 #define	RESET_US		400	/* as Linux's resets for these blocks */
 
-struct qcom_videocc_pll_cfg {
-	uint32_t	l;		/* rate = XO * (l + alpha / 2^16) */
+/* A level of the core clock: the PLL's rate, and the rails it needs. */
+struct qcom_videocc_level {
+	u_long		hz;		/* the core clock: the PLL's / 3 */
+	uint32_t	l;		/* PLL rate = XO * (l + alpha / 2^16) */
 	uint32_t	alpha;
-	/* The rest as Linux writes them: zeros are left alone. */
+	u_int		mx_vlvl;
+	u_int		mmcx_vlvl;
+};
+
+struct qcom_videocc_pll_cfg {
+	/* As Linux writes them: zeros are left alone. */
 	uint32_t	config_ctl, config_ctl_u, config_ctl_u1;
 	uint32_t	user_ctl, user_ctl_u, user_ctl_u1;
 	uint32_t	test_ctl, test_ctl_u, test_ctl_u1;
@@ -129,9 +139,9 @@ struct qcom_videocc_desc {
 	vm_size_t	gcc_size;
 	vm_paddr_t	cc_base;
 	vm_size_t	cc_size;
-	/* Rails, as Linux's OPP for the core clock needs them. */
-	u_int		mx_vlvl;
-	u_int		mmcx_vlvl;
+	/* The core clock's levels, slowest first (Linux's OPPs). */
+	const struct qcom_videocc_level *levels;
+	u_int		nlevels;
 	/* GCC (relative to gcc_base): always on, and the codec's bus. */
 	uint32_t	gcc_ahb, gcc_xo, gcc_axi;
 	/* Video CC: always on. */
@@ -146,10 +156,17 @@ struct qcom_videocc_desc {
 	uint32_t	hw_gdscr, hw_cbcr;
 };
 
-/* 1599 MHz: 19.2 MHz * (0x53 + 0x4800 / 2^16); otherwise as Linux's. */
+/* RPMh levels: low SVS 64, SVS 128, SVS L1 192, nominal 256, turbo 384, L1 416. */
+static const struct qcom_videocc_level sc8280xp_levels[] = {
+	{ 240000000, 0x25, 0x8000, 128,  64 },	/*  720 MHz */
+	{ 338000000, 0x34, 0xd000, 128, 128 },	/* 1014 MHz */
+	{ 366000000, 0x39, 0x3000, 192, 192 },	/* 1098 MHz */
+	{ 444000000, 0x45, 0x6000, 192, 256 },	/* 1332 MHz */
+	{ 533000000, 0x53, 0x4800, 256, 384 },	/* 1599 MHz */
+	{ 560000000, 0x57, 0x8000, 256, 416 },	/* 1680 MHz */
+};
+
 static const struct qcom_videocc_pll_cfg sc8280xp_pll0 = {
-	.l = 0x53,
-	.alpha = 0x4800,
 	.config_ctl = 0x20485699,
 	.config_ctl_u = 0x00002261,
 	.config_ctl_u1 = 0x2a9a699c,
@@ -164,8 +181,8 @@ static const struct qcom_videocc_desc qcom_videocc_socs[] = {
 		.gcc_size = 0x1000,
 		.cc_base = 0xabf0000,
 		.cc_size = 0x10000,
-		.mx_vlvl = 256,			/* nominal */
-		.mmcx_vlvl = 384,		/* turbo */
+		.levels = sc8280xp_levels,
+		.nlevels = nitems(sc8280xp_levels),
 		.gcc_ahb = 0x004,
 		.gcc_xo = 0x028,
 		.gcc_axi = 0x010,		/* GCC_VIDEO_AXI0 */
@@ -188,12 +205,23 @@ struct qcom_videocc {
 	const struct qcom_videocc_desc	*desc;
 	volatile uint32_t		*gcc;
 	volatile uint32_t		*cc;
-	bool				voted;
+	u_int				level;	/* the core clock's */
+	u_int				mx_voted, mmcx_voted;
 	bool				ctrl_on;
 	bool				hw_on;
 };
 
 static MALLOC_DEFINE(M_QCOM_VIDEOCC, "qcom_videocc", "Qualcomm video clocks");
+
+SYSCTL_NODE(_hw, OID_AUTO, qcom_videocc, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Qualcomm video clocks");
+static u_int qcom_videocc_mx_floor = 128;		/* SVS */
+SYSCTL_UINT(_hw_qcom_videocc, OID_AUTO, mx_floor, CTLFLAG_RDTUN,
+    &qcom_videocc_mx_floor, 0, "Lowest MX level voted (RPMh vlvl)");
+static u_int qcom_videocc_mmcx_floor = 256;		/* nominal */
+SYSCTL_UINT(_hw_qcom_videocc, OID_AUTO, mmcx_floor, CTLFLAG_RDTUN,
+    &qcom_videocc_mmcx_floor, 0,
+    "Lowest MMCX level voted (RPMh vlvl), for the display UEFI set up");
 
 #define	VCC_PRINTF(sc, ...) do {					\
 	if ((sc)->dev != NULL)						\
@@ -268,23 +296,32 @@ qcom_videocc_branch_disable(struct qcom_videocc *sc, bool gcc, uint32_t reg)
 	qcom_videocc_set(sc, gcc, reg, CBCR_CLK_ENABLE, 0);
 }
 
-/* The rails up, once (see above: never lowered). */
+/*
+ * The rails for a level, or (lvl NULL) for none, never below the floors.
+ * MMCX before MX going up, MX before MMCX going down, as Linux orders the
+ * codec's required OPPs.
+ */
 static int
-qcom_videocc_vote(struct qcom_videocc *sc)
+qcom_videocc_vote(struct qcom_videocc *sc, const struct qcom_videocc_level *lvl)
 {
-	const struct qcom_videocc_desc *d = sc->desc;
+	u_int mx, mmcx;
 	int error;
 
-	if (sc->voted)
-		return (0);
-	error = qcom_rpmh_arc_vote_level("mx.lvl", d->mx_vlvl);
-	if (error == 0)
-		error = qcom_rpmh_arc_vote_level("mmcx.lvl", d->mmcx_vlvl);
+	mx = MAX(lvl != NULL ? lvl->mx_vlvl : 0, qcom_videocc_mx_floor);
+	mmcx = MAX(lvl != NULL ? lvl->mmcx_vlvl : 0, qcom_videocc_mmcx_floor);
+	error = 0;
+	if (mmcx > sc->mmcx_voted)
+		error = qcom_rpmh_arc_vote_level("mmcx.lvl", mmcx);
+	if (error == 0 && mx != sc->mx_voted)
+		error = qcom_rpmh_arc_vote_level("mx.lvl", mx);
+	if (error == 0 && mmcx < sc->mmcx_voted)
+		error = qcom_rpmh_arc_vote_level("mmcx.lvl", mmcx);
 	if (error != 0) {
 		VCC_PRINTF(sc, "cannot vote the rails: %d\n", error);
 		return (error);
 	}
-	sc->voted = true;
+	sc->mx_voted = mx;
+	sc->mmcx_voted = mmcx;
 	return (0);
 }
 
@@ -304,13 +341,38 @@ qcom_videocc_pll_write(struct qcom_videocc *sc, uint32_t reg, uint32_t v)
 		qcom_videocc_write(sc, false, sc->desc->pll + reg, v);
 }
 
+/* A running PLL to a level's rate, through the latch, as Linux's set_rate. */
+static int
+qcom_videocc_pll_retune(struct qcom_videocc *sc,
+    const struct qcom_videocc_level *lvl)
+{
+	uint32_t p = sc->desc->pll;
+	int error;
+
+	if (qcom_videocc_read(sc, false, p + PLL_L_VAL) == lvl->l &&
+	    qcom_videocc_read(sc, false, p + PLL_ALPHA_VAL) == lvl->alpha)
+		return (0);
+	qcom_videocc_write(sc, false, p + PLL_L_VAL, lvl->l);
+	qcom_videocc_write(sc, false, p + PLL_ALPHA_VAL, lvl->alpha);
+	qcom_videocc_set(sc, false, p + PLL_MODE, 0, PLL_LATCH_INPUT);
+	DELAY(1);
+	if ((qcom_videocc_read(sc, false, p + PLL_MODE) & PLL_ACK_LATCH) == 0)
+		VCC_PRINTF(sc, "video PLL didn't latch its rate\n");
+	qcom_videocc_set(sc, false, p + PLL_MODE, PLL_LATCH_INPUT, 0);
+	error = qcom_videocc_poll(sc, false, p + PLL_MODE, PLL_LOCK_DET,
+	    PLL_LOCK_DET, "video PLL lock");
+	DELAY(100);
+	return (error);
+}
+
 /*
- * The PLL at its rate.  If firmware left it running, retune it through the
- * latch, as Linux's set_rate (stopping it could hang clocks it feeds);
- * otherwise configure it and start it, as Linux's configure and enable.
+ * The PLL at a level's rate.  If firmware left it running, retune it
+ * (stopping it could hang clocks it feeds); otherwise configure it and start
+ * it, as Linux's configure and enable.
  */
 static int
-qcom_videocc_pll_enable(struct qcom_videocc *sc)
+qcom_videocc_pll_enable(struct qcom_videocc *sc,
+    const struct qcom_videocc_level *lvl)
 {
 	const struct qcom_videocc_pll_cfg *c = sc->desc->pll_cfg;
 	uint32_t p = sc->desc->pll;
@@ -321,28 +383,13 @@ qcom_videocc_pll_enable(struct qcom_videocc *sc)
 		VCC_PRINTF(sc, "video PLL is in FSM mode\n");
 		return (ENXIO);
 	}
-	if (qcom_videocc_pll_running(sc)) {
-		if (qcom_videocc_read(sc, false, p + PLL_L_VAL) == c->l &&
-		    qcom_videocc_read(sc, false, p + PLL_ALPHA_VAL) == c->alpha)
-			return (0);
-		qcom_videocc_write(sc, false, p + PLL_L_VAL, c->l);
-		qcom_videocc_write(sc, false, p + PLL_ALPHA_VAL, c->alpha);
-		qcom_videocc_set(sc, false, p + PLL_MODE, 0, PLL_LATCH_INPUT);
-		DELAY(1);
-		if ((qcom_videocc_read(sc, false, p + PLL_MODE) &
-		    PLL_ACK_LATCH) == 0)
-			VCC_PRINTF(sc, "video PLL didn't latch its rate\n");
-		qcom_videocc_set(sc, false, p + PLL_MODE, PLL_LATCH_INPUT, 0);
-		error = qcom_videocc_poll(sc, false, p + PLL_MODE,
-		    PLL_LOCK_DET, PLL_LOCK_DET, "video PLL lock");
-		DELAY(100);
-		return (error);
-	}
+	if (qcom_videocc_pll_running(sc))
+		return (qcom_videocc_pll_retune(sc, lvl));
 
 	/* Configure. */
-	qcom_videocc_pll_write(sc, PLL_L_VAL, c->l);
+	qcom_videocc_pll_write(sc, PLL_L_VAL, lvl->l);
 	qcom_videocc_write(sc, false, p + PLL_CAL_L_VAL, PLL_CAL_VAL);
-	qcom_videocc_pll_write(sc, PLL_ALPHA_VAL, c->alpha);
+	qcom_videocc_pll_write(sc, PLL_ALPHA_VAL, lvl->alpha);
 	qcom_videocc_pll_write(sc, PLL_CONFIG_CTL, c->config_ctl);
 	qcom_videocc_pll_write(sc, PLL_CONFIG_CTL_U, c->config_ctl_u);
 	qcom_videocc_pll_write(sc, PLL_CONFIG_CTL_U1, c->config_ctl_u1);
@@ -426,11 +473,12 @@ int
 qcom_videocc_ctrl_enable(struct qcom_videocc *sc)
 {
 	const struct qcom_videocc_desc *d = sc->desc;
+	const struct qcom_videocc_level *lvl = &d->levels[sc->level];
 	int error;
 
 	if (sc->ctrl_on)
 		return (0);
-	if ((error = qcom_videocc_vote(sc)) != 0)
+	if ((error = qcom_videocc_vote(sc, lvl)) != 0)
 		return (error);
 	/* GCC's always-on video clocks: the video CC's register access. */
 	qcom_videocc_set(sc, true, d->gcc_ahb, 0, CBCR_CLK_ENABLE);
@@ -447,8 +495,8 @@ qcom_videocc_ctrl_enable(struct qcom_videocc *sc)
 		    qcom_videocc_read(sc, false, d->ctrl_gdscr),
 		    qcom_videocc_read(sc, false, d->hw_gdscr));
 
-	if ((error = qcom_videocc_pll_enable(sc)) != 0)
-		return (error);
+	if ((error = qcom_videocc_pll_enable(sc, lvl)) != 0)
+		goto unvote;
 	if ((error = qcom_videocc_rcg_set(sc, d->core_rcg,
 	    d->core_rcg_cfg)) != 0)
 		goto pll;
@@ -476,6 +524,8 @@ axi:
 	qcom_videocc_gdsc_disable(sc, d->ctrl_gdscr);
 pll:
 	qcom_videocc_pll_disable(sc);
+unvote:
+	(void)qcom_videocc_vote(sc, NULL);
 	return (error);
 }
 
@@ -491,7 +541,60 @@ qcom_videocc_ctrl_disable(struct qcom_videocc *sc)
 	qcom_videocc_branch_disable(sc, true, d->gcc_axi);
 	qcom_videocc_gdsc_disable(sc, d->ctrl_gdscr);
 	qcom_videocc_pll_disable(sc);
+	(void)qcom_videocc_vote(sc, NULL);
 	sc->ctrl_on = false;
+}
+
+/* The slowest level at least hz, or the fastest: Linux's OPP ceiling. */
+static u_int
+qcom_videocc_level_for(struct qcom_videocc *sc, u_long hz)
+{
+	const struct qcom_videocc_desc *d = sc->desc;
+	u_int i;
+
+	for (i = 0; i < d->nlevels - 1 && d->levels[i].hz < hz; i++)
+		;
+	return (i);
+}
+
+/* While the controller is off, the level is kept for its next start. */
+int
+qcom_videocc_set_rate(struct qcom_videocc *sc, u_long hz)
+{
+	const struct qcom_videocc_desc *d = sc->desc;
+	const struct qcom_videocc_level *lvl;
+	u_int i;
+	int error;
+
+	i = qcom_videocc_level_for(sc, hz);
+	if (i == sc->level)
+		return (0);
+	lvl = &d->levels[i];
+	if (!sc->ctrl_on) {
+		sc->level = i;
+		return (0);
+	}
+	/* Rails up before the clock, down after it. */
+	if (i > sc->level && (error = qcom_videocc_vote(sc, lvl)) != 0)
+		return (error);
+	if ((error = qcom_videocc_pll_retune(sc, lvl)) != 0) {
+		(void)qcom_videocc_vote(sc, &d->levels[sc->level]);
+		return (error);
+	}
+	sc->level = i;
+	return (qcom_videocc_vote(sc, lvl));
+}
+
+u_long
+qcom_videocc_round_rate(struct qcom_videocc *sc, u_long hz)
+{
+	return (sc->desc->levels[qcom_videocc_level_for(sc, hz)].hz);
+}
+
+u_long
+qcom_videocc_get_rate(struct qcom_videocc *sc)
+{
+	return (sc->desc->levels[sc->level].hz);
 }
 
 /* The codec core: its power domain, then its clock. */
@@ -577,6 +680,7 @@ qcom_videocc_create(device_t dev)
 	sc = malloc(sizeof(*sc), M_QCOM_VIDEOCC, M_WAITOK | M_ZERO);
 	sc->dev = dev;
 	sc->desc = d;
+	sc->level = d->nlevels - 1;
 	/* Firmware describes neither; map them by address. */
 	sc->gcc = pmap_mapdev(d->gcc_base, d->gcc_size);
 	sc->cc = pmap_mapdev(d->cc_base, d->cc_size);
@@ -636,8 +740,6 @@ qcom_videocc_test_sysctl(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_NODE(_hw, OID_AUTO, qcom_videocc, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
-    "Qualcomm video clocks");
 SYSCTL_PROC(_hw_qcom_videocc, OID_AUTO, test,
     CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, NULL, 0,
     qcom_videocc_test_sysctl, "I",
