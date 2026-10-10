@@ -56,5 +56,12 @@ int	qcom_rpmh_req_level(struct qcom_rpmh_req *req, u_int vlvl);
 /* A BCM's average and peak bandwidth, in its units. */
 int	qcom_rpmh_req_bw(struct qcom_rpmh_req *req, uint32_t avg,
 	    uint32_t peak);
+/*
+ * A BCM's bandwidth in kB/s, as an interconnect node of buswidth bytes and
+ * channels passes it (Linux's qcom_icc_node), in its units as Linux's
+ * bcm-voter converts it.
+ */
+int	qcom_rpmh_req_kbps(struct qcom_rpmh_req *req, uint32_t avg_kbps,
+	    uint32_t peak_kbps, u_int buswidth, u_int channels);
 
 #endif /* _DEV_QCOM_RPMH_QCOM_RPMH_H_ */

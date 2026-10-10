@@ -47,6 +47,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -239,6 +240,8 @@ struct qcom_rpmh_res {
 	bool			arc;		/* or a BCM */
 	const uint16_t		*lv;		/* ARC: the levels (vlvl) */
 	u_int			nlv;
+	uint32_t		unit;		/* BCM: its units (cmd-db) */
+	uint16_t		width;
 	bool			sent_valid;
 	uint32_t		sent;		/* ARC: index; BCM: the command */
 };
@@ -255,12 +258,11 @@ static const struct qcom_rpmh_floor qcom_rpmh_floors[] = {
 	/*
 	 * SC8280XP: the display (DP2, MDP clock at 300 MHz from UEFI) needs
 	 * MMCX at SVS, nominal for MDP to 500 MHz or HBR3; MX at SVS has run
-	 * it; UEFI's bandwidth vote for MM1 (the display's and the video
-	 * codec's path to memory) is unknown, so it stays at its peak.
+	 * it.  Its path to memory is MM0, which RPMh keeps alive: Linux, with
+	 * the same display, votes nothing on MM1 while the video codec idles.
 	 */
 	{ 449, "mmcx.lvl", 256, "display (UEFI)" },
 	{ 449, "mx.lvl", 128, "display (UEFI)" },
-	{ 449, "MM1", QCOM_RPMH_BCM_MAX, "display (UEFI), unknown" },
 };
 
 static TAILQ_HEAD(, qcom_rpmh_res) qcom_rpmh_resources =
@@ -366,23 +368,31 @@ qcom_rpmh_res_find(const char *name, struct qcom_rpmh_res **resp)
 	if (addr == 0 || (type != QCOM_CMD_DB_HW_ARC &&
 	    type != QCOM_CMD_DB_HW_BCM) || strlen(name) >= sizeof(res->name))
 		return (ENOENT);
-	lv = NULL;
+	lv = qcom_cmd_db_read_aux_data(name, &len);
 	n = 0;
 	if (type == QCOM_CMD_DB_HW_ARC) {
-		lv = qcom_cmd_db_read_aux_data(name, &len);
 		if (lv == NULL)
 			return (ENOENT);
 		/* Zero padding after the first entry ends the list. */
 		for (n = 1; n < len / 2 && lv[n] != 0; n++)
 			;
-	}
+	} else if (lv == NULL || len < 6)
+		return (ENOENT);
 	res = malloc(sizeof(*res), M_QCOM_RPMH, M_WAITOK | M_ZERO);
 	TAILQ_INIT(&res->reqs);
 	strlcpy(res->name, name, sizeof(res->name));
 	res->addr = addr;
 	res->arc = type == QCOM_CMD_DB_HW_ARC;
-	res->lv = lv;
-	res->nlv = n;
+	if (res->arc) {
+		res->lv = lv;
+		res->nlv = n;
+	} else {
+		/* Linux's struct bcm_db: unit (le32), width (le16), vcd. */
+		res->unit = le32dec(lv);
+		res->width = le16dec((const uint8_t *)lv + 4);
+		if (res->unit == 0)
+			res->unit = 1;
+	}
 	TAILQ_INSERT_TAIL(&qcom_rpmh_resources, res, link);
 
 	if (ACPI_SUCCESS(acpi_GetInteger(ACPI_ROOT_OBJECT, "\\_SB.SOID", &id)))
@@ -474,6 +484,34 @@ qcom_rpmh_req_bw(struct qcom_rpmh_req *req, uint32_t avg, uint32_t peak)
 	return (error);
 }
 
+/* Linux's bcm_div(): small votes aren't lost. */
+static uint64_t
+qcom_rpmh_bcm_div(uint64_t num, uint32_t base)
+{
+	if (num != 0 && num < base)
+		return (1);
+	return (num / base);
+}
+
+int
+qcom_rpmh_req_kbps(struct qcom_rpmh_req *req, uint32_t avg_kbps,
+    uint32_t peak_kbps, u_int buswidth, u_int channels)
+{
+	struct qcom_rpmh_res *res = req->res;
+	uint64_t x, y;
+
+	if (res->arc || buswidth == 0 || channels == 0)
+		return (EINVAL);
+	/* As Linux's bcm_aggregate(), with its vote_scale of 1000. */
+	x = qcom_rpmh_bcm_div((uint64_t)avg_kbps * res->width,
+	    buswidth * channels);
+	x = qcom_rpmh_bcm_div(x * 1000, res->unit);
+	y = qcom_rpmh_bcm_div((uint64_t)peak_kbps * res->width, buswidth);
+	y = qcom_rpmh_bcm_div(y * 1000, res->unit);
+	return (qcom_rpmh_req_bw(req, MIN(x, QCOM_RPMH_BCM_MAX),
+	    MIN(y, QCOM_RPMH_BCM_MAX)));
+}
+
 /*
  * By hand: a rail to its highest level ("nsp.lvl"), or a BCM's peak, held
  * by a "sysctl" request until the module goes (it doesn't).
@@ -518,9 +556,9 @@ qcom_rpmh_votes_sysctl(SYSCTL_HANDLER_ARGS)
 			sbuf_printf(sb, ": level %u (vlvl %u)", res->sent,
 			    res->lv[res->sent]);
 		else
-			sbuf_printf(sb, ": average %u, peak %u",
-			    res->sent >> 14 & QCOM_RPMH_BCM_MAX,
-			    res->sent & QCOM_RPMH_BCM_MAX);
+			sbuf_printf(sb, ": average %u, peak %u (unit %u, "
+			    "width %u)", res->sent >> 14 & QCOM_RPMH_BCM_MAX,
+			    res->sent & QCOM_RPMH_BCM_MAX, res->unit, res->width);
 		TAILQ_FOREACH(rq, &res->reqs, link) {
 			if (res->arc)
 				sbuf_printf(sb, "\n  %-24s vlvl %u", rq->client,
