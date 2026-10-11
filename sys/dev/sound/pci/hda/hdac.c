@@ -1678,6 +1678,29 @@ hdac_attach2(void *arg)
 			    revisionid == HDA_INVALID) {
 				device_printf(sc->dev,
 				    "CODEC at address %d not responding!\n", i);
+				device_printf(sc->dev, "GCTL %#x STATESTS/WAKEEN "
+				    "%#x INTCTL %#x INTSTS %#x\n",
+				    HDAC_READ_4(&sc->mem, HDAC_GCTL),
+				    HDAC_READ_4(&sc->mem, 0x0c),
+				    HDAC_READ_4(&sc->mem, HDAC_INTCTL),
+				    HDAC_READ_4(&sc->mem, HDAC_INTSTS));
+				device_printf(sc->dev, "CORB base %#x:%#x "
+				    "WP/RP %#x CTL/STS/SIZE %#x; RIRB base "
+				    "%#x:%#x WP/RINTCNT %#x CTL/STS/SIZE %#x\n",
+				    HDAC_READ_4(&sc->mem, HDAC_CORBUBASE),
+				    HDAC_READ_4(&sc->mem, HDAC_CORBLBASE),
+				    HDAC_READ_4(&sc->mem, HDAC_CORBWP),
+				    HDAC_READ_4(&sc->mem, HDAC_CORBCTL),
+				    HDAC_READ_4(&sc->mem, HDAC_RIRBUBASE),
+				    HDAC_READ_4(&sc->mem, HDAC_RIRBLBASE),
+				    HDAC_READ_4(&sc->mem, HDAC_RIRBWP),
+				    HDAC_READ_4(&sc->mem, HDAC_RIRBCTL));
+				device_printf(sc->dev, "CORB pa %#jx bus %#jx, "
+				    "RIRB pa %#jx bus %#jx\n",
+				    (uintmax_t)vtophys(sc->corb_dma.dma_vaddr),
+				    (uintmax_t)sc->corb_dma.dma_paddr,
+				    (uintmax_t)vtophys(sc->rirb_dma.dma_vaddr),
+				    (uintmax_t)sc->rirb_dma.dma_paddr);
 				continue;
 			}
 			sc->codecs[i].vendor_id =
