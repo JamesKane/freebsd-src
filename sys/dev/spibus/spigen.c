@@ -23,6 +23,7 @@
  */
 
 #include <sys/cdefs.h>
+#include "opt_acpi.h"
 #include "opt_platform.h"
 #include "opt_spi.h"
 
@@ -60,6 +61,19 @@ static struct ofw_compat_data compat_data[] = {
 
 #endif
 
+#ifdef DEV_ACPI
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
+
+/* Linux spidev's: generic devices, such as a header's chip selects. */
+static char *spigen_acpi_ids[] = {
+	"SPT0001",
+	"SPT0002",
+	"SPT0003",
+	NULL
+};
+#endif
+
 #include "spibus_if.h"
 
 struct spigen_softc {
@@ -80,6 +94,10 @@ struct spigen_mmap {
 static int
 spigen_probe(device_t dev)
 {
+#ifdef DEV_ACPI
+	ACPI_HANDLE h;
+	char **id;
+#endif
 	int rv;
 
 	/*
@@ -93,6 +111,12 @@ spigen_probe(device_t dev)
 	if (ofw_bus_status_okay(dev) &&
 	    ofw_bus_search_compatible(dev, compat_data)->ocd_data)
                 rv = BUS_PROBE_DEFAULT;
+#endif
+#ifdef DEV_ACPI
+	if ((h = acpi_get_handle(dev)) != NULL)
+		for (id = spigen_acpi_ids; *id != NULL; id++)
+			if (acpi_MatchHid(h, *id) != ACPI_MATCHHID_NOMATCH)
+				rv = BUS_PROBE_DEFAULT;
 #endif
 
 	device_set_desc(dev, "SPI Generic IO");
@@ -131,7 +155,8 @@ spigen_attach(device_t dev)
 	mtx_init(&sc->sc_mtx, device_get_nameunit(dev), NULL, MTX_DEF);
 
 	make_dev_args_init(&mda);
-	mda.mda_flags = MAKEDEV_WAITOK;
+	/* Two devices on one chip select fail, not panic. */
+	mda.mda_flags = MAKEDEV_WAITOK | MAKEDEV_CHECKNAME;
 	mda.mda_devsw = &spigen_cdevsw;
 	mda.mda_cr = NULL;
 	mda.mda_uid = UID_ROOT;

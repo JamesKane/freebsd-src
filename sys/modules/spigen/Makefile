@@ -6,6 +6,7 @@ SRCS=	spigen.c
 SRCS+=	\
 	bus_if.h \
 	device_if.h \
+	opt_acpi.h \
 	opt_platform.h \
 	opt_spi.h \
 	spibus_if.h \
