@@ -269,6 +269,7 @@ acpi_spibus_enumerate_child(ACPI_HANDLE handle, UINT32 level,
     void *context, void **result)
 {
 	device_t spibus, child;
+	struct acpi_spibus_ivar *devi;
 	struct spibus_ivar res;
 	ACPI_STATUS status;
 	UINT32 sta;
@@ -308,7 +309,9 @@ acpi_spibus_enumerate_child(ACPI_HANDLE handle, UINT32 level,
 		return (AE_OK);
 	}
 
-	spibus_set_cs(child, res.cs);
+	/* spibus_set_cs() refuses: a chip select is set once, here. */
+	devi = device_get_ivars(child);
+	devi->super_ivar.cs = res.cs;
 	spibus_set_mode(child, res.mode);
 	spibus_set_clock(child, res.clock);
 	spibus_set_cs_delay(child, res.cs_delay);
@@ -483,6 +486,7 @@ acpi_spibus_child_deleted(device_t bus, device_t child)
 
 	if (acpi_get_device(devi->handle) == child)
 		AcpiDetachData(devi->handle, acpi_fake_objhandler);
+	spibus_child_deleted(bus, child);
 }
 
 static int
@@ -561,7 +565,6 @@ static device_method_t acpi_spibus_methods[] = {
 	DEVMETHOD(bus_alloc_resource,   acpi_spibus_alloc_resource),
 #endif
 	DEVMETHOD(bus_add_child,	acpi_spibus_add_child),
-	DEVMETHOD(bus_child_deleted,	spibus_child_deleted),
 	DEVMETHOD(bus_probe_nomatch,	acpi_spibus_probe_nomatch),
 	DEVMETHOD(bus_driver_added,	acpi_spibus_driver_added),
 	DEVMETHOD(bus_child_deleted,	acpi_spibus_child_deleted),
