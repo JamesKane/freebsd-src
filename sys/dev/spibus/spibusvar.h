@@ -75,6 +75,7 @@ SPIBUS_ACCESSOR(cs_delay,	CS_DELAY,	uint32_t)
 
 extern driver_t spibus_driver;
 extern driver_t ofw_spibus_driver;
+extern driver_t acpi_spibus_driver;
 
 int spibus_attach(device_t);
 device_t spibus_add_child_common(device_t, u_int, const char *, int, size_t);

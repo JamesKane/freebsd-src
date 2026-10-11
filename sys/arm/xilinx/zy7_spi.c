@@ -24,8 +24,12 @@
  * SUCH DAMAGE.
  */
 
+#include "opt_acpi.h"
+#include "opt_platform.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/bus.h>
 #include <sys/conf.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
@@ -40,21 +44,33 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#ifdef FDT
 #include <dev/fdt/fdt_common.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#endif
+
+#ifdef DEV_ACPI
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
+#ifdef __aarch64__
+#include <arm64/cix/sky1_scmi.h>
+#endif
+#endif
 
 #include <dev/spibus/spi.h>
 #include <dev/spibus/spibusvar.h>
 
 #include "spibus_if.h"
 
+#ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 	{"xlnx,zy7_spi",		1},
 	{"xlnx,zynq-spi-1.0",		1},
 	{"cdns,spi-r1p6",		1},
 	{NULL,				0}
 };
+#endif
 
 struct zy7_spi_softc {
 	device_t		dev;
@@ -65,8 +81,10 @@ struct zy7_spi_softc {
 	void			*intrhandle;
 
 	uint32_t		cfg_reg_shadow;
-	uint32_t		spi_clock;
+	uint32_t		spi_clock;	/* the fastest */
 	uint32_t		ref_clock;
+	u_int			num_cs;
+	u_int			fifo_depth;
 	unsigned int		spi_clk_real_freq;
 	unsigned int		rx_overflows;
 	unsigned int		tx_underflows;
@@ -81,6 +99,8 @@ struct zy7_spi_softc {
 };
 
 #define ZY7_SPI_DEFAULT_SPI_CLOCK	50000000
+#define ZY7_SPI_DEFAULT_NUM_CS		3	/* Zynq's */
+#define ZY7_SPI_ACPI_DEFAULT_NUM_CS	4	/* the controller's most */
 
 #define SPI_SC_LOCK(sc)		mtx_lock(&(sc)->sc_mtx)
 #define	SPI_SC_UNLOCK(sc)		mtx_unlock(&(sc)->sc_mtx)
@@ -221,9 +241,13 @@ zy7_spi_intr(void *arg)
 
 	istatus = RD4(sc, ZY7_SPI_INTR_STAT_REG);
 
-	/* Stray interrupts can happen if a transfer gets interrupted. */
+	/*
+	 * Stray interrupts can happen if a transfer gets interrupted.  The
+	 * FIFO ones are levels: mask them, or they keep coming.
+	 */
 	if (!sc->busy) {
 		sc->stray_ints++;
+		WR4(sc, ZY7_SPI_INTR_DIS_REG, ~0);
 		SPI_SC_UNLOCK(sc);
 		return;
 	}
@@ -260,8 +284,8 @@ zy7_spi_intr(void *arg)
 	/* Fill transmit fifo. */
 	if (sc->tx_bytes_sent < sc->tx_bytes &&
 	    (istatus & ZY7_SPI_INTR_TX_FIFO_NOT_FULL) != 0) {
-		zy7_spi_write_fifo(sc, MIN(96, sc->tx_bytes -
-			sc->tx_bytes_sent));
+		zy7_spi_write_fifo(sc, MIN(sc->fifo_depth -
+			sc->fifo_depth / 4, sc->tx_bytes - sc->tx_bytes_sent));
 
 		if (sc->tx_bytes_sent == sc->tx_bytes) {
 			/* Disable transmit FIFO interrupt, enable receive
@@ -278,8 +302,6 @@ zy7_spi_intr(void *arg)
 	if (sc->tx_bytes_sent == sc->tx_bytes &&
 	    sc->rx_bytes_rcvd == sc->rx_bytes) {
 		/* De-assert CS. */
-		sc->cfg_reg_shadow &=
-		    ~(ZY7_SPI_CONFIG_CLK_PH | ZY7_SPI_CONFIG_CLK_POL);
 		sc->cfg_reg_shadow |= ZY7_SPI_CONFIG_CS_MASK;
 		WR4(sc, ZY7_SPI_CONFIG_REG, sc->cfg_reg_shadow);
 
@@ -289,17 +311,29 @@ zy7_spi_intr(void *arg)
 	SPI_SC_UNLOCK(sc);
 }
 
+/*
+ * The clock divider for a bus clock of at most hz: 2 << baud_div, divide
+ * by 2 not supported.  8 if even the slowest is too fast.
+ */
+static uint32_t
+zy7_spi_baud_div(struct zy7_spi_softc *sc, uint32_t hz)
+{
+	uint32_t baud_div;
+
+	baud_div = 1;
+	while ((sc->ref_clock >> (baud_div + 1)) > hz && baud_div < 8)
+		baud_div++;
+	return (baud_div);
+}
+
 /* Initialize hardware. */
 static int
 zy7_spi_init_hw(struct zy7_spi_softc *sc)
 {
 	uint32_t baud_div;
 
-	/* Find best clock divider. Divide by 2 not supported. */
-	baud_div = 1;
-	while ((sc->ref_clock >> (baud_div + 1)) > sc->spi_clock &&
-	    baud_div < 8)
-		baud_div++;
+	/* Find best clock divider. */
+	baud_div = zy7_spi_baud_div(sc, sc->spi_clock);
 	if (baud_div >= 8) {
 		device_printf(sc->dev, "cannot configure clock divider: ref=%d"
 		    " spi=%d.\n", sc->ref_clock, sc->spi_clock);
@@ -315,8 +349,15 @@ zy7_spi_init_hw(struct zy7_spi_softc *sc)
 	    ZY7_SPI_CONFIG_MODE_SEL;
 	WR4(sc, ZY7_SPI_CONFIG_REG, sc->cfg_reg_shadow);
 
+	/*
+	 * The FIFO's depth, a synthesis parameter (Zynq's is 128): the
+	 * threshold register holds up to one less.
+	 */
+	WR4(sc, ZY7_SPI_TX_THRESH_REG, 0xffff);
+	sc->fifo_depth = RD4(sc, ZY7_SPI_TX_THRESH_REG) + 1;
+
 	/* Set thresholds. */
-	WR4(sc, ZY7_SPI_TX_THRESH_REG, 32);
+	WR4(sc, ZY7_SPI_TX_THRESH_REG, sc->fifo_depth / 4);
 	WR4(sc, ZY7_SPI_RX_THRESH_REG, 1);
 
 	/* Clear and disable all interrupts. */
@@ -342,6 +383,9 @@ zy7_spi_add_sysctls(device_t dev)
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "spi_clk_real_freq", CTLFLAG_RD,
 	    &sc->spi_clk_real_freq, 0, "SPI clock real frequency");
 
+	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "fifo_depth", CTLFLAG_RD,
+	    &sc->fifo_depth, 0, "FIFO depth");
+
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "rx_overflows", CTLFLAG_RD,
 	    &sc->rx_overflows, 0, "RX FIFO overflow events");
 
@@ -355,6 +399,10 @@ zy7_spi_add_sysctls(device_t dev)
 	    &sc->stray_ints, 0, "stray interrupts");
 }
 
+static int zy7_spi_detach(device_t);
+static int zy7_spi_attach_common(device_t);
+
+#ifdef FDT
 static int
 zy7_spi_probe(device_t dev)
 {
@@ -370,20 +418,16 @@ zy7_spi_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
-static int zy7_spi_detach(device_t);
-
 static int
 zy7_spi_attach(device_t dev)
 {
 	struct zy7_spi_softc *sc;
-	int rid, err;
 	phandle_t node;
 	pcell_t cell;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
-
-	SPI_SC_LOCK_INIT(sc);
+	sc->num_cs = ZY7_SPI_DEFAULT_NUM_CS;
 
 	/* Get ref-clock and spi-clock properties. */
 	node = ofw_bus_get_node(dev);
@@ -397,6 +441,104 @@ zy7_spi_attach(device_t dev)
 		sc->spi_clock = fdt32_to_cpu(cell);
 	else
 		sc->spi_clock = ZY7_SPI_DEFAULT_SPI_CLOCK;
+
+	return (zy7_spi_attach_common(dev));
+}
+#endif /* FDT */
+
+#ifdef DEV_ACPI
+static char *zy7_spi_acpi_ids[] = {
+	"CIXH2001",		/* CIX Sky1 */
+	NULL
+};
+
+static int
+zy7_spi_acpi_probe(device_t dev)
+{
+	int rv;
+
+	if (acpi_disabled("zy7_spi"))
+		return (ENXIO);
+	rv = ACPI_ID_PROBE(device_get_parent(dev), dev, zy7_spi_acpi_ids,
+	    NULL);
+	if (rv <= 0)
+		device_set_desc(dev, "Cadence SPI Controller");
+	return (rv);
+}
+
+/*
+ * The reference clock's rate: _DSD ref-clock, or, on CIX Sky1, the SCMI
+ * clock its CLKT table names (packages of SCMI id, name, device), which
+ * clocks the registers too.
+ */
+static int
+zy7_spi_acpi_ref_clock(device_t dev, uint32_t *freq)
+{
+#ifdef __aarch64__
+	ACPI_BUFFER buf;
+	ACPI_OBJECT *pkg, *e;
+	uint64_t hz;
+	uint32_t id;
+	int error;
+#endif
+
+	if (device_get_property(dev, "ref-clock", freq, sizeof(*freq),
+	    DEVICE_PROP_UINT32) > 0)
+		return (0);
+#ifdef __aarch64__
+	buf.Pointer = NULL;
+	buf.Length = ACPI_ALLOCATE_BUFFER;
+	if (ACPI_FAILURE(AcpiEvaluateObject(acpi_get_handle(dev), "CLKT",
+	    NULL, &buf)))
+		return (ENXIO);
+	pkg = buf.Pointer;
+	error = ENXIO;
+	if (pkg->Type == ACPI_TYPE_PACKAGE && pkg->Package.Count > 0) {
+		e = &pkg->Package.Elements[0];
+		if (e->Type == ACPI_TYPE_PACKAGE && e->Package.Count > 0 &&
+		    e->Package.Elements[0].Type == ACPI_TYPE_INTEGER) {
+			id = e->Package.Elements[0].Integer.Value;
+			if ((error = sky1_scmi_clk_enable(id, true)) == 0 &&
+			    (error = sky1_scmi_clk_get_rate(id, &hz)) == 0)
+				*freq = hz;
+		}
+	}
+	AcpiOsFree(buf.Pointer);
+	return (error);
+#else
+	return (ENXIO);
+#endif
+}
+
+static int
+zy7_spi_acpi_attach(device_t dev)
+{
+	struct zy7_spi_softc *sc;
+
+	sc = device_get_softc(dev);
+	sc->dev = dev;
+	if (zy7_spi_acpi_ref_clock(dev, &sc->ref_clock) != 0) {
+		device_printf(dev, "no reference clock\n");
+		return (ENXIO);
+	}
+	/* As fast as the divider allows; devices ask for less. */
+	sc->spi_clock = sc->ref_clock / 4;
+	if (device_get_property(dev, "num-cs", &sc->num_cs,
+	    sizeof(sc->num_cs), DEVICE_PROP_UINT32) <= 0)
+		sc->num_cs = ZY7_SPI_ACPI_DEFAULT_NUM_CS;
+	return (zy7_spi_attach_common(dev));
+}
+#endif /* DEV_ACPI */
+
+/* Resources, the hardware and the bus, for either attachment. */
+static int
+zy7_spi_attach_common(device_t dev)
+{
+	struct zy7_spi_softc *sc;
+	int rid, err;
+
+	sc = device_get_softc(dev);
+	SPI_SC_LOCK_INIT(sc);
 
 	/* Get memory resource. */
 	rid = 0;
@@ -418,18 +560,27 @@ zy7_spi_attach(device_t dev)
 		return (ENOMEM);
 	}
 
+	if (bootverbose)
+		device_printf(dev, "config %#x enable %#x intr status %#x "
+		    "mask %#x\n", RD4(sc, ZY7_SPI_CONFIG_REG),
+		    RD4(sc, ZY7_SPI_EN_REG), RD4(sc, ZY7_SPI_INTR_STAT_REG),
+		    RD4(sc, ZY7_SPI_INTR_MASK_REG));
+
+	/*
+	 * Configure the device, its interrupts off, before taking them:
+	 * firmware may have left it running.
+	 */
+	err = zy7_spi_init_hw(sc);
+	if (err) {
+		zy7_spi_detach(dev);
+		return (err);
+	}
+
 	/* Activate the interrupt. */
 	err = bus_setup_intr(dev, sc->irq_res, INTR_TYPE_MISC | INTR_MPSAFE,
 	    NULL, zy7_spi_intr, sc, &sc->intrhandle);
 	if (err) {
 		device_printf(dev, "could not setup IRQ.\n");
-		zy7_spi_detach(dev);
-		return (err);
-	}
-
-	/* Configure the device. */
-	err = zy7_spi_init_hw(sc);
-	if (err) {
 		zy7_spi_detach(dev);
 		return (err);
 	}
@@ -482,19 +633,20 @@ zy7_spi_detach(device_t dev)
 	return (0);
 }
 
+#ifdef FDT
 static phandle_t
 zy7_spi_get_node(device_t bus, device_t dev)
 {
 
 	return (ofw_bus_get_node(bus));
 }
+#endif
 
 static int
 zy7_spi_transfer(device_t dev, device_t child, struct spi_command *cmd)
 {
 	struct zy7_spi_softc *sc = device_get_softc(dev);
-	uint32_t cs;
-	uint32_t mode;
+	uint32_t baud_div, cfg, clock, cs, mode;
 	int err = 0;
 
 	KASSERT(cmd->tx_cmd_sz == cmd->rx_cmd_sz,
@@ -505,12 +657,15 @@ zy7_spi_transfer(device_t dev, device_t child, struct spi_command *cmd)
 	/* Get chip select and mode for this child. */
 	spibus_get_cs(child, &cs);
 	cs &= ~SPIBUS_CS_HIGH;
-	if (cs > 2) {
+	if (cs >= sc->num_cs) {
 		device_printf(dev, "Invalid chip select %d requested by %s",
 		    cs, device_get_nameunit(child));
 		return (EINVAL);
 	}
 	spibus_get_mode(child, &mode);
+	spibus_get_clock(child, &clock);
+	if (clock == 0 || clock > sc->spi_clock)
+		clock = sc->spi_clock;
 
 	SPI_SC_LOCK(sc);
 
@@ -531,16 +686,31 @@ zy7_spi_transfer(device_t dev, device_t child, struct spi_command *cmd)
 	sc->rx_bytes = sc->cmd->rx_cmd_sz + sc->cmd->rx_data_sz;
 	sc->rx_bytes_rcvd = 0;
 
+	/* Handle the clock, polarity and phase. */
+	baud_div = MIN(zy7_spi_baud_div(sc, clock), 7);
+	sc->spi_clk_real_freq = sc->ref_clock >> (baud_div + 1);
+	cfg = sc->cfg_reg_shadow & ~(ZY7_SPI_CONFIG_BAUD_RATE_DIV_MASK |
+	    ZY7_SPI_CONFIG_CLK_PH | ZY7_SPI_CONFIG_CLK_POL);
+	cfg |= ZY7_SPI_CONFIG_BAUD_RATE_DIV(baud_div);
+	if (mode == SPIBUS_MODE_CPHA || mode == SPIBUS_MODE_CPOL_CPHA)
+		cfg |= ZY7_SPI_CONFIG_CLK_PH;
+	if (mode == SPIBUS_MODE_CPOL || mode == SPIBUS_MODE_CPOL_CPHA)
+		cfg |= ZY7_SPI_CONFIG_CLK_POL;
+	if (cfg != sc->cfg_reg_shadow) {
+		/*
+		 * A new clock setting applies only across a disable, without
+		 * which a new polarity shows the device stray edges (Linux).
+		 */
+		sc->cfg_reg_shadow = cfg;
+		WR4(sc, ZY7_SPI_EN_REG, 0);
+		WR4(sc, ZY7_SPI_CONFIG_REG, sc->cfg_reg_shadow);
+		WR4(sc, ZY7_SPI_EN_REG, ZY7_SPI_ENABLE);
+	}
+
 	/* Enable interrupts.  zy7_spi_intr() will handle transfer. */
 	WR4(sc, ZY7_SPI_INTR_EN_REG,
 	    ZY7_SPI_INTR_TX_FIFO_NOT_FULL |
 	    ZY7_SPI_INTR_RX_OVERFLOW);
-
-	/* Handle polarity and phase. */
-	if (mode == SPIBUS_MODE_CPHA || mode == SPIBUS_MODE_CPOL_CPHA)
-		sc->cfg_reg_shadow |= ZY7_SPI_CONFIG_CLK_PH;
-	if (mode == SPIBUS_MODE_CPOL || mode == SPIBUS_MODE_CPOL_CPHA)
-		sc->cfg_reg_shadow |= ZY7_SPI_CONFIG_CLK_POL;
 
 	/* Assert CS. */
 	sc->cfg_reg_shadow &= ~ZY7_SPI_CONFIG_CS_MASK;
@@ -561,6 +731,7 @@ zy7_spi_transfer(device_t dev, device_t child, struct spi_command *cmd)
 	return (err);
 }
 
+#ifdef FDT
 static device_method_t zy7_spi_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		zy7_spi_probe),
@@ -586,3 +757,30 @@ DRIVER_MODULE(zy7_spi, simplebus, zy7_spi_driver, 0, 0);
 DRIVER_MODULE(ofw_spibus, zy7_spi, ofw_spibus_driver, 0, 0);
 SIMPLEBUS_PNP_INFO(compat_data);
 MODULE_DEPEND(zy7_spi, ofw_spibus, 1, 1, 1);
+#endif /* FDT */
+
+#ifdef DEV_ACPI
+static device_method_t zy7_spi_acpi_methods[] = {
+	/* Device interface */
+	DEVMETHOD(device_probe,		zy7_spi_acpi_probe),
+	DEVMETHOD(device_attach,	zy7_spi_acpi_attach),
+	DEVMETHOD(device_detach,	zy7_spi_detach),
+
+	/* SPI interface */
+	DEVMETHOD(spibus_transfer,	zy7_spi_transfer),
+
+	DEVMETHOD_END
+};
+
+static driver_t zy7_spi_acpi_driver = {
+	"zy7_spi",
+	zy7_spi_acpi_methods,
+	sizeof(struct zy7_spi_softc),
+};
+
+DRIVER_MODULE(zy7_spi, acpi, zy7_spi_acpi_driver, 0, 0);
+DRIVER_MODULE(acpi_spibus, zy7_spi, acpi_spibus_driver, 0, 0);
+MODULE_DEPEND(zy7_spi, acpi, 1, 1, 1);
+MODULE_DEPEND(zy7_spi, spibus, 1, 1, 1);
+ACPI_PNP_INFO(zy7_spi_acpi_ids);
+#endif /* DEV_ACPI */
