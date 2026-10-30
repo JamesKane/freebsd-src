@@ -2116,9 +2116,11 @@ linuxkpi_dma_sync(struct device *dev, dma_addr_t dma_addr, size_t size,
 {
 	struct linux_dma_priv *priv;
 	struct linux_dma_obj *obj;
+#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__)
 	bus_dmamap_t map;
 	bus_addr_t start, end;
 	int nseg;
+#endif
 
 	priv = dev->dma_priv;
 
@@ -2136,6 +2138,7 @@ linuxkpi_dma_sync(struct device *dev, dma_addr_t dma_addr, size_t size,
 	}
 	DMA_PRIV_UNLOCK(priv);
 
+#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__)
 	/*
 	 * Not a mapping we keep: a 1:1 one, which linux_dma_map_phys_common()
 	 * returns untracked.  Sync the range through a map of its own, for
@@ -2163,6 +2166,7 @@ linuxkpi_dma_sync(struct device *dev, dma_addr_t dma_addr, size_t size,
 		}
 		bus_dmamap_destroy(priv->dmat, map);
 	}
+#endif
 }
 
 void
