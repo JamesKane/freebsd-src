@@ -1987,6 +1987,7 @@ static dma_addr_t
 lkpi_dma_map_aligned(struct device *dev, vm_paddr_t phys, size_t size,
     size_t align, bus_dma_tag_t parent)
 {
+#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__)
 	struct linux_dma_priv *priv;
 	struct lkpi_dma_obj *obj;
 	bus_dma_tag_t dmat;
@@ -2010,6 +2011,13 @@ lkpi_dma_map_aligned(struct device *dev, vm_paddr_t phys, size_t size,
 		obj->own_dmat = dmat;
 	DMA_PRIV_UNLOCK(priv);
 	return (dma);
+#else
+	/*
+	 * Untranslated here (see linux_dma_map_phys_common()): the DMA
+	 * address is the physical one, which the allocation aligned.
+	 */
+	return (linux_dma_map_phys_common(dev, phys, size, parent));
+#endif
 }
 
 void *
