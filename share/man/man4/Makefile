@@ -14,6 +14,7 @@ MANPACKAGE=	kernel-man
 MAN=	aac.4 \
 	aacraid.4 \
 	acpi.4 \
+	${_acpi_apple.4} \
 	${_acpi_asus.4} \
 	${_acpi_asus_wmi.4} \
 	${_acpi_dock.4} \
@@ -57,6 +58,7 @@ MAN=	aac.4 \
 	${_bxe.4} \
 	${_aout.4} \
 	${_apic.4} \
+	${_apm.4} \
 	aq.4 \
 	arcmsr.4 \
 	arswitch.4 \
@@ -352,7 +354,7 @@ MAN=	aac.4 \
 	me.4 \
 	mem.4 \
 	mfi.4 \
-	${_mgb.4} \
+	mgb.4 \
 	miibus.4 \
 	mld.4 \
 	mlx.4 \
@@ -738,6 +740,7 @@ MLINKS+=em.4 if_em.4 \
 	em.4 if_igbv.4 \
 	em.4 lem.4 \
 	em.4 if_lem.4
+MLINKS+=ena.4 if_ena.4
 MLINKS+=enc.4 if_enc.4
 MLINKS+=enic.4 if_enic.4
 MLINKS+=epair.4 if_epair.4
@@ -797,6 +800,7 @@ MLINKS+=me.4 if_me.4
 MLINKS+=mem.4 kmem.4
 MLINKS+=mfi.4 mfi_linux.4 \
 	mfi.4 mfip.4
+MLINKS+=mgb.4 if_mgb.4
 MLINKS+=mlx5en.4 mce.4 \
 	mlx5en.4 if_mce.4
 MLINKS+=mos.4 if_mos.4
@@ -877,6 +881,7 @@ _acpi_wmi.4=	acpi_wmi.4
 _aesni.4=	aesni.4
 _aout.4=	aout.4
 _apic.4=	apic.4
+_apm.4=		apm.4
 _atrtc.4=	atrtc.4
 _attimer.4=	attimer.4
 _aibs.4=	aibs.4
@@ -921,7 +926,6 @@ _io.4=		io.4
 _itwd.4=	itwd.4
 _kvmclock.4=	kvmclock.4
 _mca.4=		mca.4
-_mgb.4=		mgb.4
 _nda.4=		nda.4
 _nfe.4=		nfe.4
 _nfsmb.4=	nfsmb.4
@@ -954,6 +958,7 @@ _xnb.4=		xnb.4
 .endif
 
 .if ${MACHINE_CPUARCH} == "amd64"
+_acpi_apple.4=	acpi_apple.4
 _ioat.4=	ioat.4
 _iwx.4=		iwx.4
 _nvdimm.4=	nvdimm.4

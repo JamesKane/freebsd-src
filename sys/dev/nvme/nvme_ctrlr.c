@@ -612,7 +612,7 @@ nvme_ctrlr_create_qpairs(struct nvme_controller *ctrlr)
 	return (0);
 }
 
-static int
+int
 nvme_ctrlr_delete_qpairs(struct nvme_controller *ctrlr)
 {
 	struct nvme_completion_poll_status	status;
@@ -655,6 +655,40 @@ nvme_ctrlr_construct_namespaces(struct nvme_controller *ctrlr)
 	}
 
 	return (0);
+}
+
+static void
+nvme_ctrlr_notify_ns_added(struct nvme_controller *ctrlr, device_t child)
+{
+	struct nvme_namespace *ns;
+
+	/*
+	 * Notify the consumer of all currently active namespaces.
+	 */
+	for (int i = 0; i < nvme_ctrlr_num_namespaces(ctrlr); i++) {
+		ns = &ctrlr->ns[i];
+		if (ns->data.nsze == 0)
+			continue;
+		NVME_NS_ADDED(child, ns);
+	}
+}
+
+static void
+nvme_ctrlr_notify_ns_recovered(struct nvme_controller *ctrlr)
+{
+	device_t *children;
+	int n_children;
+
+	if (device_get_children(ctrlr->dev, &children, &n_children) != 0)
+		return;
+
+	/*
+	 * A controller failure was reported to every child, so notify every
+	 * child when its namespaces become available again.
+	 */
+	for (int i = 0; i < n_children; i++)
+		nvme_ctrlr_notify_ns_added(ctrlr, children[i]);
+	free(children, M_TEMP);
 }
 
 static bool
@@ -795,7 +829,7 @@ nvme_ctrlr_construct_and_submit_aer(struct nvme_controller *ctrlr,
 	 * Disable timeout here, since asynchronous event requests should by
 	 *  nature never be timed out.
 	 */
-	req->timeout = false;
+	req->timeout_ms = NVME_TIMEOUT_NONE;
 	req->cmd.opc = NVME_OPC_ASYNC_EVENT_REQUEST;
 	nvme_ctrlr_submit_admin_request(ctrlr, req);
 }
@@ -883,6 +917,54 @@ out:
 	if (error && bootverbose)
 		nvme_printf(ctrlr, "failed to configure APST\n");
 	free(data, M_NVME);
+}
+
+/* XXX revisit the ordering if the clock ever comes up earlier. */
+static void
+nvme_ctrlr_set_timestamp(struct nvme_controller *ctrlr)
+{
+	struct nvme_completion_poll_status status;
+	struct nvme_timestamp_data *ts;
+	struct timespec now;
+	uint64_t ms;
+	int i;
+
+	ts = malloc(sizeof(*ts), M_NVME, M_WAITOK | M_ZERO);
+	getnanotime(&now);
+	ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	for (i = 0; i < nitems(ts->tstmp); i++)
+		ts->tstmp[i] = (ms >> (i * 8)) & 0xff;
+
+	status.done = 0;
+	nvme_ctrlr_cmd_set_feature(ctrlr, NVME_FEAT_TIMESTAMP, 0, 0, 0, 0, 0,
+	    ts, sizeof(*ts), nvme_completion_poll_cb, &status);
+	nvme_completion_poll(&status);
+	if (nvme_completion_is_error(&status.cpl) && bootverbose)
+		nvme_printf(ctrlr, "failed to set the timestamp\n");
+	free(ts, M_NVME);
+}
+
+static void
+nvme_ctrlr_timestamp_mountroot(void *arg)
+{
+	struct nvme_controller *ctrlr = arg;
+
+	if (ctrlr->is_failed || ctrlr->is_failed_admin || ctrlr->is_dying)
+		return;
+	nvme_ctrlr_set_timestamp(ctrlr);
+}
+
+static void
+nvme_ctrlr_configure_timestamp(struct nvme_controller *ctrlr)
+{
+	if (NVMEV(NVME_CTRLR_DATA_ONCS_TIMESTAMP, ctrlr->cdata.oncs) == 0)
+		return;
+
+	/* The mountroot handler registered at attach does the initial set. */
+	if (!root_mounted())
+		return;
+
+	nvme_ctrlr_set_timestamp(ctrlr);
 }
 
 static void
@@ -1153,6 +1235,7 @@ nvme_ctrlr_start(void *ctrlr_arg, bool resetting)
 	nvme_ctrlr_configure_aer(ctrlr);
 	nvme_ctrlr_configure_apst(ctrlr);
 	nvme_ctrlr_configure_int_coalescing(ctrlr);
+	nvme_ctrlr_configure_timestamp(ctrlr);
 
 	for (i = 0; i < ctrlr->num_io_queues; i++)
 		nvme_io_qpair_enable(&ctrlr->ioq[i]);
@@ -1194,21 +1277,17 @@ nvme_ctrlr_start_config_hook(void *arg)
 			nvme_printf(ctrlr,
 			    "ignoring Apple-internal namespaces above NSID 1\n");
 
+		if (!root_mounted() &&
+		    NVMEV(NVME_CTRLR_DATA_ONCS_TIMESTAMP, ctrlr->cdata.oncs) != 0)
+			ctrlr->timestamp_tag = EVENTHANDLER_REGISTER(mountroot,
+			    nvme_ctrlr_timestamp_mountroot, ctrlr,
+			    EVENTHANDLER_PRI_ANY);
+
 		ctrlr->is_initialized = true;
 		child = device_add_child(ctrlr->dev, NULL, DEVICE_UNIT_ANY);
 		device_set_ivars(child, ctrlr);
 		bus_attach_children(ctrlr->dev);
-
-		/*
-		 * Now notify the child of all the known namepsaces
-		 */
-		for (int i = 0; i < nvme_ctrlr_num_namespaces(ctrlr); i++) {
-			struct nvme_namespace	*ns = &ctrlr->ns[i];
-
-			if (ns->data.nsze == 0)
-				continue;
-			NVME_NS_ADDED(child, ns);
-		}
+		nvme_ctrlr_notify_ns_added(ctrlr, child);
 	}
 	TSEXIT();
 }
@@ -1217,13 +1296,19 @@ static void
 nvme_ctrlr_reset_task(void *arg, int pending)
 {
 	struct nvme_controller	*ctrlr = arg;
+	bool			recovering;
 	int			status;
 
+	recovering = ctrlr->is_initialized && ctrlr->is_failed;
 	nvme_ctrlr_devctl_log(ctrlr, "RESET", "event=\"start\"");
 	status = nvme_ctrlr_hw_reset(ctrlr);
 	if (status == 0) {
 		nvme_ctrlr_devctl_log(ctrlr, "RESET", "event=\"success\"");
+		if (recovering)
+			ctrlr->is_failed = false;
 		nvme_ctrlr_start(ctrlr, true);
+		if (recovering && !ctrlr->is_failed)
+			nvme_ctrlr_notify_ns_recovered(ctrlr);
 	} else {
 		nvme_ctrlr_devctl_log(ctrlr, "RESET", "event=\"timed_out\"");
 		nvme_ctrlr_fail(ctrlr, true);
@@ -1624,7 +1709,7 @@ nvme_ctrlr_linux_passthru_cmd(struct nvme_controller *ctrlr,
 	mtx = mtx_pool_find(mtxpool_sleep, npc);
 	npc->metadata = (uintptr_t) mtx;
 
-	/* XXX no timeout passed down */
+	req->timeout_ms = npc->timeout_ms;
 	if (is_admin)
 		nvme_ctrlr_submit_admin_request(ctrlr, req);
 	else
@@ -1788,6 +1873,12 @@ nvme_ctrlr_construct(struct nvme_controller *ctrlr, device_t dev)
 	timeout_period = max(timeout_period, NVME_MIN_TIMEOUT_PERIOD);
 	ctrlr->timeout_period = timeout_period;
 
+	timeout_period = NVME_FORMAT_TIMEOUT_PERIOD;
+	TUNABLE_INT_FETCH("hw.nvme.format_timeout_period", &timeout_period);
+	timeout_period = min(timeout_period, NVME_MAX_FORMAT_TIMEOUT_PERIOD);
+	timeout_period = max(timeout_period, NVME_MIN_TIMEOUT_PERIOD);
+	ctrlr->format_timeout_period = timeout_period;
+
 	nvme_retry_count = NVME_DEFAULT_RETRY_COUNT;
 	TUNABLE_INT_FETCH("hw.nvme.retry_count", &nvme_retry_count);
 
@@ -1850,6 +1941,11 @@ nvme_ctrlr_destruct(struct nvme_controller *ctrlr, device_t dev)
 	bool	gone;
 
 	ctrlr->is_dying = true;
+
+	if (ctrlr->timestamp_tag != NULL) {
+		EVENTHANDLER_DEREGISTER(mountroot, ctrlr->timestamp_tag);
+		ctrlr->timestamp_tag = NULL;
+	}
 
 	if (ctrlr->resource == NULL)
 		goto nores;

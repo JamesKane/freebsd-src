@@ -46,6 +46,7 @@
 #include "bhyve_machdep.h"
 #include "bhyverun.h"
 #include "config.h"
+#include "config_schema.h"
 #include "debug.h"
 #include "fdt.h"
 #include "mem.h"
@@ -54,6 +55,23 @@
 #include "pci_irq.h"
 #include "rtc_pl031.h"
 #include "uart_emul.h"
+
+static const struct config_option config_options_machdep[] = {
+	{ "gdb.address", CONFIG_OPTION_STRING },
+	{ "gdb.port", CONFIG_OPTION_INTEGER },
+	{ "gdb.wait", CONFIG_OPTION_BOOL },
+	{ "rtc.use_localtime", CONFIG_OPTION_BOOL },
+	{ "console", CONFIG_OPTION_STRING },
+	{ "fdt.bootargs", CONFIG_OPTION_STRING },
+};
+
+void
+config_schema_merge_options_machdep(struct config_schema *schema)
+{
+
+	config_schema_merge_options(schema, NULL, config_options_machdep,
+	    nitems(config_options_machdep));
+}
 
 /* Start of mem + 1M */
 #define	FDT_BASE	0x100000
@@ -161,6 +179,10 @@ bhyve_optparse(int argc, char **argv)
 			set_config_bool("monitor.no_reboot", true);
 			break;
 		case 'o':
+			if (strcmp(optarg, "help") == 0) {
+				print_config_options();
+				exit(0);
+			}
 			if (!bhyve_parse_config_option(optarg)) {
 				errx(EX_USAGE,
 				    "invalid configuration option '%s'",
@@ -395,9 +417,9 @@ bhyve_init_platform(struct vmctx *ctx, struct vcpu *bsp)
 		error = vm_get_register(fbsdrun_vcpu(cpu), VM_REG_GUEST_MPIDR_EL1,
 		    &mpidr);
 		assert(error == 0);
-#define	MPIDR_AFF_MASK	(MPIDR_AFF0_MASK | MPIDR_AFF1_MASK | MPIDR_AFF2_MASK | MPIDR_AFF3_MASK)
-		cpu_to_mpidr[cpu] = mpidr & MPIDR_AFF_MASK;
-#undef MPIDR_AFF_MASK
+#define	MPIDR_Aff_MASK	(MPIDR_Aff0_MASK | MPIDR_Aff1_MASK | MPIDR_Aff2_MASK | MPIDR_Aff3_MASK)
+		cpu_to_mpidr[cpu] = mpidr & MPIDR_Aff_MASK;
+#undef MPIDR_Aff_MASK
 	}
 
 	bootrom = get_config_value("bootrom");

@@ -87,6 +87,9 @@ enum {
 	PFNL_CMD_OSFP_FLUSH = 49,
 	PFNL_CMD_OSFP_GET = 50,
 	PFNL_CMD_OSFP_ADD = 51,
+	PFNL_CMD_BEGIN = 52,
+	PFNL_CMD_COMMIT = 53,
+	PFNL_CMD_ROLLBACK = 54,
 	__PFNL_CMD_MAX,
 };
 #define PFNL_CMD_MAX (__PFNL_CMD_MAX -1)
@@ -118,7 +121,7 @@ enum pfstate_peer_type_t {
 
 enum pfstate_type_t {
 	PF_ST_UNSPEC,
-	PF_ST_ID		= 1, /* u32, state id */
+	PF_ST_ID		= 1, /* u64, state id */
 	PF_ST_CREATORID		= 2, /* u32, */
 	PF_ST_IFNAME		= 3, /* string */
 	PF_ST_ORIG_IFNAME	= 4, /* string */
@@ -494,10 +497,11 @@ enum pf_tstats_t {
 
 enum pfr_addr_t {
 	PFR_A_UNSPEC,
-	PFR_A_AF		= 1, /* uint8_t */
+	PFR_A_AF		= 1, /* uint8_t, uint32_t in replies */
 	PFR_A_NET		= 2, /* uint8_t */
 	PFR_A_NOT		= 3, /* bool */
 	PFR_A_ADDR		= 4, /* in6_addr */
+	PFR_A_FBACK		= 5, /* uint8_t */
 };
 
 enum pf_table_addrs_t {
@@ -526,6 +530,7 @@ enum pf_table_astats_t {
 	PF_TAS_FLAGS		= 3, /* u32 */
 	PF_TAS_ASTATS_COUNT	= 4, /* u32 */
 	PF_TAS_ASTATS_ZEROED	= 5, /* u32 */
+	PF_TAS_ADDR		= 6, /* nested, pfr_addr_t */
 };
 
 enum pf_limit_rate_t {
@@ -605,6 +610,7 @@ enum pf_ina_define_t {
 	PF_ID_ADDR		= 4, /* pfr_addr */
 	PF_ID_NADD		= 5, /* u32 */
 	PF_ID_NADDR		= 6, /* u32 */
+	PF_ID_APPEND		= 7, /* bool */
 };
 
 enum pf_osfp_t {
@@ -623,6 +629,18 @@ enum pf_osfp_t {
 	PF_OFP_OPTCNT		= 12, /* u8 */
 	PF_OFP_WSCALE		= 13, /* u8 */
 	PF_OFP_TTL		= 14, /* u8 */
+};
+
+enum pf_trans_e_t {
+	PF_TE_UNSPEC,
+	PF_TE_RULESET_NUM	= 1, /* u32 */
+	PF_TE_ANCHOR		= 2, /* string */
+	PF_TE_TICKET		= 3, /* u32 */
+};
+
+enum pf_trans_t {
+	PF_TR_UNSPEC,
+	PF_TR_TRANS		= 1, /* pf_trans_e */
 };
 
 #ifdef _KERNEL

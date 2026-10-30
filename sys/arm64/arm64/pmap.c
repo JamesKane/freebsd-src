@@ -154,6 +154,7 @@
 #include <machine/md_var.h>
 #include <machine/pcb.h>
 #include <machine/rsi.h>
+#include <machine/sysinsn.h>
 
 #ifdef NUMA
 #define	PMAP_MEMDOM	MAXMEMDOM
@@ -1798,7 +1799,7 @@ pmap_dbm_has_errata(const struct cpu_feat *feat __unused, u_int midr,
 	}
 
 	/* Disable on Cortex-A510 for erratum 2051678 - r0p0 to r0p2 */
-	if (midr_check_var_part_range(midr, CPU_IMPL_ARM, CPU_PART_CORTEX_A510,
+	if (midr_check_var_rev_range(midr, CPU_IMPL_ARM, CPU_PART_CORTEX_A510,
 	    0, 0, 0, 2)) {
 		static u_int errata_id = 2051678;
 
@@ -1904,7 +1905,7 @@ pmap_multiple_tlbi_check(const struct cpu_feat *feat __unused, u_int midr)
 	 * Present in r0p0 - r1p1
 	 * Fixed in r1p2
 	 */
-	if (midr_check_var_part_range(midr, CPU_IMPL_ARM, CPU_PART_CORTEX_A510,
+	if (midr_check_var_rev_range(midr, CPU_IMPL_ARM, CPU_PART_CORTEX_A510,
 	    0, 0, 1, 1))
 		return (FEAT_DEFAULT_DISABLE);
 
@@ -2104,26 +2105,18 @@ static __inline void
 pmap_s1_invalidate_range_kernel(uint64_t r, bool final_only)
 {
 	if (final_only)
-		__asm __volatile(".arch_extension tlb-rmi	\n"
-		    "tlbi rvaale1is, %0				\n"
-		    ".arch_extension notlb-rmi" : : "r" (r));
+		tlbi_rvaale1is(r);
 	else
-		__asm __volatile(".arch_extension tlb-rmi	\n"
-		    "tlbi rvaae1is, %0				\n"
-		    ".arch_extension notlb-rmi" : : "r" (r));
+		tlbi_rvaae1is(r);
 }
 
 static __inline void
 pmap_s1_invalidate_range_user(uint64_t r, bool final_only)
 {
 	if (final_only)
-		__asm __volatile(".arch_extension tlb-rmi	\n"
-		    "tlbi rvale1is, %0				\n"
-		    ".arch_extension notlb-rmi" : : "r" (r));
+		tlbi_rvale1is(r);
 	else
-		__asm __volatile(".arch_extension tlb-rmi	\n"
-		    "tlbi rvae1is, %0				\n"
-		    ".arch_extension notlb-rmi" : : "r" (r));
+		tlbi_rvae1is(r);
 }
 
 /*
@@ -2150,6 +2143,31 @@ pmap_s1_invalidate_page(pmap_t pmap, vm_offset_t va, bool final_only)
 		__asm __volatile("tlbi	vale1is, xzr" ::: "memory");
 	}
 	dsb(ish);
+	isb();
+}
+
+/*
+ * Invalidates any cached final-level TLB entry for the specified virtual
+ * address in the given virtual address space, but only on the current
+ * processor.
+ *
+ * The pmap_multiple_tlbi errata only affect broadcast invalidations.
+ */
+static __inline void
+pmap_s1_invalidate_page_local(pmap_t pmap, vm_offset_t va)
+{
+	uint64_t r;
+
+	PMAP_ASSERT_STAGE1(pmap);
+	dsb(nshst);
+	r = TLBI_VA(va);
+	if (pmap == kernel_pmap) {
+		__asm __volatile("tlbi vaale1, %0" : : "r" (r));
+	} else {
+		r |= ASID_TO_OPERAND(COOKIE_TO_ASID(pmap->pm_cookie));
+		__asm __volatile("tlbi vale1, %0" : : "r" (r));
+	}
+	dsb(nsh);
 	isb();
 }
 
@@ -9967,11 +9985,16 @@ pmap_fault(pmap_t pmap, uint64_t esr, uint64_t far)
 		ptep = pmap_pte(pmap, far, &lvl);
 		if (ptep != NULL &&
 		    ((pte = pmap_load(ptep)) & ATTR_SW_DBM) != 0) {
+			/*
+			 * A local invalidation suffices when enabling write
+			 * access.  At worst, a write using a stale read-only
+			 * TLB entry on another processor triggers a fault,
+			 * requiring its own local invalidation below.
+			 */
 			if ((pte & ATTR_S1_AP_RW_BIT) ==
-			    ATTR_S1_AP(ATTR_S1_AP_RO)) {
+			    ATTR_S1_AP(ATTR_S1_AP_RO))
 				pmap_clear_bits(ptep, ATTR_S1_AP_RW_BIT);
-				pmap_s1_invalidate_page(pmap, far, true);
-			}
+			pmap_s1_invalidate_page_local(pmap, far);
 			rv = KERN_SUCCESS;
 		}
 		PMAP_UNLOCK(pmap);

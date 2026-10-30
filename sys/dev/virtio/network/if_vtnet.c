@@ -1314,6 +1314,8 @@ vtnet_setup_interface(struct vtnet_softc *sc)
 	}
 
 	ether_ifattach(ifp, sc->vtnet_hwaddr);
+	if (if_getmtu(ifp) > sc->vtnet_max_mtu)
+		if_setmtu(ifp, sc->vtnet_max_mtu);
 
 	/* Tell the upper layer(s) we support long frames. */
 	if_setifheaderlen(ifp, sizeof(struct ether_vlan_header));
@@ -2190,7 +2192,10 @@ vtnet_rxq_eof(struct vtnet_rxq *rxq)
 			mp = mp->m_next;
 		}
 
-		if (len < sc->vtnet_hdr_size + ETHER_HDR_LEN) {
+		if (synced < len ||
+		    len < sc->vtnet_hdr_size + ETHER_HDR_LEN) {
+			if (synced < len)
+				sc->vtnet_stats.rx_frame_too_large++;
 			rxq->vtnrx_stats.vrxs_ierrors++;
 			vtnet_rxq_discard_buf(rxq, m);
 			continue;

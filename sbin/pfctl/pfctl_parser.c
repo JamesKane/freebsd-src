@@ -919,8 +919,11 @@ print_rule(struct pfctl_rule *r, const char *anchor_call, int opts, int numeric)
 	} else {
 		if (r->action >= nitems(actiontypes))
 			printf("action(%d)", r->action);
-	else
+		else {
 			printf("%s", actiontypes[r->action]);
+			if (r->natpass)
+				printf(" pass");
+		}
 	}
 	if (r->action == PF_DROP) {
 		if (r->rule_flag & PFRULE_RETURN)
@@ -2127,41 +2130,4 @@ append_addr_host(struct pfr_buffer *b, struct node_host *n, int test, int not)
 	} while ((n = n->next) != NULL);
 
 	return (0);
-}
-
-int
-pfctl_add_trans(struct pfr_buffer *buf, int rs_num, const char *anchor)
-{
-	struct pfioc_trans_e trans;
-
-	bzero(&trans, sizeof(trans));
-	trans.rs_num = rs_num;
-	if (strlcpy(trans.anchor, anchor,
-	    sizeof(trans.anchor)) >= sizeof(trans.anchor))
-		errx(1, "pfctl_add_trans: strlcpy");
-
-	return pfr_buf_add(buf, &trans);
-}
-
-u_int32_t
-pfctl_get_ticket(struct pfr_buffer *buf, int rs_num, const char *anchor)
-{
-	struct pfioc_trans_e *p;
-
-	PFRB_FOREACH(p, buf)
-		if (rs_num == p->rs_num && !strcmp(anchor, p->anchor))
-			return (p->ticket);
-	errx(1, "pfctl_get_ticket: assertion failed");
-}
-
-int
-pfctl_trans(int dev, struct pfr_buffer *buf, u_long cmd, int from)
-{
-	struct pfioc_trans trans;
-
-	bzero(&trans, sizeof(trans));
-	trans.size = buf->pfrb_size - from;
-	trans.esize = sizeof(struct pfioc_trans_e);
-	trans.array = ((struct pfioc_trans_e *)buf->pfrb_caddr) + from;
-	return ioctl(dev, cmd, &trans);
 }

@@ -92,7 +92,7 @@ static uint64_t update_special_reg_field(uint64_t user_reg, u_int type,
  * aliasing cache until we know otherwise.
  */
 void (*arm64_icache_sync_range)(void *, vm_size_t) =
-    &arm64_aliasing_icache_sync_range;
+    arm64_aliasing_icache_sync_range;
 
 static int
 sysctl_hw_machine(SYSCTL_HANDLER_ARGS)
@@ -2287,7 +2287,7 @@ user_ctr_has_neoverse_n1_1542419(uint32_t midr, uint64_t ctr)
 	 * Present in r3p0 - r4p0
 	 * Fixed in r4p1
 	 */
-	return (midr_check_var_part_range(midr, CPU_IMPL_ARM,
+	return (midr_check_var_rev_range(midr, CPU_IMPL_ARM,
 	    CPU_PART_NEOVERSE_N1, 3, 0, 4, 0) && CTR_DIC_VAL(ctr) != 0);
 }
 
@@ -2828,13 +2828,21 @@ identify_cpu_sysinit(void *dummy __unused)
 	}
 
 	if (dic && idc) {
-		arm64_icache_sync_range = &arm64_dic_idc_icache_sync_range;
+		arm64_icache_sync_range = arm64_dic_idc_icache_sync_range;
 		if (bootverbose)
 			printf("Enabling DIC & IDC ICache sync\n");
-	} else if (idc) {
-		arm64_icache_sync_range = &arm64_idc_aliasing_icache_sync_range;
+	} else if (idc && icache_aliasing) {
+		arm64_icache_sync_range = arm64_idc_aliasing_icache_sync_range;
 		if (bootverbose)
 			printf("Enabling IDC ICache sync\n");
+	} else if (idc) {
+		arm64_icache_sync_range = arm64_idc_pipt_icache_sync_range;
+		if (bootverbose)
+			printf("Enabling IDC & PIPT ICache sync\n");
+	} else if (!icache_aliasing) {
+		arm64_icache_sync_range = arm64_pipt_icache_sync_range;
+		if (bootverbose)
+			printf("Enabling PIPT ICache sync\n");
 	}
 }
 /*

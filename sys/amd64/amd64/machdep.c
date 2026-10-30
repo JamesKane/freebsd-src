@@ -115,7 +115,11 @@
 #include <machine/clock.h>
 #include <machine/cpu.h>
 #include <machine/cputypes.h>
+#ifdef FDT
+#include <x86/fdt.h>
+#endif
 #include <machine/frame.h>
+#include <machine/ifunc.h>
 #include <machine/intr_machdep.h>
 #include <x86/mca.h>
 #include <machine/md_var.h>
@@ -124,15 +128,11 @@
 #include <machine/pcb.h>
 #include <machine/proc.h>
 #include <machine/sigframe.h>
+#include <machine/smp.h>
 #include <machine/specialreg.h>
 #include <machine/trap.h>
 #include <machine/tss.h>
 #include <x86/ucode.h>
-#include <x86/ifunc.h>
-#include <machine/smp.h>
-#ifdef FDT
-#include <x86/fdt.h>
-#endif
 
 #ifdef DEV_ATPIC
 #include <x86/isa/icu.h>
@@ -1398,6 +1398,8 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	    (cpu_stdext_feature & CPUID_STDEXT_FSGSBASE) != 0 && !pti) {
 		fred = 1;
 		TUNABLE_INT_FETCH("hw.fred", &fred);
+		if (fred != 0)
+			fred = 1;
 	}
 
 	sched_instance_select();

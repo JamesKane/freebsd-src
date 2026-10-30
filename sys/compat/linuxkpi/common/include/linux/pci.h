@@ -295,10 +295,6 @@ struct pci_bus {
 	int		number;
 };
 
-extern struct list_head pci_drivers;
-extern struct list_head pci_devices;
-extern spinlock_t pci_lock;
-
 #define	__devexit_p(x)	x
 
 #define	module_pci_driver(_drv)						\
@@ -416,6 +412,17 @@ static inline uint16_t
 pci_dev_id(struct pci_dev *pdev)
 {
 	return (PCI_DEVID(pdev->bus->number, pdev->devfn));
+}
+
+static inline bool
+pci_is_vga(struct pci_dev *pdev)
+{
+	/* pdev->class holds only the base class. */
+	uint8_t class = pci_get_class(pdev->dev.bsddev);
+	uint8_t subclass  = pci_get_subclass(pdev->dev.bsddev);
+
+	return ((class == PCIC_DISPLAY && subclass == PCIS_DISPLAY_VGA) ||
+	    (class == PCIC_OLD && subclass == PCIS_OLD_VGA));
 }
 
 static inline int

@@ -359,6 +359,8 @@ struct pfctl_state_peer {
 	uint32_t			 seqdiff;
 	uint8_t				 state;
 	uint8_t				 wscale;
+	uint16_t			 max_win;
+	uint16_t			 mss;
 };
 
 struct pfctl_state_key {
@@ -369,8 +371,6 @@ struct pfctl_state_key {
 };
 
 struct pfctl_state {
-	TAILQ_ENTRY(pfctl_state)	entry;
-
 	uint64_t		 id;
 	uint32_t		 creatorid;
 	uint8_t		 	 direction;
@@ -409,11 +409,6 @@ struct pfctl_state {
 	struct pfctl_rule	 created_by_rule;
 };
 
-TAILQ_HEAD(pfctl_statelist, pfctl_state);
-struct pfctl_states {
-	struct pfctl_statelist	states;
-};
-
 enum pfctl_syncookies_mode {
 	PFCTL_SYNCOOKIES_NEVER,
 	PFCTL_SYNCOOKIES_ALWAYS,
@@ -449,8 +444,11 @@ struct pfctl_src_node {
 
 struct pfctl_handle;
 struct pfctl_handle	*pfctl_open(const char *pf_device);
+struct pfctl_handle	*pfctl_open_from_nl_fd(const char *pf_device,
+	    int nl_fd);
 void	pfctl_close(struct pfctl_handle *);
 int	pfctl_fd(struct pfctl_handle *);
+int	pfctl_nl_fd(struct pfctl_handle *);
 
 int	pfctl_startstop(struct pfctl_handle *h, int start);
 struct pfctl_status* pfctl_get_status_h(struct pfctl_handle *h);
@@ -508,11 +506,7 @@ struct pfctl_state_filter {
 	bool			include_rule;
 };
 typedef int (*pfctl_get_state_fn)(struct pfctl_state *, void *);
-int pfctl_get_states_iter(pfctl_get_state_fn f, void *arg);
 int pfctl_get_states_h(struct pfctl_handle *h, struct pfctl_state_filter *filter, pfctl_get_state_fn f, void *arg);
-int pfctl_get_filtered_states_iter(struct pfctl_state_filter *filter, pfctl_get_state_fn f, void *arg);
-int	pfctl_get_states(int dev, struct pfctl_states *states);
-void	pfctl_free_states(struct pfctl_states *states);
 int	pfctl_clear_states(int dev, const struct pfctl_kill *kill,
 	    unsigned int *killed);
 int	pfctl_kill_states(int dev, const struct pfctl_kill *kill,
@@ -707,5 +701,17 @@ int	pfctl_source_clear(struct pfctl_handle *h, struct pfctl_source_clear *);
 int	pfctl_flush_fingerprints(struct pfctl_handle *h);
 int	pfctl_get_fingerprint(struct pfctl_handle *h, int idx, struct pf_osfp_ioctl *fp);
 int	pfctl_add_fingerprint(struct pfctl_handle *h, struct pf_osfp_ioctl *fp);
+
+struct pfctl_trans;
+
+struct pfctl_trans*	pfctl_trans_alloc(void);
+void			pfctl_trans_free(struct pfctl_trans *t);
+size_t			pfctl_trans_size(struct pfctl_trans *t);
+int			pfctl_trans_add(struct pfctl_trans *t, int rs_num, const char *anchor);
+uint32_t		pfctl_get_ticket(struct pfctl_trans *t, int rs_num, const char *anchor);
+
+int			pfctl_trans_begin(struct pfctl_handle *h, struct pfctl_trans *t, size_t off);
+int			pfctl_trans_commit(struct pfctl_handle *h, struct pfctl_trans *t, size_t off);
+int			pfctl_trans_rollback(struct pfctl_handle *h, struct pfctl_trans *t, size_t off);
 
 #endif
